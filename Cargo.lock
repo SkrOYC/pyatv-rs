@@ -1013,6 +1013,7 @@ dependencies = [
  "hkdf",
  "pyatv-core",
  "rand",
+ "rand_core",
  "sha1",
  "sha2",
  "srp",
