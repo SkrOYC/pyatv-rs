@@ -1,39 +1,51 @@
 //! Companion frame framing: one type byte plus a three-byte big-endian length.
 //!
-//! Transcribed from `pyatv/protocols/companion/connection.py`; see
-//! `docs/research/mrp-companion.md` §4.2.
+//! Transcribed from `pyatv/protocols/companion/connection.py:16-40,98-119,126-153`; see
+//! `docs/research/companion-port-spec.md` §1.1-§1.2.
 //!
-//! The length field counts the payload only, and when encryption is active the payload includes the
-//! sixteen-byte Poly1305 tag. The four header bytes are used verbatim as the AEAD's associated
-//! data, which binds the declared type and length to the ciphertext.
+//! The length field counts the payload only, and when encryption is active it counts the
+//! sixteen-byte Poly1305 tag as well. The four header bytes are then used verbatim as the AEAD's
+//! associated data, which binds the declared type and length to the ciphertext. [`crate::codec`]
+//! owns that arithmetic; this module is only the header itself.
 
 use bytes::{BufMut, BytesMut};
 
 use crate::{Error, Result};
 
-/// Length of the frame header in bytes.
+/// Length of the frame header in bytes (`connection.py:17`).
 pub const HEADER_LENGTH: usize = 4;
 
 /// The largest payload a three-byte length field can describe.
-pub const MAX_PAYLOAD: usize = 0x00FF_FFFF;
+///
+/// This is the *format's* ceiling, not the one this crate enforces; see
+/// [`crate::codec::MAX_FRAME_PAYLOAD`].
+pub const MAX_ENCODABLE_PAYLOAD: usize = 0x00FF_FFFF;
 
 /// What a frame carries.
 ///
-/// Value `2` is not defined upstream and is presumed reserved.
+/// The numbering is sparse and is what appears on the wire, so it is mirrored exactly rather than
+/// compacted (`connection.py:21-40`). Value `2` is absent upstream with no explanation, as are
+/// `12..=15`, `19..=31` and `35..`.
+///
+/// pyatv's client only ever *acts* on the four auth types and the three OPACK types: every other
+/// variant is logged and dropped by `frame_received` (`protocol.py:192-207`), and no code anywhere
+/// in `pyatv/protocols/companion/` constructs one. This port mirrors that ignorance deliberately —
+/// see `docs/research/companion-port-spec.md` §12 finding 1 — so the remaining variants exist to
+/// name what arrives, not to be sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum FrameType {
     /// Unspecified.
     Unknown = 0,
-    /// Keepalive.
+    /// Keepalive. pyatv never sends one and there is no Companion-level heartbeat.
     NoOp = 1,
     /// Pair-setup, first message.
     PsStart = 3,
-    /// Pair-setup, subsequent messages.
+    /// Pair-setup, subsequent messages — including the reply to [`FrameType::PsStart`].
     PsNext = 4,
     /// Pair-verify, first message.
     PvStart = 5,
-    /// Pair-verify, subsequent messages.
+    /// Pair-verify, subsequent messages — including the reply to [`FrameType::PvStart`].
     PvNext = 6,
     /// Unencrypted OPACK.
     UOpack = 7,
@@ -41,26 +53,30 @@ pub enum FrameType {
     EOpack = 8,
     /// OPACK variant whose purpose pyatv's source does not explain.
     POpack = 9,
-    /// Pairing-adjacent request.
+    /// Pairing-adjacent request. Never constructed or parsed by pyatv.
     PaReq = 10,
-    /// Pairing-adjacent response.
+    /// Pairing-adjacent response. Never constructed or parsed by pyatv.
     PaRsp = 11,
-    /// Session start request.
+    /// Session start request. Never constructed or parsed by pyatv.
     SessionStartRequest = 16,
-    /// Session start response.
+    /// Session start response. Never constructed or parsed by pyatv.
     SessionStartResponse = 17,
-    /// Session payload.
+    /// Session payload. Never constructed or parsed by pyatv.
     SessionData = 18,
-    /// Family identity request.
+    /// Family identity request. Never constructed or parsed by pyatv.
     FamilyIdentityRequest = 32,
-    /// Family identity response.
+    /// Family identity response. Never constructed or parsed by pyatv.
     FamilyIdentityResponse = 33,
-    /// Family identity update.
+    /// Family identity update. Never constructed or parsed by pyatv.
     FamilyIdentityUpdate = 34,
 }
 
 impl FrameType {
     /// Map a raw type byte onto a known frame type.
+    ///
+    /// `None` for anything unlisted. pyatv's `FrameType(header[0])` raises `ValueError` there,
+    /// caught by `data_received`'s blanket `except` and logged (`connection.py:151-153`), so an
+    /// unknown byte drops one frame rather than killing the connection.
     #[must_use]
     pub const fn from_byte(byte: u8) -> Option<Self> {
         Some(match byte {
@@ -85,10 +101,38 @@ impl FrameType {
         })
     }
 
-    /// Whether frames of this type are ChaCha20-Poly1305 sealed once a session exists.
+    /// Whether this type carries an OPACK pairing envelope (`_pd`) rather than a message envelope.
+    ///
+    /// `_AUTH_FRAMES` (`protocol.py:25-30`).
     #[must_use]
-    pub const fn is_encrypted(self) -> bool {
-        matches!(self, Self::EOpack)
+    pub const fn is_auth(self) -> bool {
+        matches!(
+            self,
+            Self::PsStart | Self::PsNext | Self::PvStart | Self::PvNext
+        )
+    }
+
+    /// Whether this type carries an `_i`/`_t`/`_x`/`_c` message envelope.
+    ///
+    /// `_OPACK_FRAMES` (`protocol.py:32-36`).
+    #[must_use]
+    pub const fn is_opack(self) -> bool {
+        matches!(self, Self::UOpack | Self::EOpack | Self::POpack)
+    }
+
+    /// The frame type the device answers a handshake message with.
+    ///
+    /// Port of the remap in `exchange_auth` (`protocol.py:132-140`): `*_Start` is only ever used
+    /// for the *first* outbound message of a handshake, and the device's reply to it already comes
+    /// back typed `*_Next`. From the second message on, request and response types coincide, so
+    /// this is the identity for everything else.
+    #[must_use]
+    pub const fn response_type(self) -> Self {
+        match self {
+            Self::PsStart => Self::PsNext,
+            Self::PvStart => Self::PvNext,
+            other => other,
+        }
     }
 }
 
@@ -97,21 +141,22 @@ impl FrameType {
 pub struct FrameHeader {
     /// What the frame carries.
     pub frame_type: FrameType,
-    /// Payload length in bytes, excluding these four header bytes but including the auth tag when
-    /// the payload is encrypted.
+    /// Payload length in bytes, excluding these four header bytes but **including** the
+    /// sixteen-byte auth tag when the payload is encrypted.
     pub payload_length: usize,
 }
 
 impl FrameHeader {
-    /// Build a header for a payload of the given length.
+    /// Build a header for a payload of the given on-wire length.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Framing`] if the payload exceeds [`MAX_PAYLOAD`].
+    /// Returns [`Error::Framing`] if the length does not fit the three-byte field.
     pub fn new(frame_type: FrameType, payload_length: usize) -> Result<Self> {
-        if payload_length > MAX_PAYLOAD {
+        if payload_length > MAX_ENCODABLE_PAYLOAD {
             return Err(Error::Framing(format!(
-                "payload of {payload_length} bytes exceeds the {MAX_PAYLOAD}-byte frame limit"
+                "payload of {payload_length} bytes exceeds the {MAX_ENCODABLE_PAYLOAD}-byte frame \
+                 length field"
             )));
         }
         Ok(Self {
@@ -125,8 +170,8 @@ impl FrameHeader {
     pub fn encode(&self) -> [u8; HEADER_LENGTH] {
         let mut header = [0u8; HEADER_LENGTH];
         header[0] = self.frame_type as u8;
-        // `FrameHeader::new` caps the length at MAX_PAYLOAD, so only the low three bytes are ever
-        // significant here.
+        // `FrameHeader::new` caps the length at MAX_ENCODABLE_PAYLOAD, so only the low three bytes
+        // are ever significant; the saturating conversion is for the compiler, not the wire.
         let length = u32::try_from(self.payload_length)
             .unwrap_or(u32::MAX)
             .to_be_bytes();
@@ -135,6 +180,10 @@ impl FrameHeader {
     }
 
     /// Decode the four wire bytes.
+    ///
+    /// The length is read as a `u24` from bytes 1..4, never as a `u32` over all four
+    /// (`connection.py:132-134` slices `[1:HEADER_LENGTH]`), so the type byte can never leak into
+    /// the length.
     ///
     /// # Errors
     ///
@@ -163,7 +212,9 @@ impl FrameHeader {
         })
     }
 
-    /// Total bytes this frame occupies on the wire.
+    /// Total bytes this frame occupies on the wire, header included.
+    ///
+    /// This is what pyatv confusingly also calls `payload_length` (`connection.py:132-135`).
     #[must_use]
     pub const fn total_length(&self) -> usize {
         HEADER_LENGTH + self.payload_length
@@ -171,6 +222,10 @@ impl FrameHeader {
 }
 
 /// Write a complete frame: header followed by an already-sealed payload.
+///
+/// The caller is responsible for having added the auth tag to `payload` before calling, because
+/// the length field must count it; [`crate::codec::FrameCodec::encode`] is the entry point that
+/// gets that right.
 ///
 /// # Errors
 ///
@@ -186,7 +241,7 @@ pub fn encode_frame(frame_type: FrameType, payload: &[u8]) -> Result<BytesMut> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameHeader, FrameType, HEADER_LENGTH, MAX_PAYLOAD, encode_frame};
+    use super::{FrameHeader, FrameType, HEADER_LENGTH, MAX_ENCODABLE_PAYLOAD, encode_frame};
 
     /// The length is three bytes big-endian, so 0x010203 lands as those bytes in order.
     #[test]
@@ -216,8 +271,8 @@ mod tests {
 
     #[test]
     fn oversized_payloads_are_rejected() {
-        assert!(FrameHeader::new(FrameType::EOpack, MAX_PAYLOAD).is_ok());
-        assert!(FrameHeader::new(FrameType::EOpack, MAX_PAYLOAD + 1).is_err());
+        assert!(FrameHeader::new(FrameType::EOpack, MAX_ENCODABLE_PAYLOAD).is_ok());
+        assert!(FrameHeader::new(FrameType::EOpack, MAX_ENCODABLE_PAYLOAD + 1).is_err());
     }
 
     /// Type 2 is undefined upstream and must not silently decode.
@@ -226,6 +281,20 @@ mod tests {
         assert_eq!(FrameType::from_byte(2), None);
         assert!(FrameHeader::decode(&[0x02, 0, 0, 0]).is_err());
         assert!(FrameHeader::decode(&[0x08, 0, 0]).is_err());
+    }
+
+    /// The type byte must never be read as part of the length: a 0xFF type with a zero length is
+    /// still a zero-length frame, not a 4-gigabyte one.
+    #[test]
+    fn the_length_is_a_u24_not_a_u32() {
+        let header = FrameHeader::decode(&[0x08, 0xFF, 0xFF, 0xFF]).unwrap();
+        assert_eq!(header.payload_length, MAX_ENCODABLE_PAYLOAD);
+        assert_eq!(
+            FrameHeader::decode(&[0x08, 0, 0, 0])
+                .unwrap()
+                .payload_length,
+            0
+        );
     }
 
     #[test]
@@ -237,11 +306,31 @@ mod tests {
         );
     }
 
-    /// Only `E_OPACK` is sealed; pairing frames travel in the clear by definition.
+    /// `*_Start` is outbound-only; the device answers with `*_Next` (`protocol.py:132-140`).
     #[test]
-    fn only_encrypted_opack_is_sealed() {
-        assert!(FrameType::EOpack.is_encrypted());
-        assert!(!FrameType::UOpack.is_encrypted());
-        assert!(!FrameType::PsStart.is_encrypted());
+    fn only_the_two_start_types_remap_to_a_different_response() {
+        assert_eq!(FrameType::PsStart.response_type(), FrameType::PsNext);
+        assert_eq!(FrameType::PvStart.response_type(), FrameType::PvNext);
+        assert_eq!(FrameType::PsNext.response_type(), FrameType::PsNext);
+        assert_eq!(FrameType::PvNext.response_type(), FrameType::PvNext);
+        assert_eq!(FrameType::EOpack.response_type(), FrameType::EOpack);
+    }
+
+    #[test]
+    fn auth_and_opack_frames_are_disjoint_sets() {
+        for frame_type in [
+            FrameType::PsStart,
+            FrameType::PsNext,
+            FrameType::PvStart,
+            FrameType::PvNext,
+        ] {
+            assert!(frame_type.is_auth());
+            assert!(!frame_type.is_opack());
+        }
+        for frame_type in [FrameType::UOpack, FrameType::EOpack, FrameType::POpack] {
+            assert!(frame_type.is_opack());
+            assert!(!frame_type.is_auth());
+        }
+        assert!(!FrameType::NoOp.is_auth() && !FrameType::NoOp.is_opack());
     }
 }

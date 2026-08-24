@@ -14,3 +14,8 @@ workspace = true
 [dependencies]
 bytes.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Round-trip property tests over the wire format; version verified against crates.io and matching
+# the pin recorded in docs/research/rust-crates.md §11.
+proptest = "1.11.0"

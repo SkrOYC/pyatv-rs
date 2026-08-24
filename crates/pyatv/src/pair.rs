@@ -20,6 +20,8 @@ use pyatv_core::interface::PairingHandler;
 use pyatv_core::storage::Storage;
 use pyatv_core::{BaseConfig, Error, Protocol, Result};
 use pyatv_proto_airplay::{AirPlayPairingHandler, AirPlayPairingOptions};
+use pyatv_proto_companion::auth::PairSetupOptionsCompanion;
+use pyatv_proto_companion::{CompanionPairingHandler, CompanionPairingOptions};
 
 /// Begin pairing with one protocol on a device.
 ///
@@ -82,12 +84,32 @@ pub async fn pair(
                 storage,
             )))
         }
-        // TODO(step-1): dispatch the remaining protocols:
-        //   Mrp       -> pyatv_proto_mrp, CryptoPairingMessage envelope
-        //   Companion -> pyatv_proto_companion::pairing, PS_*/PV_* frames
-        //   Dmap      -> pyatv_proto_dmap::pairing, inverted client-as-server flow
-        Protocol::Mrp | Protocol::Companion | Protocol::Dmap => {
-            Err(Error::UnsupportedProtocol(protocol))
+        Protocol::Companion => {
+            tracing::debug!(
+                port = service.port,
+                pairing = ?service.pairing,
+                "creating Companion pairing handler"
+            );
+
+            Ok(Box::new(CompanionPairingHandler::new(
+                CompanionPairingOptions {
+                    address: config.address,
+                    service: service.clone(),
+                    device_identifier,
+                    device_name: Some(config.name.clone()),
+                    // The name the device shows on screen while asking for the PIN. Upstream
+                    // defaults it to `"pyatv"` and lets a caller override it through
+                    // `pyatv.pair(..., name=...)` (`pyatv/protocols/companion/pairing.py:24`);
+                    // this port has no equivalent keyword-argument channel yet, so the default is
+                    // what every caller gets.
+                    setup: PairSetupOptionsCompanion::default(),
+                },
+                storage,
+            )))
         }
+        // TODO(step-1): dispatch the remaining protocols:
+        //   Mrp  -> pyatv_proto_mrp, CryptoPairingMessage envelope
+        //   Dmap -> pyatv_proto_dmap::pairing, inverted client-as-server flow
+        Protocol::Mrp | Protocol::Dmap => Err(Error::UnsupportedProtocol(protocol)),
     }
 }

@@ -16,6 +16,13 @@ bytes.workspace = true
 pyatv-core.workspace = true
 pyatv-opack.workspace = true
 pyatv-pairing.workspace = true
+rand = "0.10.2"
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+pyatv-core.workspace = true
+pyatv-pairing = { workspace = true, features = ["test-server"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
