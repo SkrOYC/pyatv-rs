@@ -11,6 +11,7 @@
 pub mod browse;
 pub mod dns;
 pub mod knock;
+pub mod service;
 pub mod service_types;
 pub mod unicast;
 
