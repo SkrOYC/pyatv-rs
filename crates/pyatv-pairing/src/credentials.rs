@@ -127,25 +127,25 @@ impl HapCredentials {
 }
 
 impl std::fmt::Display for HapCredentials {
-    /// Render back into pyatv's credential string, using the short form for legacy credentials.
+    /// Render back into pyatv's credential string: always four colon-separated hex fields.
+    ///
+    /// The two-field form is **parse-only**. `HapCredentials.__str__`
+    /// (`pyatv/auth/hap_pairing.py:77-86`) unconditionally joins all four fields regardless of
+    /// authentication type, so a legacy credential comes back out as `":ltsk::client_id"` with two
+    /// empty segments rather than in the compact form it may have been read from
+    /// (`docs/research/hap-pairing-port-spec.md` §3.2 corrects the earlier research report on
+    /// this). Parsing a two-field string and re-rendering it is therefore lossy in format but not
+    /// in data — replicated exactly, because config files written by either implementation have to
+    /// be readable by the other.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.authentication_type() == AuthenticationType::Legacy {
-            write!(
-                formatter,
-                "{}:{}",
-                hex::encode(&self.client_id),
-                hex::encode(&self.ltsk)
-            )
-        } else {
-            write!(
-                formatter,
-                "{}:{}:{}:{}",
-                hex::encode(&self.ltpk),
-                hex::encode(&self.ltsk),
-                hex::encode(&self.atv_id),
-                hex::encode(&self.client_id)
-            )
-        }
+        write!(
+            formatter,
+            "{}:{}:{}:{}",
+            hex::encode(&self.ltpk),
+            hex::encode(&self.ltsk),
+            hex::encode(&self.atv_id),
+            hex::encode(&self.client_id)
+        )
     }
 }
 
@@ -182,9 +182,11 @@ mod tests {
         assert_eq!(credentials.to_string(), input);
     }
 
-    /// The two-field form reverses the order: `client_id` first, then `ltsk`.
+    /// The two-field form reverses the order: `client_id` first, then `ltsk`. It is accepted on
+    /// input and never produced on output, so the round trip is lossy in format but not in data —
+    /// exactly as in pyatv, see the `Display` documentation.
     #[test]
-    fn two_field_strings_round_trip_as_legacy() {
+    fn two_field_strings_parse_as_legacy_and_reformat_as_four_fields() {
         let input = "0011223344556677:aabbcc";
         let credentials = HapCredentials::parse(input).unwrap();
 
@@ -197,7 +199,18 @@ mod tests {
             vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]
         );
         assert_eq!(credentials.ltsk, vec![0xAA, 0xBB, 0xCC]);
-        assert_eq!(credentials.to_string(), input);
+        assert_eq!(credentials.to_string(), ":aabbcc::0011223344556677");
+        assert_eq!(
+            HapCredentials::parse(&credentials.to_string()).unwrap(),
+            credentials
+        );
+    }
+
+    /// `NO_CREDENTIALS` renders as four empty fields, i.e. three colons
+    /// (`pyatv/auth/hap_pairing.py:123`).
+    #[test]
+    fn null_credentials_render_as_three_colons() {
+        assert_eq!(HapCredentials::null().to_string(), ":::");
     }
 
     #[test]

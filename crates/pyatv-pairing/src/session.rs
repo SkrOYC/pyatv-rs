@@ -1,162 +1,284 @@
-//! ChaCha20-Poly1305 transport framing, and the three nonce layouts that are not interchangeable.
+//! The AirPlay HAP channel framing: 1024-byte chunks with a length-prefix AAD.
 //!
-//! Ported from `pyatv/auth/hap_session.py` and `pyatv/support/chacha20.py`. See
-//! `docs/research/crypto-pairing.md` §5, which is emphatic that these layouts must stay separate:
-//! the same counter value produces different nonce bytes under HAP framing and under Companion
-//! framing, so a single shared nonce builder would decrypt to garbage on one of them.
+//! Port of `pyatv/auth/hap_session.py:1-66`, driven by `pyatv/auth/hap_channel.py:52-72`.
+//!
+//! **This framing is AirPlay-only.** `docs/research/hap-pairing-port-spec.md` §4.0 corrects the
+//! earlier research report on this point: the only importers of `hap_session`/`hap_channel` in
+//! pyatv are the AirPlay RTSP control connection and the AirPlay 2 event and data-stream channels.
+//! MRP encrypts a whole protobuf message per AEAD call with no AAD and no size cap, and Companion
+//! uses a 4-byte frame header as AAD with a bare 12-byte counter — both talk to
+//! [`crate::chacha::Chacha20Cipher`] directly and must not be routed through this type.
+//!
+//! Frame layout, per `hap_session.py:53-66`:
+//!
+//! ```text
+//! | 2-byte LE plaintext length | ciphertext (length bytes) | 16-byte Poly1305 tag |
+//!                       ^-- these two bytes are also the AEAD's associated data
+//! ```
 
-use crate::Result;
+use crate::{
+    Result,
+    chacha::{Chacha20Cipher, NonceLayout},
+};
 
-/// Plaintext bytes per AEAD operation in HAP framing, from HAP spec section 5.2.2.
+pub use crate::chacha::{AUTH_TAG_LENGTH, NONCE_LENGTH, fixed_nonce};
+
+/// Plaintext bytes per AEAD operation, "as specified by HAP, section 5.2.2 (Release R1)"
+/// (`pyatv/auth/hap_session.py:17`).
 pub const FRAME_LENGTH: usize = 1024;
 
-/// Poly1305 tag length.
-pub const AUTH_TAG_LENGTH: usize = 16;
+/// Bytes of length prefix in front of each frame, also used verbatim as the AEAD's AAD.
+pub const LENGTH_PREFIX_LEN: usize = 2;
 
-/// How a 12-byte ChaCha20-Poly1305 nonce is assembled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NonceLayout {
-    /// Four zero bytes followed by an 8-byte little-endian counter.
-    ///
-    /// Used by [`HapSession`] framing and, with the counter replaced by a fixed ASCII string, by
-    /// the pair-setup and pair-verify TLV encryption steps.
-    PaddedCounter,
-    /// A bare 12-byte little-endian counter with no zero prefix.
-    ///
-    /// Used by the Companion link only.
-    BareCounter,
-}
+// The length prefix is two bytes, so a frame can never be larger than `u16::MAX`. This makes the
+// conversion in `encrypt` provably infallible.
+const _: () = assert!(FRAME_LENGTH <= u16::MAX as usize);
 
-impl NonceLayout {
-    /// Build the 12-byte nonce for `counter` under this layout.
-    #[must_use]
-    pub fn nonce(self, counter: u64) -> [u8; 12] {
-        let mut nonce = [0u8; 12];
-        match self {
-            Self::PaddedCounter => nonce[4..].copy_from_slice(&counter.to_le_bytes()),
-            Self::BareCounter => {
-                nonce[..8].copy_from_slice(&counter.to_le_bytes());
-            }
-        }
-        nonce
-    }
-}
-
-/// The fixed ASCII nonces used during pair-setup and pair-verify.
+/// Encrypted transport for an AirPlay HAP channel, after pair-verify has completed.
 ///
-/// These are literal strings, not counters. Each is left-padded with four zero bytes to reach 12
-/// bytes, exactly as [`NonceLayout::PaddedCounter`] would for a counter.
-pub mod fixed_nonce {
-    /// Decrypt the device's M2 pair-verify payload.
-    pub const PV_MSG02: &[u8; 8] = b"PV-Msg02";
-    /// Encrypt the controller's M3 pair-verify payload.
-    pub const PV_MSG03: &[u8; 8] = b"PV-Msg03";
-    /// Encrypt the controller's M5 pair-setup payload.
-    pub const PS_MSG05: &[u8; 8] = b"PS-Msg05";
-    /// Decrypt the device's M6 pair-setup payload.
-    pub const PS_MSG06: &[u8; 8] = b"PS-Msg06";
-
-    /// Left-pad an 8-byte fixed nonce to the 12 bytes ChaCha20-Poly1305 requires.
-    #[must_use]
-    pub fn pad(nonce: &[u8; 8]) -> [u8; 12] {
-        let mut padded = [0u8; 12];
-        padded[4..].copy_from_slice(nonce);
-        padded
-    }
-}
-
-/// Encrypted transport for a HAP channel, after pair-verify has completed.
-///
-/// Wire format per frame is `2-byte little-endian plaintext length | ciphertext | 16-byte tag`,
-/// with those same two length bytes used as the AEAD's associated data. Payloads longer than
-/// [`FRAME_LENGTH`] are split across consecutive frames. Read and write directions keep independent
-/// counters.
+/// Read and write directions keep independent keys and counters. Inbound data is buffered
+/// internally so a caller can feed arbitrary TCP segments in and get whole frames out, exactly as
+/// `HAPSession._encrypted_data` does (`pyatv/auth/hap_session.py:24,36-51`).
 #[derive(Debug)]
 pub struct HapSession {
-    output_key: [u8; 32],
-    input_key: [u8; 32],
-    output_counter: u64,
-    input_counter: u64,
+    cipher: Chacha20Cipher,
+    buffer: Vec<u8>,
 }
 
 impl HapSession {
     /// Build a session from the two derived transport keys.
+    ///
+    /// Argument order matches `HAPSession.enable(output_key, input_key)`
+    /// (`pyatv/auth/hap_session.py:27-29`): `output_key` encrypts what this side sends.
     #[must_use]
-    pub fn new(output_key: [u8; 32], input_key: [u8; 32]) -> Self {
+    pub fn new(output_key: &[u8; 32], input_key: &[u8; 32]) -> Self {
         Self {
-            output_key,
-            input_key,
-            output_counter: 0,
-            input_counter: 0,
+            cipher: Chacha20Cipher::new(output_key, input_key, NonceLayout::PaddedCounter),
+            buffer: Vec::new(),
         }
     }
 
-    /// Encrypt `plaintext`, splitting it into [`FRAME_LENGTH`]-byte frames.
+    /// Bytes of a partial inbound frame currently held back.
+    #[must_use]
+    pub fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Frame and encrypt `plaintext`, splitting it at [`FRAME_LENGTH`].
+    ///
+    /// An empty input produces an empty output and consumes no counter value: `while data:`
+    /// (`pyatv/auth/hap_session.py:59`) never enters the loop.
     ///
     /// # Errors
     ///
     /// Returns [`crate::Error::Aead`] if the AEAD seal fails.
-    // TODO(step-1): chunk at FRAME_LENGTH; per chunk emit the 2-byte LE length, then
-    // `ChaCha20Poly1305::new(&output_key).encrypt(nonce, Payload { msg: chunk, aad: &length })`,
-    // incrementing `output_counter` once per frame. See docs/research/crypto-pairing.md §5.2.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let _ = (plaintext, &self.output_key, self.output_counter);
-        todo!("HapSession::encrypt")
+        let mut output = Vec::with_capacity(framed_len(plaintext.len()));
+
+        for chunk in plaintext.chunks(FRAME_LENGTH) {
+            // `len(frame)` is at most FRAME_LENGTH, so this cast cannot truncate.
+            let length = u16::try_from(chunk.len()).unwrap_or(u16::MAX).to_le_bytes();
+            let frame = self.cipher.encrypt(chunk, Some(&length))?;
+
+            output.extend_from_slice(&length);
+            output.extend_from_slice(&frame);
+        }
+
+        Ok(output)
     }
 
-    /// Decrypt as many complete frames as `ciphertext` contains.
+    /// Buffer `ciphertext` and return the plaintext of every frame that is now complete.
     ///
-    /// Returns the recovered plaintext and how many bytes were consumed, so the caller can retain a
-    /// partial trailing frame.
+    /// A trailing partial frame is retained for the next call, so this can be fed raw socket reads.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Aead`] if a frame's tag does not verify.
-    // TODO(step-1): read the 2-byte LE length, wait for `length + AUTH_TAG_LENGTH` more bytes, then
-    // decrypt with the length bytes as AAD and increment `input_counter`.
-    pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<(Vec<u8>, usize)> {
-        let _ = (ciphertext, &self.input_key, self.input_counter);
-        todo!("HapSession::decrypt")
+    /// Returns [`crate::Error::Aead`] if a frame's tag does not verify. The session is not
+    /// recoverable after that: pyatv advances the inbound counter before decrypting
+    /// (`pyatv/support/chacha20.py:68-70`), so the stream is permanently out of step with the peer.
+    pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        self.buffer.extend_from_slice(ciphertext);
+
+        let mut output = Vec::new();
+        let mut consumed = 0usize;
+
+        while let Some(rest) = self.buffer.get(consumed..) {
+            let Some(length) = rest.get(..LENGTH_PREFIX_LEN) else {
+                break;
+            };
+            let block_length =
+                usize::from(u16::from_le_bytes([length[0], length[1]])) + AUTH_TAG_LENGTH;
+            let Some(block) = rest.get(LENGTH_PREFIX_LEN..LENGTH_PREFIX_LEN + block_length) else {
+                break;
+            };
+
+            // The AAD is the two length bytes exactly as they arrived, not a re-encoding of the
+            // decoded length (`pyatv/auth/hap_session.py:40-48`).
+            let aad = [length[0], length[1]];
+            output.extend_from_slice(&self.cipher.decrypt(block, Some(&aad))?);
+            consumed += LENGTH_PREFIX_LEN + block_length;
+        }
+
+        self.buffer.drain(..consumed);
+        Ok(output)
     }
+}
+
+/// Size of the framed form of a `plaintext_len`-byte payload.
+fn framed_len(plaintext_len: usize) -> usize {
+    let frames = plaintext_len.div_ceil(FRAME_LENGTH);
+    plaintext_len + frames * (LENGTH_PREFIX_LEN + AUTH_TAG_LENGTH)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{NonceLayout, fixed_nonce};
+    use super::{AUTH_TAG_LENGTH, FRAME_LENGTH, HapSession, LENGTH_PREFIX_LEN};
+    use crate::chacha::{Chacha20Cipher, NonceLayout};
 
-    /// HAP framing prefixes four zero bytes; Companion does not. The same counter must therefore
-    /// produce different bytes under the two layouts.
-    #[test]
-    fn the_two_nonce_layouts_disagree_for_the_same_counter() {
-        assert_eq!(
-            NonceLayout::PaddedCounter.nonce(1),
-            [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            NonceLayout::BareCounter.nonce(1),
-            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        );
-        assert_ne!(
-            NonceLayout::PaddedCounter.nonce(1),
-            NonceLayout::BareCounter.nonce(1)
-        );
+    const OUT_KEY: [u8; 32] = [b'o'; 32];
+    const IN_KEY: [u8; 32] = [b'i'; 32];
+
+    /// One session's output must decrypt in a peer session whose keys are swapped, which is how a
+    /// controller and an accessory actually face each other.
+    fn peer() -> (HapSession, HapSession) {
+        (
+            HapSession::new(&OUT_KEY, &IN_KEY),
+            HapSession::new(&IN_KEY, &OUT_KEY),
+        )
     }
 
-    /// The counter is little-endian in both layouts.
     #[test]
-    fn counters_are_little_endian() {
-        assert_eq!(
-            NonceLayout::PaddedCounter.nonce(0x0102),
-            [0, 0, 0, 0, 0x02, 0x01, 0, 0, 0, 0, 0, 0]
-        );
+    fn short_payload_is_one_frame_and_round_trips() {
+        let (mut local, mut remote) = peer();
+
+        let framed = local.encrypt(b"hello").expect("encrypt");
+
+        assert_eq!(framed.len(), LENGTH_PREFIX_LEN + 5 + AUTH_TAG_LENGTH);
+        assert_eq!(&framed[..2], &[5, 0]);
+        assert_eq!(remote.decrypt(&framed).expect("decrypt"), b"hello");
     }
 
-    /// A fixed ASCII nonce lands in the same byte positions the padded counter uses.
+    /// The frame bytes are checked against an independently driven cipher rather than against a
+    /// hard-coded blob, so this tests the framing (chunking, prefix, AAD choice) and not just that
+    /// the code agrees with itself.
     #[test]
-    fn fixed_nonces_are_left_padded_to_twelve_bytes() {
-        let padded = fixed_nonce::pad(fixed_nonce::PV_MSG02);
+    fn frame_bytes_match_the_primitive_driven_by_hand() {
+        let mut session = HapSession::new(&OUT_KEY, &IN_KEY);
+        let reference = Chacha20Cipher::new(&OUT_KEY, &IN_KEY, NonceLayout::PaddedCounter);
 
-        assert_eq!(&padded[..4], &[0, 0, 0, 0]);
-        assert_eq!(&padded[4..], b"PV-Msg02");
+        let payload = b"exact frame bytes";
+        let framed = session.encrypt(payload).expect("encrypt");
+
+        let length = [0x11, 0x00];
+        let expected = reference
+            .encrypt_with_nonce(payload, &NonceLayout::PaddedCounter.nonce(0), Some(&length))
+            .expect("reference encrypt");
+
+        assert_eq!(&framed[..2], &length);
+        assert_eq!(&framed[2..], expected.as_slice());
+        // The reference call above used a fixed nonce and so left its counter at zero; the session
+        // must have advanced its own.
+        assert_eq!(reference.out_nonce(), NonceLayout::PaddedCounter.nonce(0));
+    }
+
+    /// Anything past 1024 bytes must be split, and each frame gets the next counter value.
+    #[test]
+    fn payloads_are_chunked_at_the_frame_length() {
+        let (mut local, mut remote) = peer();
+        let payload = vec![0x5Au8; FRAME_LENGTH * 2 + 1];
+
+        let framed = local.encrypt(&payload).expect("encrypt");
+
+        assert_eq!(
+            framed.len(),
+            payload.len() + 3 * (LENGTH_PREFIX_LEN + AUTH_TAG_LENGTH)
+        );
+        assert_eq!(&framed[..2], &[0x00, 0x04]);
+        assert_eq!(remote.decrypt(&framed).expect("decrypt"), payload);
+    }
+
+    /// A payload that is an exact multiple of the frame length must not emit a trailing empty
+    /// frame.
+    #[test]
+    fn an_exact_multiple_emits_no_empty_trailing_frame() {
+        let (mut local, mut remote) = peer();
+        let payload = vec![0x01u8; FRAME_LENGTH];
+
+        let framed = local.encrypt(&payload).expect("encrypt");
+
+        assert_eq!(
+            framed.len(),
+            FRAME_LENGTH + LENGTH_PREFIX_LEN + AUTH_TAG_LENGTH
+        );
+        assert_eq!(remote.decrypt(&framed).expect("decrypt"), payload);
+    }
+
+    /// `while data:` never runs for an empty payload, so nothing goes on the wire.
+    #[test]
+    fn an_empty_payload_produces_no_frame() {
+        let mut session = HapSession::new(&OUT_KEY, &IN_KEY);
+
+        assert!(session.encrypt(b"").expect("encrypt").is_empty());
+    }
+
+    /// Feeding the stream one byte at a time must reassemble both frames and hold back nothing at
+    /// the end.
+    #[test]
+    fn partial_frames_are_buffered_until_complete() {
+        let (mut local, mut remote) = peer();
+        let first = local.encrypt(b"first message").expect("encrypt");
+        let second = local
+            .encrypt(&vec![0x7Fu8; FRAME_LENGTH + 5])
+            .expect("encrypt");
+
+        let mut stream = first;
+        stream.extend_from_slice(&second);
+
+        let mut received = Vec::new();
+        for byte in &stream {
+            received.extend_from_slice(&remote.decrypt(&[*byte]).expect("decrypt"));
+        }
+
+        let mut expected = b"first message".to_vec();
+        expected.extend_from_slice(&vec![0x7Fu8; FRAME_LENGTH + 5]);
+        assert_eq!(received, expected);
+        assert_eq!(remote.buffered_len(), 0);
+    }
+
+    /// A frame delivered without its tag yields nothing and stays buffered.
+    #[test]
+    fn a_truncated_frame_yields_nothing_and_is_retained() {
+        let (mut local, mut remote) = peer();
+        let framed = local.encrypt(b"incomplete").expect("encrypt");
+        let cut = framed.len() - 1;
+
+        assert!(remote.decrypt(&framed[..cut]).expect("decrypt").is_empty());
+        assert_eq!(remote.buffered_len(), cut);
+        assert_eq!(
+            remote.decrypt(&framed[cut..]).expect("decrypt"),
+            b"incomplete"
+        );
+        assert_eq!(remote.buffered_len(), 0);
+    }
+
+    /// Flipping a ciphertext byte must fail the tag.
+    #[test]
+    fn tampered_ciphertext_is_rejected() {
+        let (mut local, mut remote) = peer();
+        let mut framed = local.encrypt(b"authentic").expect("encrypt");
+        framed[4] ^= 0x01;
+
+        assert!(remote.decrypt(&framed).is_err());
+    }
+
+    /// The length prefix is the AAD, so rewriting it must fail the tag rather than silently
+    /// producing a shorter plaintext.
+    #[test]
+    fn tampered_length_prefix_is_rejected() {
+        let (mut local, mut remote) = peer();
+        let mut framed = local.encrypt(&[0xAAu8; 32]).expect("encrypt");
+        framed[0] = 31;
+
+        assert!(remote.decrypt(&framed).is_err());
     }
 }

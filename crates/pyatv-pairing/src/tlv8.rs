@@ -10,8 +10,18 @@
 //! trying to be more general than the devices are.
 //!
 //! Nesting is not supported: HAP TLV8 is single-level, matching pyatv's own module caveat.
-
-use std::collections::BTreeMap;
+//!
+//! **Entries are kept in insertion order, not tag-numeric order.** pyatv's `write_tlv`
+//! (`pyatv/auth/hap_tlv8.py:105-123`, see `docs/research/hap-pairing-port-spec.md` §1.6) iterates
+//! a plain Python `dict`, which is insertion-ordered as of 3.7+; every call site builds its dict
+//! literal in the exact order it wants on the wire, and some real accessories parse positionally.
+//! A `BTreeMap` would silently reorder entries to ascending tag order and produce wire bytes that
+//! diverge from pyatv's for any message whose fields aren't already in tag order — this broke
+//! byte-exact known-answer tests against pyatv captures. [`Tlv8`] therefore stores entries in a
+//! `Vec<(u8, Bytes)>` walked linearly: HAP messages carry well under sixteen tags, so linear
+//! lookup is cheap and preserves insertion order for free. Re-inserting an existing tag replaces
+//! its value **in place**, matching Python `dict[key] = value`, which does not move an existing
+//! key to the end.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -166,10 +176,11 @@ pub const FLAG_TRANSIENT_PAIRING: u8 = 0x10;
 /// A decoded single-level TLV8 message.
 ///
 /// Entries are keyed by raw tag byte rather than [`TlvValue`] so that tags pyatv has not catalogued
-/// still round-trip instead of being dropped.
+/// still round-trip instead of being dropped. Entries are stored, and encoded, in insertion order
+/// (see the module docs) rather than tag order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tlv8 {
-    entries: BTreeMap<u8, Bytes>,
+    entries: Vec<(u8, Bytes)>,
 }
 
 impl Tlv8 {
@@ -180,9 +191,24 @@ impl Tlv8 {
     }
 
     /// Set a known tag, replacing any existing value.
+    ///
+    /// Replacing an existing tag keeps its original position, matching Python `dict[key] = value`.
     #[must_use]
     pub fn with(mut self, tag: TlvValue, value: impl Into<Bytes>) -> Self {
-        self.entries.insert(tag as u8, value.into());
+        self.set_raw(tag as u8, value.into());
+        self
+    }
+
+    /// Set a raw tag byte, replacing any existing value.
+    ///
+    /// Needed for tags pyatv has not catalogued: `step3`'s `additional_data` parameter can carry
+    /// any tag (`pyatv/auth/hap_srp.py:197-198`), and the Companion reference accessory emits an
+    /// uncatalogued tag `27` in its pair-setup M2 that nothing in pyatv ever reads back.
+    ///
+    /// Replacing an existing tag keeps its original position, matching Python `dict[key] = value`.
+    #[must_use]
+    pub fn with_raw(mut self, tag: u8, value: impl Into<Bytes>) -> Self {
+        self.set_raw(tag, value.into());
         self
     }
 
@@ -192,10 +218,26 @@ impl Tlv8 {
         self.with(tag, Bytes::from(vec![value]))
     }
 
+    /// Insert or, if already present, replace-in-place the value for `tag`.
+    fn set_raw(&mut self, tag: u8, value: Bytes) {
+        if let Some(existing) = self.entries.iter_mut().find(|(t, _)| *t == tag) {
+            existing.1 = value;
+        } else {
+            self.entries.push((tag, value));
+        }
+    }
+
     /// Read a known tag.
     #[must_use]
     pub fn get(&self, tag: TlvValue) -> Option<&Bytes> {
-        self.entries.get(&(tag as u8))
+        self.get_raw(tag as u8)
+    }
+
+    /// Read a raw tag byte.
+    fn get_raw(&self, tag: u8) -> Option<&Bytes> {
+        self.entries
+            .iter()
+            .find_map(|(t, value)| (*t == tag).then_some(value))
     }
 
     /// Read a known tag, or fail with [`Error::MissingTlv`].
@@ -226,9 +268,9 @@ impl Tlv8 {
         self.entries.is_empty()
     }
 
-    /// Every tag present, in ascending tag order.
+    /// Every tag present, in insertion order.
     pub fn tags(&self) -> impl Iterator<Item = u8> + '_ {
-        self.entries.keys().copied()
+        self.entries.iter().map(|(tag, _)| *tag)
     }
 
     /// Encode to the wire format, splitting values longer than [`MAX_CHUNK`] into consecutive
@@ -255,11 +297,14 @@ impl Tlv8 {
 
     /// Decode a wire-format message, concatenating contiguous same-tag runs.
     ///
+    /// Entries are kept in the order their tag first appears on the wire, matching pyatv's
+    /// `read_tlv` (which folds into a plain, insertion-ordered `dict`).
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Tlv8`] if the input ends inside an entry header or value.
     pub fn decode(input: &[u8]) -> Result<Self> {
-        let mut entries: BTreeMap<u8, BytesMut> = BTreeMap::new();
+        let mut entries: Vec<(u8, BytesMut)> = Vec::new();
         let mut offset = 0usize;
 
         while offset < input.len() {
@@ -277,7 +322,13 @@ impl Tlv8 {
             })?;
             offset += length;
 
-            entries.entry(tag).or_default().extend_from_slice(value);
+            if let Some((_, existing)) = entries.iter_mut().find(|(t, _)| *t == tag) {
+                existing.extend_from_slice(value);
+            } else {
+                let mut buffer = BytesMut::with_capacity(length);
+                buffer.extend_from_slice(value);
+                entries.push((tag, buffer));
+            }
         }
 
         Ok(Self {
@@ -302,8 +353,83 @@ mod tests {
             .with_byte(TlvValue::Method, 0x00)
             .with_byte(TlvValue::SeqNo, 0x01);
 
-        // Tags sort ascending: Method (0x00) then SeqNo (0x06).
+        // Insertion order here happens to match ascending tag order: Method (0x00) then
+        // SeqNo (0x06). `insertion_order_can_differ_from_tag_order` below covers the case where
+        // it doesn't.
         assert_eq!(&message.encode()[..], &[0x00, 0x01, 0x00, 0x06, 0x01, 0x01]);
+    }
+
+    /// pyatv's `write_tlv` walks a plain (insertion-ordered) `dict`, so the wire order is
+    /// caller-controlled construction order, not tag-numeric order
+    /// (`docs/research/hap-pairing-port-spec.md` §1.6). Inserting the higher tag first must
+    /// produce it first on the wire, matching pyatv's `DOUBLE_KEY_IN =
+    /// OrderedDict([(1, b"111"), (4, b"222")])` fixture pattern but with the order reversed
+    /// relative to tag value, to make sure a `BTreeMap`-style resort can't sneak back in.
+    #[test]
+    fn insertion_order_can_differ_from_tag_order() {
+        let message = Tlv8::new()
+            .with_byte(TlvValue::SeqNo, 0x02) // tag 0x06
+            .with_byte(TlvValue::Method, 0x00); // tag 0x00, inserted second
+
+        assert_eq!(
+            message.tags().collect::<Vec<_>>(),
+            vec![TlvValue::SeqNo as u8, TlvValue::Method as u8]
+        );
+        // SeqNo (tag 0x06) must appear before Method (tag 0x00) on the wire.
+        assert_eq!(&message.encode()[..], &[0x06, 0x01, 0x02, 0x00, 0x01, 0x00]);
+    }
+
+    /// Re-inserting an existing tag replaces its value without moving it, matching Python
+    /// `dict[key] = value` (which never changes a key's position). Ported from the observed
+    /// semantics of `pyatv/auth/hap_tlv8.py:write_tlv` building its `dict` literal.
+    #[test]
+    fn replacing_an_existing_tag_keeps_its_position() {
+        let message = Tlv8::new()
+            .with_byte(TlvValue::SeqNo, 0x01) // position 0
+            .with_byte(TlvValue::Method, 0x00) // position 1
+            .with_byte(TlvValue::SeqNo, 0x02); // replaces position 0, does not move to the end
+
+        assert_eq!(
+            message.tags().collect::<Vec<_>>(),
+            vec![TlvValue::SeqNo as u8, TlvValue::Method as u8]
+        );
+        assert_eq!(message.get_uint(TlvValue::SeqNo), Some(2));
+        assert_eq!(&message.encode()[..], &[0x06, 0x01, 0x02, 0x00, 0x01, 0x00]);
+    }
+
+    /// Ported from `tests/auth/test_hap_tlv8.py`'s `SINGLE_KEY_IN`/`SINGLE_KEY_OUT` fixture
+    /// (`docs/research/hap-pairing-port-spec.md` §1.8): a single uncatalogued-by-name-but-real
+    /// tag (`Signature = 0x0A`) with an ASCII value.
+    #[test]
+    fn pyatv_single_key_fixture() {
+        let message = Tlv8::new().with(TlvValue::Signature, Bytes::from_static(b"123"));
+        assert_eq!(&message.encode()[..], &[0x0a, 0x03, 0x31, 0x32, 0x33]);
+    }
+
+    /// Ported from `tests/auth/test_hap_tlv8.py`'s `DOUBLE_KEY_IN`/`DOUBLE_KEY_OUT` fixture: an
+    /// `OrderedDict([(1, b"111"), (4, b"222")])`, confirming insertion-order-preserving encode.
+    #[test]
+    fn pyatv_double_key_fixture() {
+        let message = Tlv8::new()
+            .with(TlvValue::Identifier, Bytes::from_static(b"111"))
+            .with(TlvValue::Proof, Bytes::from_static(b"222"));
+        assert_eq!(
+            &message.encode()[..],
+            &[0x01, 0x03, 0x31, 0x31, 0x31, 0x04, 0x03, 0x32, 0x32, 0x32]
+        );
+    }
+
+    /// Ported from `tests/auth/test_hap_tlv8.py`'s `LARGE_KEY_IN`/`LARGE_KEY_OUT` fixture: a
+    /// 256-byte value under `Salt` (tag 2) fragments into a 255-byte chunk and a 1-byte remainder,
+    /// both under the same tag.
+    #[test]
+    fn pyatv_large_key_fixture() {
+        let message = Tlv8::new().with(TlvValue::Salt, Bytes::from(vec![0x31u8; 256]));
+        let mut expected = vec![0x02, 0xff];
+        expected.extend(std::iter::repeat_n(0x31u8, 255));
+        expected.extend([0x02, 0x01, 0x31]);
+        assert_eq!(&message.encode()[..], &expected[..]);
+        assert_eq!(Tlv8::decode(&expected).unwrap(), message);
     }
 
     #[test]

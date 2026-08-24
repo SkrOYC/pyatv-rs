@@ -8,6 +8,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# A reference HAP accessory (`crate::server`) with pyatv's fixed test key material, so the client
+# state machines can be driven end to end without a device. Also unlocks the `#[doc(hidden)]`
+# constructors that pin a controller's pair-verify X25519 ephemeral (`EphemeralExchange::from_scalar`,
+# `PairVerify::start_with`), which the known-answer vectors in `tests/kat/` need in order to replay a
+# fixed exchange. Test-only; never enable it in a build that ships.
+test-server = []
+
 [lints]
 workspace = true
 
@@ -20,6 +28,8 @@ ctr = "0.10.1"
 ed25519-dalek = "3.0.0"
 hex = "0.4.3"
 hkdf = "0.13.0"
+num-bigint = "0.5.1"
+plist = "1.10.0"
 pyatv-core.workspace = true
 rand = "0.10.2"
 rand_core = "0.10.1"
@@ -30,3 +40,9 @@ subtle = "2.6.1"
 thiserror.workspace = true
 tracing.workspace = true
 x25519-dalek = "3.0.0"
+
+[dev-dependencies]
+hex = "0.4.3"
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+srp = "0.7.0-rc.3"

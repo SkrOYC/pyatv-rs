@@ -8,10 +8,14 @@
 //!
 //! Nothing in this crate performs I/O: it is a set of sans-io state machines and codecs that the protocol crates drive. That keeps the pairing logic testable against captured byte vectors with no runtime involved, which is the only practical way to validate a reverse-engineered protocol.
 
+pub mod chacha;
 pub mod credentials;
 pub mod error;
 pub mod hkdf_derive;
 pub mod legacy_auth;
+pub mod pairing;
+#[cfg(feature = "test-server")]
+pub mod server;
 pub mod session;
 pub mod srp_hap;
 pub mod srp_legacy;
@@ -19,6 +23,7 @@ pub mod tlv8;
 
 pub use credentials::{AuthenticationType, HapCredentials};
 pub use error::Error;
+pub use pairing::{PairSetup, PairVerify, SessionKeys, TransientPairSetup};
 pub use tlv8::{Tlv8, TlvValue};
 
 /// Convenience alias for fallible pairing operations.
