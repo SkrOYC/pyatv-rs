@@ -8,6 +8,16 @@
 //! Fields are addressed by a `/`-separated path (`"srp/client_proof_m1"`). A missing or
 //! wrong-shaped field panics with the path in the message, because a vector that has silently
 //! changed shape must fail loudly rather than assert on `None`.
+//!
+//! Shared, via `mod kat;`, by both `hap_srp_kat.rs` and `hap_verify_kat.rs`. Each integration test
+//! file is compiled as its own crate, so a method only one of the two sibling files calls looks
+//! unused from the other's point of view; the module-wide `dead_code` allow below is that, not
+//! genuinely unused API.
+
+#![allow(
+    dead_code,
+    reason = "each sibling *_kat.rs test binary only calls part of this API"
+)]
 
 use serde_json::Value;
 
