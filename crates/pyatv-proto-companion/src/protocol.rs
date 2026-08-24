@@ -13,14 +13,15 @@
 //! * **One exchange is in flight at a time.** pyatv can have many, keyed by XID
 //!   (`protocol.py:143-153`). Serialising them is what removes the background task, the shared
 //!   mutable queue map and pyatv's own unbounded `_queues` leak when a caller cancels a wait
-//!   (`docs/research/companion-port-spec.md` §12 finding 12). A response whose XID is not the one
-//!   being awaited is still kept — see `stash` — so nothing is lost if that changes later.
+//!   (`docs/research/companion-port-spec.md` §12 finding 12). A response whose XID is one this
+//!   side issued and has not yet resolved is still kept — see `stash` — so nothing is lost if that
+//!   changes later.
 //! * **Events are delivered on a channel** rather than to a listener object, so a caller that is
 //!   not currently in an exchange still receives them the next time it drives the loop.
 //!
 //! Everything on the wire is unchanged by either.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use pyatv_opack::Value;
@@ -35,6 +36,13 @@ use crate::{Error, Result};
 
 /// How long one exchange waits for its answer (`DEFAULT_TIMEOUT`, `protocol.py:38`).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many issued-but-unresolved XIDs may be tracked at once.
+///
+/// Because exchanges are serialised this is one in practice; the cap is what makes the bookkeeping
+/// safe to keep if that ever changes, and what stops a bug elsewhere from turning the two maps into
+/// an unbounded sink. The oldest entry is forgotten when a new one would exceed it.
+const MAX_OUTSTANDING: usize = 16;
 
 /// An event the device pushed.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,8 +71,17 @@ pub struct CompanionProtocol {
     connection: CompanionConnection,
     /// Next `_x` to hand out.
     xid: u32,
-    /// Responses that arrived for an XID nobody was waiting for yet, kept as raw OPACK so no key
-    /// is lost on the way back out.
+    /// XIDs handed to a device in an [`CompanionProtocol::exchange_opack`] that has not finished,
+    /// oldest first. Nothing else is correlated by XID: pairing frames are matched on frame type
+    /// and events are never answered, so their auto-stamped XIDs are deliberately absent.
+    outstanding: VecDeque<u32>,
+    /// Responses that arrived for an [`Self::outstanding`] XID nobody was waiting for yet, kept as
+    /// raw OPACK so no key is lost on the way back out.
+    ///
+    /// Keys are always a subset of [`Self::outstanding`], so this inherits its [`MAX_OUTSTANDING`]
+    /// bound. It used to accept **any** XID and never evict, which let a device — or anything able
+    /// to reach the port before pair-verify — grow it without limit by answering XIDs nobody asked
+    /// about.
     stash: HashMap<u32, Value>,
     events: mpsc::UnboundedSender<CompanionEvent>,
     timeout: Duration,
@@ -91,6 +108,7 @@ impl CompanionProtocol {
         let protocol = Self {
             connection,
             xid,
+            outstanding: VecDeque::new(),
             stash: HashMap::new(),
             events,
             timeout: DEFAULT_TIMEOUT,
@@ -129,6 +147,29 @@ impl CompanionProtocol {
         let xid = self.xid;
         self.xid = self.xid.wrapping_add(1);
         xid
+    }
+
+    /// Record an XID this side is about to await an answer for.
+    ///
+    /// Evicts the oldest outstanding XID, and anything stashed under it, rather than growing past
+    /// [`MAX_OUTSTANDING`].
+    fn issue(&mut self, xid: u32) {
+        while self.outstanding.len() >= MAX_OUTSTANDING
+            && let Some(forgotten) = self.outstanding.pop_front()
+        {
+            self.stash.remove(&forgotten);
+            tracing::debug!(xid = forgotten, "forgetting the oldest outstanding XID");
+        }
+        self.outstanding.push_back(xid);
+    }
+
+    /// Forget an XID once its exchange has finished, however it finished.
+    ///
+    /// Called on success, on failure and on timeout alike: a response that turns up after the
+    /// deadline has no waiter and never will, so it must not be kept.
+    fn resolve(&mut self, xid: u32) {
+        self.outstanding.retain(|candidate| *candidate != xid);
+        self.stash.remove(&xid);
     }
 
     /// Bring the connection up: pair-verify against stored credentials, then encrypt.
@@ -228,6 +269,7 @@ impl CompanionProtocol {
         };
 
         let xid = self.next_xid();
+        self.issue(xid);
         entries.retain(|(key, _)| key.as_str() != Some(KEY_XID));
         entries.push((Value::from(KEY_XID), Value::from(xid)));
 
@@ -278,12 +320,18 @@ impl CompanionProtocol {
             Awaiting::Xid(xid) => format!("a response to XID {xid}"),
         };
 
-        let value = tokio::time::timeout(self.timeout, self.pump_inner(awaiting))
-            .await
-            .map_err(|_| Error::Timeout {
-                what,
-                millis: u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
-            })??;
+        let outcome = tokio::time::timeout(self.timeout, self.pump_inner(awaiting)).await;
+
+        // Whatever happened, this XID is finished with: a late answer must be dropped rather than
+        // stashed for a waiter that has already given up.
+        if let Awaiting::Xid(xid) = awaiting {
+            self.resolve(xid);
+        }
+
+        let value = outcome.map_err(|_| Error::Timeout {
+            what,
+            millis: u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
+        })??;
 
         Envelope::from_value(&value)?.into_result()?;
         Ok(value)
@@ -432,21 +480,28 @@ impl CompanionProtocol {
             return Some(value);
         }
 
-        tracing::debug!(
-            xid,
-            "stashing a response for an XID that is not being awaited"
-        );
-        self.stash.insert(xid, value);
+        self.stash_response(envelope, value);
         None
     }
 
-    /// Keep a response nobody is waiting for, for the idle-read path.
+    /// Keep a response nobody is waiting for *yet*, or drop it if nobody ever will.
+    ///
+    /// Only an XID this side issued and has not resolved is worth keeping. Anything else — an XID
+    /// that was never handed out, or one whose exchange already returned or timed out — has no
+    /// possible waiter, so keeping it would be a memory sink a peer controls rather than a
+    /// correlation aid.
     fn stash_response(&mut self, envelope: &Envelope, value: Value) {
         let Some(xid) = envelope.xid else {
             tracing::warn!("dropping a response with no XID");
             return;
         };
-        tracing::debug!(xid, "stashing a response that arrived while idle");
+
+        if !self.outstanding.contains(&xid) {
+            tracing::debug!(xid, "dropping a response for an XID nobody is waiting for");
+            return;
+        }
+
+        tracing::debug!(xid, "stashing a response for an XID not currently awaited");
         self.stash.insert(xid, value);
     }
 
@@ -456,6 +511,7 @@ impl CompanionProtocol {
     ///
     /// Returns [`Error::Io`] if the socket shutdown fails.
     pub async fn close(&mut self) -> Result<()> {
+        self.outstanding.clear();
         self.stash.clear();
         self.connection.close().await
     }

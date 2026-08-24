@@ -71,6 +71,19 @@ pub enum Error {
         offset: usize,
     },
 
+    /// The payload decoded to far more memory than it occupies on the wire.
+    ///
+    /// OPACK back-references let one input byte produce a whole value, so a small frame can
+    /// materialise an arbitrarily large one. [`crate::de`]'s module docs describe the budget and
+    /// [`crate::de::unpack_with_budget`] raises or lowers it.
+    #[error("decoding materialised more than {limit} bytes (at offset {offset})")]
+    BudgetExceeded {
+        /// The ceiling that was exceeded.
+        limit: usize,
+        /// How far into the input the decoder had read.
+        offset: usize,
+    },
+
     /// Containers were nested more deeply than [`crate::MAX_DEPTH`].
     ///
     /// OPACK has no depth field, so a hostile `0xD1` repeated a million times would otherwise

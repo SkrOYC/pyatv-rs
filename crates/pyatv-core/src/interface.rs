@@ -23,6 +23,7 @@ pub use control::{Keyboard, RemoteControl, TouchGestures};
 pub use device::{Apps, Audio, Features, Power, UserAccounts};
 pub use playback::{Metadata, PlaybackListener, PushUpdater, Stream};
 
+use crate::consts::PowerState;
 use crate::models::{BaseService, DeviceInfo};
 use crate::{Error, Result};
 
@@ -65,6 +66,26 @@ pub trait AppleTV: Send + Sync + std::fmt::Debug {
     fn device_info(&self) -> &DeviceInfo;
     /// The service that drives the primary connection.
     fn service(&self) -> &BaseService;
+
+    /// Register a listener notified when a connection drops or is closed.
+    ///
+    /// Upstream reaches this through `StateProducer`, which `interface.AppleTV` inherits, so a
+    /// caller writes `atv.listener = mine`. There it is a single slot; here it is a list, because a
+    /// weakly held list costs nothing and "the last registration silently replaced yours" is not a
+    /// behaviour worth porting.
+    ///
+    /// The listener is held weakly: dropping your `Arc` unregisters it.
+    fn add_listener(&self, listener: &Arc<dyn DeviceListener>);
+
+    /// Register a listener notified when the device's power state changes.
+    ///
+    /// Upstream hangs this off the power interface instead (`atv.power.listener = mine`,
+    /// `pyatv/core/facade.py:305-333`). It is on the root object here because the facade is what
+    /// owns the listener list, and because a caller that wants power updates should not have to
+    /// discover that `power()` may be `None`.
+    ///
+    /// Held weakly, as [`AppleTV::add_listener`].
+    fn add_power_listener(&self, listener: &Arc<dyn PowerListener>);
 
     /// Tear down every protocol connection.
     fn close(&self) -> BoxFuture<'_, Result<()>>;
@@ -151,6 +172,19 @@ pub trait DeviceListener: Send + Sync + std::fmt::Debug {
     fn connection_lost(&self, reason: &str);
     /// The connection was closed on request.
     fn connection_closed(&self);
+}
+
+/// Notified when a connected device reports a new power state.
+///
+/// Ports `pyatv.interface.PowerListener` (`pyatv/interface.py:918-926`), whose one method is
+/// `powerstate_update(old_state, new_state)`. Both states are passed because upstream does and
+/// because "it changed" is rarely enough on its own — a listener usually wants to know whether the
+/// device just woke or just slept.
+///
+/// Registered through [`AppleTV::add_power_listener`] and held weakly.
+pub trait PowerListener: Send + Sync + std::fmt::Debug {
+    /// The device moved from `old_state` to `new_state`.
+    fn power_state_changed(&self, old_state: PowerState, new_state: PowerState);
 }
 
 /// Helper for protocol crates: the error every unimplemented capability should return.

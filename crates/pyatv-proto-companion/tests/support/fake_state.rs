@@ -74,6 +74,12 @@ pub enum Reply {
 /// Everything the device knows and a test can assert on.
 ///
 /// One instance is shared by every accepted connection, as `FakeCompanionState` is upstream.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a test fixture mirroring upstream's FakeCompanionState field for field; grouping \
+              its independent flags into sub-structs would make the port harder to check against \
+              tests/fake_device/companion.py for no benefit to the tests that read them"
+)]
 #[derive(Debug)]
 pub struct DeviceState {
     /// Whether a pair-setup completed.
@@ -120,6 +126,12 @@ pub struct DeviceState {
     pub touch_event: Option<(u64, u64, u64)>,
     /// The `_touchStart` dimensions the client asked for.
     pub touch_size: Option<(f64, f64)>,
+    /// Attach an `_iMC` push to **every** response.
+    ///
+    /// Not an upstream behaviour: it is the adversarial shape that used to wedge the client's
+    /// event drain, since handling an `_iMC` sent a `GetVolume` whose response carried another
+    /// `_iMC`, for ever. A real device pushes `_iMC` only when the flags change.
+    pub echo_media_control: bool,
 }
 
 impl Default for DeviceState {
@@ -151,6 +163,7 @@ impl Default for DeviceState {
             rti_session_uuid: None,
             touch_event: None,
             touch_size: None,
+            echo_media_control: false,
         }
     }
 }
@@ -163,6 +176,18 @@ impl DeviceState {
     pub fn handle(&mut self, identifier: &str, content: &Value, is_event: bool) -> Vec<Reply> {
         self.commands.push(identifier.to_owned());
 
+        let mut replies = self.dispatch(identifier, content, is_event);
+        if self.echo_media_control && !is_event {
+            replies.push(Reply::Event(
+                "_iMC",
+                opack! { "_mcF" => self.media_control_flags | 0x0100 },
+            ));
+        }
+        replies
+    }
+
+    /// The dispatch table itself.
+    fn dispatch(&mut self, identifier: &str, content: &Value, is_event: bool) -> Vec<Reply> {
         match identifier {
             "_interest" => self.interest(content),
             "_hidT" => {

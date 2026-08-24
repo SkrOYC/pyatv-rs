@@ -148,7 +148,7 @@ impl CompanionPairingHandler {
         let rendered = credentials.to_string();
         session.service.credentials = Some(rendered.clone());
         session.has_paired = true;
-        self.persist(&rendered)?;
+        self.persist(&rendered).await?;
 
         Ok(())
     }
@@ -188,16 +188,29 @@ impl CompanionPairingHandler {
     /// `self._settings.protocols.companion.credentials` together (`pairing.py:58-67`); the second
     /// is this. Settings for other protocols are preserved rather than overwritten, and the record
     /// is created if pairing is the first thing that has ever touched storage for this device.
-    fn persist(&self, credentials: &str) -> pyatv_core::Result<()> {
+    ///
+    /// [`Storage`] is a synchronous trait — see its module docs for why — and
+    /// [`Storage::save`] is the one method that really touches the disk. This is a library, so it
+    /// does not get to assume the caller's runtime can afford a blocking `write` plus an `fsync` on
+    /// a worker thread: the work goes to [`tokio::task::spawn_blocking`] rather than being done
+    /// inline. It happens once per pairing, so the extra task costs nothing measurable.
+    async fn persist(&self, credentials: &str) -> pyatv_core::Result<()> {
         tracing::debug!(identifier = %self.device_identifier, "storing Companion credentials");
+        // In-memory, so it stays on this thread.
         self.storage.store_credentials(
             &self.device_identifier,
             Protocol::Companion,
             credentials,
         )?;
+
         // Nothing is written to disk until `save()`; a pairing that is not persisted is a pairing
         // the user has to redo, so it happens here rather than being left to the caller.
-        self.storage.save()
+        let storage = Arc::clone(&self.storage);
+        tokio::task::spawn_blocking(move || storage.save())
+            .await
+            .map_err(|error| {
+                pyatv_core::Error::Storage(format!("saving credentials panicked: {error}"))
+            })?
     }
 }
 

@@ -14,11 +14,12 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::Result;
+use crate::consts::PowerState;
 use crate::consts::Protocol;
 use crate::features::FeatureName;
 use crate::interface::{
     AppleTV, Apps, Audio, BoxFuture, DeviceListener, Features, Keyboard, Metadata, Power,
-    ProtocolHandle, PushUpdater, RemoteControl, Stream, TouchGestures, UserAccounts,
+    PowerListener, ProtocolHandle, PushUpdater, RemoteControl, Stream, TouchGestures, UserAccounts,
 };
 use crate::models::{BaseService, DeviceInfo};
 use crate::relayer::Relayer;
@@ -89,6 +90,70 @@ pub struct SetupData {
     pub device_info: DeviceInfo,
 }
 
+/// The listener registry a facade shares with the protocol connections reporting to it.
+///
+/// This is deliberately a separate, `Arc`-able object rather than a field on [`FacadeAppleTV`]: a
+/// protocol's `setup()` needs somewhere to report a dropped connection to, and it needs it *before*
+/// the facade has finished being assembled. `FacadeAppleTV` itself cannot be shared at that point
+/// — `add_protocol` takes `&mut self` — so the hub is created first, handed to every protocol, and
+/// kept by the facade afterwards.
+///
+/// Both lists hold [`Weak`] references, so a caller that drops its listener unregisters it and
+/// cannot leak it into the facade's lifetime. Upstream's `StateProducer` also holds listeners
+/// weakly, and also has exactly one slot per interface; a list is used here because replacing a
+/// previous caller's listener without telling them is not worth reproducing.
+#[derive(Debug, Default)]
+pub struct ListenerHub {
+    devices: Mutex<Vec<Weak<dyn DeviceListener>>>,
+    power: Mutex<Vec<Weak<dyn PowerListener>>>,
+}
+
+impl ListenerHub {
+    /// Register a connection listener.
+    pub fn add_listener(&self, listener: &Arc<dyn DeviceListener>) {
+        if let Ok(mut listeners) = self.devices.lock() {
+            listeners.push(Arc::downgrade(listener));
+        }
+    }
+
+    /// Register a power-state listener.
+    pub fn add_power_listener(&self, listener: &Arc<dyn PowerListener>) {
+        if let Ok(mut listeners) = self.power.lock() {
+            listeners.push(Arc::downgrade(listener));
+        }
+    }
+}
+
+impl DeviceListener for ListenerHub {
+    fn connection_lost(&self, reason: &str) {
+        tracing::debug!(reason, "a protocol connection was lost");
+        if let Ok(listeners) = self.devices.lock() {
+            for listener in listeners.iter().filter_map(Weak::upgrade) {
+                listener.connection_lost(reason);
+            }
+        }
+    }
+
+    fn connection_closed(&self) {
+        if let Ok(listeners) = self.devices.lock() {
+            for listener in listeners.iter().filter_map(Weak::upgrade) {
+                listener.connection_closed();
+            }
+        }
+    }
+}
+
+impl PowerListener for ListenerHub {
+    fn power_state_changed(&self, old_state: PowerState, new_state: PowerState) {
+        tracing::debug!(?old_state, ?new_state, "the device power state changed");
+        if let Ok(listeners) = self.power.lock() {
+            for listener in listeners.iter().filter_map(Weak::upgrade) {
+                listener.power_state_changed(old_state, new_state);
+            }
+        }
+    }
+}
+
 /// Unified view of one device across every connected protocol.
 #[derive(Debug)]
 pub struct FacadeAppleTV {
@@ -104,7 +169,7 @@ pub struct FacadeAppleTV {
     user_accounts: Relayer<dyn UserAccounts>,
     features: Arc<FacadeFeatures>,
     handles: Vec<(Protocol, Arc<dyn ProtocolHandle>)>,
-    listeners: Mutex<Vec<Weak<dyn DeviceListener>>>,
+    listeners: Arc<ListenerHub>,
     device_info: DeviceInfo,
     service: BaseService,
 }
@@ -130,7 +195,7 @@ impl FacadeAppleTV {
             user_accounts: default(),
             features: Arc::new(FacadeFeatures::default()),
             handles: Vec::new(),
-            listeners: Mutex::new(Vec::new()),
+            listeners: Arc::new(ListenerHub::default()),
             device_info: DeviceInfo::default(),
             service,
         }
@@ -167,18 +232,15 @@ impl FacadeAppleTV {
         register!(touch_gestures);
         register!(user_accounts);
 
-        // `Arc::get_mut` cannot fail here: `features()` is the only thing that clones the `Arc`,
-        // and it takes `&self` while this takes `&mut self`, so no clone can be outstanding.
-        if let Some(facade_features) = Arc::get_mut(&mut self.features) {
-            if let Some(features) = data.features_impl {
-                // `add_mapping` (`facade.py:274-284`): a feature is owned by the highest-priority
-                // protocol that declared it, and later registrations only win if they outrank the
-                // incumbent.
-                facade_features.add_mapping(protocol, &data.features, &features);
-            }
-            if has_push_updater {
-                facade_features.set_push_updates(true);
-            }
+        if let Some(features) = data.features_impl {
+            // `add_mapping` (`facade.py:274-284`): a feature is owned by the highest-priority
+            // protocol that declared it, and later registrations only win if they outrank the
+            // incumbent.
+            self.features
+                .add_mapping(protocol, &data.features, &features);
+        }
+        if has_push_updater {
+            self.features.set_push_updates(true);
         }
 
         if let Some(handle) = data.handle {
@@ -191,13 +253,14 @@ impl FacadeAppleTV {
         self.device_info.merge_from(&data.device_info);
     }
 
-    /// Register a listener notified when a connection drops.
+    /// The registry to hand a protocol's `setup()` so its connection reports here.
     ///
-    /// Held weakly, so a caller that drops its listener does not leak it.
-    pub fn add_listener(&self, listener: &Arc<dyn DeviceListener>) {
-        if let Ok(mut listeners) = self.listeners.lock() {
-            listeners.push(Arc::downgrade(listener));
-        }
+    /// Taken before any protocol is set up — see [`ListenerHub`] for why it has to be a separate
+    /// object — and handed to each of them, so a protocol that drops its socket reaches every
+    /// listener the caller registers later.
+    #[must_use]
+    pub fn listener_hub(&self) -> Arc<ListenerHub> {
+        Arc::clone(&self.listeners)
     }
 
     /// Every protocol that contributed at least one capability.
@@ -233,20 +296,11 @@ impl FacadeAppleTV {
 impl DeviceListener for FacadeAppleTV {
     /// Fan a protocol's connection loss out to every registered listener.
     fn connection_lost(&self, reason: &str) {
-        tracing::debug!(reason, "a protocol connection was lost");
-        if let Ok(listeners) = self.listeners.lock() {
-            for listener in listeners.iter().filter_map(Weak::upgrade) {
-                listener.connection_lost(reason);
-            }
-        }
+        self.listeners.connection_lost(reason);
     }
 
     fn connection_closed(&self) {
-        if let Ok(listeners) = self.listeners.lock() {
-            for listener in listeners.iter().filter_map(Weak::upgrade) {
-                listener.connection_closed();
-            }
-        }
+        self.listeners.connection_closed();
     }
 }
 
@@ -303,6 +357,14 @@ impl AppleTV for FacadeAppleTV {
         &self.service
     }
 
+    fn add_listener(&self, listener: &Arc<dyn DeviceListener>) {
+        self.listeners.add_listener(listener);
+    }
+
+    fn add_power_listener(&self, listener: &Arc<dyn PowerListener>) {
+        self.listeners.add_power_listener(listener);
+    }
+
     /// Close every protocol in turn.
     ///
     /// Upstream collects a task per protocol and lets the caller await them all
@@ -326,5 +388,107 @@ impl AppleTV for FacadeAppleTV {
             self.connection_closed();
             first_error.map_or(Ok(()), Err)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use super::{FacadeAppleTV, SetupData};
+    use crate::consts::Protocol;
+    use crate::features::{FeatureInfo, FeatureName, FeatureState};
+    use crate::interface::{AppleTV, Features};
+    use crate::models::BaseService;
+
+    /// A protocol whose every feature is available, so the test can see whether it was consulted.
+    #[derive(Debug)]
+    struct Available;
+
+    impl Features for Available {
+        fn get_feature(&self, _feature: FeatureName) -> FeatureInfo {
+            FeatureInfo::available()
+        }
+
+        fn all_features(&self, _include_unsupported: bool) -> Vec<(FeatureName, FeatureInfo)> {
+            Vec::new()
+        }
+    }
+
+    fn setup_data(protocol: Protocol, feature: FeatureName) -> SetupData {
+        let mut features = BTreeSet::new();
+        features.insert(feature);
+        SetupData {
+            protocol: Some(protocol),
+            features,
+            features_impl: Some(Arc::new(Available)),
+            ..SetupData::default()
+        }
+    }
+
+    fn facade() -> FacadeAppleTV {
+        FacadeAppleTV::new(BaseService::new(Protocol::Companion, 49153))
+    }
+
+    /// A feature handle taken before a protocol connects must see that protocol afterwards.
+    ///
+    /// `add_protocol` used to reach into the registry with `Arc::get_mut`, which returns `None`
+    /// while any clone of the `Arc` is alive — and `features()` hands out exactly such a clone. A
+    /// caller that read `atv.features()` once and then connected another protocol therefore had
+    /// that protocol's entire feature mapping dropped on the floor, silently, with the feature
+    /// reporting `Unsupported` for the rest of the session.
+    #[test]
+    fn features_registered_after_a_handle_was_taken_are_still_visible() {
+        let mut facade = facade();
+        let handle = facade.features();
+        assert_eq!(
+            handle.get_feature(FeatureName::AppList).state,
+            FeatureState::Unsupported
+        );
+
+        facade.add_protocol(setup_data(Protocol::Companion, FeatureName::AppList));
+
+        assert_eq!(
+            handle.get_feature(FeatureName::AppList).state,
+            FeatureState::Available,
+            "the handle taken earlier must see the new mapping"
+        );
+        assert_eq!(
+            facade.features().get_feature(FeatureName::AppList).state,
+            FeatureState::Available,
+            "and so must a freshly taken one"
+        );
+    }
+
+    /// The same for the push-updates flag, which takes the other branch of `add_protocol`.
+    #[test]
+    fn a_second_protocol_registers_even_with_handles_outstanding() {
+        let mut facade = facade();
+        facade.add_protocol(setup_data(Protocol::Companion, FeatureName::AppList));
+
+        let handle = facade.features();
+        facade.add_protocol(setup_data(Protocol::Mrp, FeatureName::Title));
+
+        assert_eq!(
+            handle.get_feature(FeatureName::Title).state,
+            FeatureState::Available
+        );
+        assert_eq!(
+            handle.get_feature(FeatureName::AppList).state,
+            FeatureState::Available
+        );
+    }
+
+    /// A facade with no protocols reports nothing and holds no handles.
+    #[test]
+    fn an_empty_facade_is_empty() {
+        let facade = facade();
+        assert!(facade.is_empty());
+        assert!(facade.connected_protocols().is_empty());
+        assert_eq!(
+            facade.features().get_feature(FeatureName::AppList).state,
+            FeatureState::Unsupported
+        );
     }
 }

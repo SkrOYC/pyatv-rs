@@ -44,11 +44,14 @@ pub struct FakeCompanionDevice {
     accessory: Arc<Mutex<ReferenceAccessory>>,
     state: Arc<Mutex<DeviceState>>,
     task: tokio::task::JoinHandle<()>,
+    /// Every accepted connection, so a test can drop them out from under the client.
+    connections: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Drop for FakeCompanionDevice {
     fn drop(&mut self) {
         self.task.abort();
+        self.kill_connections();
     }
 }
 
@@ -66,16 +69,21 @@ impl FakeCompanionDevice {
 
         let accessory = Arc::new(Mutex::new(ReferenceAccessory::with_pin(pin)));
         let state = Arc::new(Mutex::new(DeviceState::default()));
+        let connections = Arc::new(std::sync::Mutex::new(Vec::new()));
         let served_accessory = Arc::clone(&accessory);
         let served_state = Arc::clone(&state);
+        let served_connections = Arc::clone(&connections);
 
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let accessory = Arc::clone(&served_accessory);
                 let state = Arc::clone(&served_state);
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     Connection::new(stream, accessory, state).serve().await;
                 });
+                if let Ok(mut open) = served_connections.lock() {
+                    open.push(handle);
+                }
             }
         });
 
@@ -84,6 +92,21 @@ impl FakeCompanionDevice {
             accessory,
             state,
             task,
+            connections,
+        }
+    }
+
+    /// Yank every live connection, as a device losing power or Wi-Fi would.
+    ///
+    /// Aborting the task drops its `TcpStream`, which closes the socket; the client sees the read
+    /// return zero bytes. This is the only way to reach the `connection_lost` path — a graceful
+    /// `close()` takes the other branch.
+    pub fn kill_connections(&self) {
+        let Ok(mut open) = self.connections.lock() else {
+            return;
+        };
+        for handle in open.drain(..) {
+            handle.abort();
         }
     }
 

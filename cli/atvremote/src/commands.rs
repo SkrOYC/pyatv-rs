@@ -112,6 +112,17 @@ pub async fn resolve_device(cli: &Cli) -> Result<BaseConfig> {
 /// that is saved without having been loaded writes an empty document over the user's credentials.
 /// Upstream loads at the same point (`pyatv/scripts/atvremote.py:715-716`).
 ///
+/// # Blocking
+///
+/// [`pyatv::Storage`] is a synchronous trait, so this reads the file on the calling thread — and
+/// its callers are `async fn`s, so that is a Tokio worker. This is deliberate rather than
+/// overlooked: `atvremote` is a one-shot process that loads once at the top of a command and saves
+/// once at the bottom, the file is a few kilobytes of local JSON, and there is no other task on the
+/// runtime whose latency the read could affect. A long-lived application embedding this workspace
+/// should wrap these calls in [`tokio::task::spawn_blocking`], which is what the library itself
+/// does at the one point it writes to storage without the caller asking
+/// (`pyatv_proto_companion::pairing`).
+///
 /// # Errors
 ///
 /// Fails if no settings path could be determined, or if the file exists but could not be read or

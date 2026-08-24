@@ -20,10 +20,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use pyatv_core::facade::SetupData;
-use pyatv_core::interface::{BoxFuture, DeviceListener, Features, ProtocolHandle};
+use pyatv_core::interface::{BoxFuture, DeviceListener, Features, PowerListener, ProtocolHandle};
 use pyatv_core::storage::InfoSettings;
 use pyatv_core::{
-    BaseService, DeviceInfo, DeviceModel, FeatureInfo, FeatureName, Protocol, device_info,
+    BaseService, DeviceInfo, DeviceModel, FeatureInfo, FeatureName, FeatureState, Protocol,
+    device_info,
 };
 use pyatv_pairing::HapCredentials;
 
@@ -173,11 +174,20 @@ impl Features for CompanionFeatures {
         FeatureInfo::unavailable()
     }
 
+    /// Every feature, filtered on the reported **state** rather than on membership.
+    ///
+    /// `Features.all_features` (`pyatv/interface.py:1088-1095`) keeps a feature when
+    /// `info.state != FeatureState.Unsupported or include_unsupported`, and `CompanionFeatures`
+    /// does not override it. Filtering on `self.declared` instead was wrong twice over: it dropped
+    /// the `Unavailable` answer the fourth branch of [`Features::get_feature`] gives for an
+    /// undeclared feature, which upstream *does* report, and it kept
+    /// [`FeatureName::PowerState`] while it is still `Unsupported`, which upstream does not. It
+    /// also disagreed with [`pyatv_core::facade::FacadeFeatures`], which already filtered on state.
     fn all_features(&self, include_unsupported: bool) -> Vec<(FeatureName, FeatureInfo)> {
         FeatureName::ALL
             .into_iter()
             .map(|feature| (feature, self.get_feature(feature)))
-            .filter(|(feature, _)| include_unsupported || self.declared.contains(feature))
+            .filter(|(_, info)| include_unsupported || info.state != FeatureState::Unsupported)
             .collect()
     }
 }
@@ -205,6 +215,12 @@ pub struct CompanionSetupOptions {
     pub info: InfoSettings,
     /// Notified if the connection drops without the caller asking.
     pub listener: Option<Arc<dyn DeviceListener>>,
+    /// Notified when the device reports a new power state.
+    ///
+    /// Companion is the protocol that learns this first — it is the one subscribed to
+    /// `SystemStatus`/`TVSystemStatus` — so this is where upstream's `PowerListener` chain starts
+    /// (`__init__.py:253-278`).
+    pub power_listener: Option<Arc<dyn PowerListener>>,
 }
 
 /// Connect Companion and describe what it contributes.
@@ -236,8 +252,16 @@ pub async fn setup(options: CompanionSetupOptions) -> Result<Option<SetupData>> 
     let credentials = HapCredentials::parse(credentials).map_err(Error::Pairing)?;
     let info = system_info(&options.info, credentials.client_id.clone());
 
-    let api =
-        Arc::new(CompanionApi::connect(options.peer, &credentials, &info, options.listener).await?);
+    let api = Arc::new(
+        CompanionApi::connect(
+            options.peer,
+            &credentials,
+            &info,
+            options.listener,
+            options.power_listener,
+        )
+        .await?,
+    );
 
     // `await power.initialize()` inside `_connect` (`__init__.py:684-687`). Infallible by design:
     // newer tvOS refuses `FetchAttentionState`, and that must not fail the connection.

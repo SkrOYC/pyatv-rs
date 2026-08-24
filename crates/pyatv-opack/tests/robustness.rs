@@ -225,3 +225,113 @@ fn trailing_bytes_are_left_for_the_caller() {
     let (value, consumed) = unpack(&[0x08, 0xFF, 0xFF]).expect("a small integer decodes");
     assert_eq!((value, consumed), (Value::Uint(0), 1));
 }
+
+// ---- The materialised-byte budget ----
+
+/// The exact amplification a reviewer found: a one-mebibyte frame that decodes to tens of
+/// gigabytes.
+///
+/// The array holds one 60 000-byte string and then nothing but `0xA0`, the one-byte back-reference
+/// to it. Every bound the decoder had before the budget landed is satisfied — no length is large,
+/// nothing nests, every read is inside the buffer — yet with an owned `String` payload the clones
+/// alone came to roughly 56 GB and the process was killed. This is reachable before authentication,
+/// since Companion decodes `PS_`/`PV_` frames in the clear.
+///
+/// The assertion is deliberately two-part: the error proves the budget fired, and the wall clock
+/// proves it fired *early* rather than after materialising the payload and noticing afterwards.
+fn back_reference_bomb(total: usize) -> Vec<u8> {
+    const TEXT: usize = 60_000;
+
+    let mut payload = Vec::with_capacity(total);
+    payload.push(0xDF); // array, open-ended
+    payload.push(0x62); // string with a two-byte little-endian length
+    payload.extend_from_slice(&u16::try_from(TEXT).expect("fits").to_le_bytes());
+    payload.extend(std::iter::repeat_n(b'a', TEXT));
+    payload.extend(std::iter::repeat_n(0xA0, total - payload.len() - 1));
+    payload.push(0x03); // terminator
+    payload
+}
+
+#[test]
+fn a_back_reference_bomb_is_refused_before_it_is_materialised() {
+    let payload = back_reference_bomb(1024 * 1024);
+    assert_eq!(payload.len(), 1024 * 1024);
+
+    let started = std::time::Instant::now();
+    let error = unpack(&payload).expect_err("a 56 GB expansion must not be decoded");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(error, Error::BudgetExceeded { .. }),
+        "expected the budget to fire, got {error}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the budget must fire early, not after the damage; took {elapsed:?}"
+    );
+}
+
+/// The same payload decodes fine once the caller says it means it, which is what keeps the budget
+/// a policy rather than a format restriction.
+#[test]
+fn an_explicit_budget_lets_the_caller_decode_what_the_default_refuses() {
+    let payload = back_reference_bomb(64 * 1024);
+    let (value, consumed) = pyatv_opack::unpack_with_budget(&payload, 64 * 1024 * 1024)
+        .expect("a raised budget must accept it");
+
+    assert_eq!(consumed, payload.len());
+    let items = value.as_array().expect("the payload is an array");
+    // One inline string plus one back-reference per remaining byte.
+    assert_eq!(items.len(), 64 * 1024 - 60_004);
+    assert_eq!(items[0].as_str().map(str::len), Some(60_000));
+    assert_eq!(items[1], items[0]);
+}
+
+/// Every real Companion message is a few kilobytes, so the floor has to be comfortably above them.
+#[test]
+fn the_default_budget_has_a_floor_and_a_ceiling() {
+    use pyatv_opack::de::{MAX_BUDGET, MIN_BUDGET, default_budget};
+
+    assert_eq!(default_budget(0), MIN_BUDGET);
+    assert_eq!(default_budget(1024), MIN_BUDGET);
+    assert_eq!(default_budget(1024 * 1024), 4 * 1024 * 1024);
+    assert_eq!(default_budget(usize::MAX), MAX_BUDGET);
+}
+
+/// Many distinct short strings must decode in linear-ish time.
+///
+/// The decoder records every string it sees so a later back-reference can name it, and the
+/// "have I seen this?" test used to be a linear scan of everything recorded so far — quadratic in
+/// the number of distinct values. The bucket map fixes that, but only while the digests spread:
+/// `DefaultHasher::new()` is `SipHash` with a fixed zero key, so a precomputed set of colliding
+/// short strings put every value back in one bucket and restored the quadratic behaviour. Seeding
+/// the table from `RandomState` makes such a set unconstructible from outside the process, which is
+/// also why this test uses plain distinct strings — after the fix there is no longer a way to
+/// build the adversarial input, so what is left to assert is that the ordinary case is fast.
+///
+/// The budget is raised explicitly because this payload is a legitimate instance of the one shape
+/// the default refuses: tens of thousands of very short elements.
+#[test]
+fn thousands_of_distinct_strings_decode_in_linear_time() {
+    const COUNT: usize = 20_000;
+
+    let mut payload = vec![0xDF];
+    for index in 0..COUNT {
+        let text = format!("k{index:07}");
+        payload.push(0x40 + u8::try_from(text.len()).expect("eight bytes"));
+        payload.extend_from_slice(text.as_bytes());
+    }
+    payload.push(0x03);
+
+    let started = std::time::Instant::now();
+    let (value, consumed) = pyatv_opack::unpack_with_budget(&payload, pyatv_opack::de::MAX_BUDGET)
+        .expect("distinct short strings are a well-formed payload");
+    let elapsed = started.elapsed();
+
+    assert_eq!(consumed, payload.len());
+    assert_eq!(value.as_array().map(<[Value]>::len), Some(COUNT));
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "decoding {COUNT} distinct strings must not be quadratic; took {elapsed:?}"
+    );
+}

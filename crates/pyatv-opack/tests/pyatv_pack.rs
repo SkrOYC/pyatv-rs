@@ -16,7 +16,7 @@ fn packed(value: &Value) -> Vec<u8> {
 }
 
 fn repeat_string(unit: &str, count: usize) -> Value {
-    Value::String(unit.repeat(count))
+    Value::from(unit.repeat(count))
 }
 
 fn repeat_data(byte: u8, count: usize) -> Value {
@@ -41,7 +41,7 @@ fn pack_unsupported_type() {
         },
         Value::Float(1.0),
         Value::Float32(1.0),
-        Value::String("a".into()),
+        Value::from("a"),
         Value::Data(Bytes::from_static(b"a")),
         Value::Uuid([0; 16]),
         Value::Array(vec![Value::Null]),
@@ -246,8 +246,8 @@ fn pack_endless_dict() {
         .step_by(2)
         .map(|code| {
             (
-                Value::String(char::from(code).to_string()),
-                Value::String(char::from(code + 1).to_string()),
+                Value::from(char::from(code).to_string()),
+                Value::from(char::from(code + 1).to_string()),
             )
         })
         .collect();

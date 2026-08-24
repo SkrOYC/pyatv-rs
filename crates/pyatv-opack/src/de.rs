@@ -17,6 +17,35 @@
 //! (`opack.py:209`), not `& 0xF0`, so `0xF0..=0xFF` also decode as dictionaries with
 //! `tag & 0xF` entries. Nothing is known to emit those tags, but the reference implementation
 //! accepts them and the goal is to accept whatever a device might send.
+//!
+//! # The materialised-byte budget
+//!
+//! Bounds-checking every read is not enough on its own, because OPACK's back-reference mechanism
+//! lets one input byte *produce* a value. `0xA0` is a single byte that yields whatever the first
+//! interned value was, so a one-megabyte frame holding one 60 000-byte string followed by ~988 000
+//! `0xA0` bytes inside a `0xDF` array decodes to a 988 000-element vector — and, before
+//! [`Value::String`] became an [`Arc`], to roughly 56 GB of copied text. Neither the depth cap nor
+//! the length checks see any of that: nothing is ever "too long", there are simply a great many
+//! short things.
+//!
+//! [`unpack`] therefore charges a budget for the bytes a decode *materialises*:
+//!
+//! * a string or byte string costs its length;
+//! * every container element and every resolved back-reference costs [`ELEMENT_COST`], the size of
+//!   one [`Value`] slot in the vector holding it.
+//!
+//! Back-references cost a slot and not the referenced value's length because, with the [`Arc`] and
+//! [`bytes::Bytes`] payloads, resolving one really is a refcount bump — charging the full length
+//! would reject the legitimate payloads interning exists to produce.
+//!
+//! The default ceiling is `max(4 × input length, 64 KiB)`, capped at [`MAX_BUDGET`]. Four times the
+//! input covers any payload whose expansion is proportional to what was sent, and the 64 KiB floor
+//! keeps small frames — every real Companion message is a few kilobytes — well clear of it. The
+//! one shape it *does* refuse is a very large, very dense array of single-byte values, which costs
+//! [`ELEMENT_COST`] per input byte; no Apple protocol sends one, and [`unpack_with_budget`] is
+//! there for a caller that disagrees.
+
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -37,17 +66,59 @@ use crate::{Error, MAX_DEPTH, Result};
 /// pyatv's reference implementation does not define, [`Error::IntegerTooWide`] for the
 /// unrepresentable integer widths, [`Error::InvalidUtf8`] for a malformed string,
 /// [`Error::BadBackReference`] for a pointer past the end of the object table,
-/// [`Error::LengthOverflow`] for a length that does not fit this target's `usize`, and
-/// [`Error::DepthLimitExceeded`] when containers nest deeper than [`MAX_DEPTH`].
+/// [`Error::LengthOverflow`] for a length that does not fit this target's `usize`,
+/// [`Error::DepthLimitExceeded`] when containers nest deeper than [`MAX_DEPTH`], and
+/// [`Error::BudgetExceeded`] when the payload decodes to far more than it occupies on the wire —
+/// see the module docs.
 pub fn unpack(input: &[u8]) -> Result<(Value, usize)> {
+    unpack_with_budget(input, default_budget(input.len()))
+}
+
+/// [`unpack`] with an explicit materialised-byte ceiling.
+///
+/// For the rare caller that legitimately decodes something the default budget refuses — a huge,
+/// dense array of single-byte values is the only known shape — or one that wants a tighter bound
+/// than the default on a payload from an untrusted peer.
+///
+/// # Errors
+///
+/// As [`unpack`].
+pub fn unpack_with_budget(input: &[u8], budget: usize) -> Result<(Value, usize)> {
     let mut decoder = Decoder {
         input,
         offset: 0,
         table: UnpackTable::default(),
         depth: 0,
+        budget,
+        spent: 0,
     };
     let value = decoder.value()?;
     Ok((value, decoder.offset))
+}
+
+/// What one [`Value`] slot in a container's backing vector costs the budget.
+///
+/// The real size of the enum, so the budget tracks the allocation a decode actually performs
+/// rather than a number picked to look tidy.
+pub const ELEMENT_COST: usize = size_of::<Value>();
+
+/// The budget floor, so that a small frame is never refused for being small.
+pub const MIN_BUDGET: usize = 64 * 1024;
+
+/// The budget ceiling, whatever the input length suggests.
+pub const MAX_BUDGET: usize = 16 * 1024 * 1024;
+
+/// `max(4 × len, MIN_BUDGET)`, capped at [`MAX_BUDGET`].
+#[must_use]
+pub const fn default_budget(input_len: usize) -> usize {
+    let scaled = input_len.saturating_mul(4);
+    if scaled < MIN_BUDGET {
+        MIN_BUDGET
+    } else if scaled > MAX_BUDGET {
+        MAX_BUDGET
+    } else {
+        scaled
+    }
 }
 
 /// Decoder state, including the back-reference table.
@@ -57,6 +128,10 @@ struct Decoder<'a> {
     offset: usize,
     table: UnpackTable,
     depth: usize,
+    /// Ceiling on the bytes this decode may materialise; see the module docs.
+    budget: usize,
+    /// How much of it has been charged so far.
+    spent: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -108,6 +183,21 @@ impl<'a> Decoder<'a> {
             return Err(Error::DepthLimitExceeded { limit: MAX_DEPTH });
         }
         self.depth += 1;
+        Ok(())
+    }
+
+    /// Charge `bytes` against the materialised-byte budget.
+    ///
+    /// Saturating rather than wrapping: an overflowing total is by definition over budget, and the
+    /// reported figure is a diagnostic rather than a measurement.
+    fn charge(&mut self, bytes: usize) -> Result<()> {
+        self.spent = self.spent.saturating_add(bytes);
+        if self.spent > self.budget {
+            return Err(Error::BudgetExceeded {
+                limit: self.budget,
+                offset: self.offset,
+            });
+        }
         Ok(())
     }
 
@@ -194,16 +284,27 @@ impl<'a> Decoder<'a> {
     }
 
     fn string(&mut self, length: usize, start: usize) -> Result<Value> {
+        // Charged after `take`, so a length prefix that is merely a lie about a truncated buffer
+        // still reports the truncation rather than the budget.
         let bytes = self.take(length)?;
         let text = core::str::from_utf8(bytes).map_err(|_| Error::InvalidUtf8 { offset: start })?;
-        Ok(Value::String(text.to_owned()))
+        self.charge(length)?;
+        Ok(Value::String(Arc::from(text)))
     }
 
     fn data(&mut self, length: usize) -> Result<Value> {
-        Ok(Value::Data(Bytes::copy_from_slice(self.take(length)?)))
+        let bytes = Bytes::copy_from_slice(self.take(length)?);
+        self.charge(length)?;
+        Ok(Value::Data(bytes))
     }
 
+    /// Resolve a back-reference, charging one [`Value`] slot for the clone.
+    ///
+    /// One slot and not the referenced value's length: only scalars are ever interned (containers
+    /// are recorded by neither side, see [`crate::ser`]), and every scalar payload is either
+    /// inline, an [`Arc`] or a [`Bytes`], so the clone is O(1) whatever the value's length.
     fn back_reference(&mut self, index: usize) -> Result<Value> {
+        self.charge(ELEMENT_COST)?;
         self.table
             .get(index)
             .cloned()
@@ -218,11 +319,13 @@ impl<'a> Decoder<'a> {
         let mut items = Vec::new();
         if count == tags::CONTAINER_ENDLESS_COUNT {
             while self.peek()? != tags::TERMINATOR {
+                self.charge(ELEMENT_COST)?;
                 items.push(self.value()?);
             }
             self.offset += 1;
         } else {
             for _ in 0..count {
+                self.charge(ELEMENT_COST)?;
                 items.push(self.value()?);
             }
         }
@@ -235,12 +338,14 @@ impl<'a> Decoder<'a> {
         let mut entries = Vec::new();
         if count == tags::CONTAINER_ENDLESS_COUNT {
             while self.peek()? != tags::TERMINATOR {
+                self.charge(2 * ELEMENT_COST)?;
                 let key = self.value()?;
                 entries.push((key, self.value()?));
             }
             self.offset += 1;
         } else {
             for _ in 0..count {
+                self.charge(2 * ELEMENT_COST)?;
                 let key = self.value()?;
                 entries.push((key, self.value()?));
             }

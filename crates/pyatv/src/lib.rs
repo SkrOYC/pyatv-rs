@@ -21,8 +21,9 @@ pub use pair::pair;
 pub use scan::scan;
 
 pub use pyatv_core::interface::{
-    AppleTV, Apps, Audio, Features, Keyboard, Metadata, PairingHandler, PlaybackListener, Power,
-    PushUpdater, RemoteControl, Stream, TouchGestures, UserAccounts,
+    AppleTV, Apps, Audio, DeviceListener, Features, Keyboard, Metadata, PairingHandler,
+    PlaybackListener, Power, PowerListener, PushUpdater, RemoteControl, Stream, TouchGestures,
+    UserAccounts,
 };
 pub use pyatv_core::models::Playing;
 pub use pyatv_core::storage::{

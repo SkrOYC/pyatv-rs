@@ -108,7 +108,8 @@ fn hex_identifier() -> String {
     bytes
         .iter()
         .fold(String::with_capacity(12), |mut out, byte| {
-            // Writing into a `String` is infallible; the `Result` exists only for the generic trait.
+            // Writing into a `String` is infallible; the `Result` exists only for the generic
+            // trait.
             let _ = write!(out, "{byte:02x}");
             out
         })
@@ -204,6 +205,12 @@ pub async fn begin_session(protocol: &mut CompanionProtocol, info: &SystemInfo) 
 ///
 /// The client picks a random `u32`, the device answers with one of its own, and the session id is
 /// `(remote << 32) | local` (`api.py:213-225`). Only `_sessionStop` ever uses it.
+///
+/// The device's half is masked to 32 bits. `_sid` is an OPACK integer and nothing on the wire
+/// stops a device — or anything that reached the port — from putting a full `u64` there; upstream
+/// shifts a Python bignum and quietly ends up with a 96-bit identifier, while a `u64` shift here
+/// would silently discard the high bits and produce a `_sessionStop` the device does not
+/// recognise. Masking makes the truncation explicit and says so in the log.
 async fn start_session(protocol: &mut CompanionProtocol) -> Result<u64> {
     let local_sid: u32 = rand::random();
 
@@ -223,7 +230,20 @@ async fn start_session(protocol: &mut CompanionProtocol) -> Result<u64> {
         .and_then(Value::as_u64)
         .ok_or_else(|| Error::Envelope("_sessionStart returned no _sid".to_owned()))?;
 
-    let sid = (remote_sid << 32) | u64::from(local_sid);
+    let remote_half = u32::try_from(remote_sid).unwrap_or_else(|_| {
+        tracing::warn!(
+            remote_sid = format!("{remote_sid:#X}"),
+            "the device's _sid does not fit 32 bits; masking it"
+        );
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the mask is the point: the composite id has 32 bits for the device's half"
+        )]
+        let masked = remote_sid as u32;
+        masked
+    });
+
+    let sid = (u64::from(remote_half) << 32) | u64::from(local_sid);
     tracing::debug!(sid = format!("{sid:#X}"), "started the Companion session");
     Ok(sid)
 }

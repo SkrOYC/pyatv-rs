@@ -107,17 +107,13 @@ impl TouchGestures for CompanionTouchGestures {
         })
     }
 
-    /// A select click. `TouchAction` is not the right vocabulary here — upstream's `click` takes an
-    /// [`InputAction`] — so the phase is mapped onto one: [`TouchAction::Click`] is a single tap,
-    /// [`TouchAction::Hold`] is a hold, and the two remaining phases have no click meaning.
-    fn click(&self, action: TouchAction) -> BoxFuture<'_, Result<()>> {
-        let action = match action {
-            TouchAction::Hold => InputAction::Hold,
-            TouchAction::Press | TouchAction::Release | TouchAction::Click => {
-                InputAction::SingleTap
-            }
-        };
-
+    /// A select click, straight through to `click` (`api.py:373-393`).
+    ///
+    /// The trait used to take a [`TouchAction`] here and fold it onto an [`InputAction`], which
+    /// made [`InputAction::DoubleTap`] unreachable through the facade: no touch *phase* means
+    /// "twice", so `Press`, `Release` and `Click` all collapsed to a single tap and the two-press
+    /// sequence could only be reached by calling [`crate::api::CompanionApi::click`] directly.
+    fn click(&self, action: InputAction) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move { self.api.click(action).await.map_err(Into::into) })
     }
 }

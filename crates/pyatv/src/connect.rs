@@ -18,8 +18,8 @@
 
 use std::sync::Arc;
 
-use pyatv_core::facade::{DEFAULT_PRIORITIES, FacadeAppleTV};
-use pyatv_core::interface::{AppleTV, DeviceListener};
+use pyatv_core::facade::{DEFAULT_PRIORITIES, FacadeAppleTV, ListenerHub};
+use pyatv_core::interface::{AppleTV, DeviceListener, PowerListener};
 use pyatv_core::storage::{Settings, Storage};
 use pyatv_core::{BaseConfig, BaseService, Error, Protocol, Result};
 use pyatv_proto_companion::facade::{CompanionSetupOptions, setup as companion_setup};
@@ -85,10 +85,14 @@ pub async fn connect(
     };
 
     let mut facade = FacadeAppleTV::new(service);
+    // Taken before anything connects: a protocol reports a dropped socket to the hub, and the hub
+    // fans it out to whatever the caller registers on the returned `AppleTV` afterwards. Without
+    // this the protocols were handed `None` and `connection_lost` reached nobody at all.
+    let listeners = facade.listener_hub();
     let mut failures = Vec::new();
 
     for service in enabled_services(&config, protocol) {
-        match setup_protocol(&config, service, &settings).await {
+        match setup_protocol(&config, service, &settings, &listeners).await {
             Ok(Some(data)) => {
                 tracing::debug!(protocol = ?service.protocol, "connected to protocol");
                 facade.add_protocol(data);
@@ -151,6 +155,7 @@ async fn setup_protocol(
     config: &BaseConfig,
     service: &BaseService,
     settings: &Settings,
+    listeners: &Arc<ListenerHub>,
 ) -> Result<Option<pyatv_core::facade::SetupData>> {
     match service.protocol {
         Protocol::Companion => {
@@ -158,7 +163,8 @@ async fn setup_protocol(
                 peer: std::net::SocketAddr::new(config.address, service.port),
                 service: service.clone(),
                 info: settings.info.clone(),
-                listener: None::<Arc<dyn DeviceListener>>,
+                listener: Some(Arc::clone(listeners) as Arc<dyn DeviceListener>),
+                power_listener: Some(Arc::clone(listeners) as Arc<dyn PowerListener>),
             };
             companion_setup(options).await.map_err(Into::into)
         }

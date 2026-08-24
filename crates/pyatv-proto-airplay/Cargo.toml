@@ -16,6 +16,7 @@ bytes.workspace = true
 plist = "1.10.0"
 pyatv-core.workspace = true
 pyatv-pairing.workspace = true
+rand = "0.10.2"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { version = "0.7.19", features = ["codec"] }
@@ -23,4 +24,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 pyatv-pairing = { workspace = true, features = ["test-server"] }
+serde_json = "1.0.151"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

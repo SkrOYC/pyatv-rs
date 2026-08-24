@@ -47,7 +47,10 @@
 //!   and decoder disagree about which values get an index, so it can emit payloads it cannot
 //!   itself parse, and this crate would too if it copied the encoder verbatim. [`ser`] has the
 //!   summary; the full reasoning and the reproducing example live in the `objects` module source.
-//! * **Integer tags wider than eight bytes are rejected**, and **nesting is capped** — see [`de`].
+//! * **Integer tags wider than eight bytes are rejected**, **nesting is capped**, and a decode is
+//!   charged a **materialised-byte budget** so that a back-reference-heavy payload cannot expand a
+//!   one-megabyte frame into gigabytes — all three are [`de`]'s, and all three are additions
+//!   rather than ports.
 //!
 //! This crate deliberately depends only on `bytes` and `thiserror` — it must stay usable from any
 //! layer of the workspace without dragging in the runtime or the core types.
@@ -60,7 +63,7 @@ pub mod ser;
 pub mod tags;
 pub mod value;
 
-pub use de::unpack;
+pub use de::{unpack, unpack_with_budget};
 pub use error::Error;
 pub use ser::{encode, pack};
 pub use value::{UintWidth, Value};

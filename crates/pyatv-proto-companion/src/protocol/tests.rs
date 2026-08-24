@@ -167,53 +167,95 @@ async fn xids_increment_and_every_outbound_frame_carries_one() {
 
 /// A response for an XID nobody is waiting for is kept, and resolves the exchange that asks for it
 /// later — where pyatv drops it with "No receiver for XID" (`protocol.py:231-232`).
+/// A response for an XID this side never issued is dropped, not kept.
+///
+/// The stash used to accept any XID at all and never evict, so a peer — reachable before
+/// pair-verify, since `PS_`/`PV_` frames are decoded in the clear — could grow it without limit
+/// simply by answering XIDs nobody had asked about. Now only an issued-and-unresolved XID is kept.
 #[tokio::test]
-async fn an_early_response_is_stashed_and_resolves_the_later_exchange() {
+async fn a_response_for_an_xid_this_side_never_issued_is_dropped() {
     let (mut protocol, _events, mut peer) = pair(50).await;
 
     let device = tokio::spawn(async move {
-        let (_, first) = peer.recv().await;
+        let (_, request) = peer.recv().await;
 
-        // Answer a *later* XID first, then the one being awaited.
+        // Three answers for XIDs the client has not handed out, then the real one.
+        for xid in [900u64, 901, 902] {
+            peer.send(
+                FrameType::EOpack,
+                &opack! {
+                    "_i" => "_ghost",
+                    "_x" => xid,
+                    "_t" => MessageType::Response.code(),
+                    "_c" => opack! {},
+                },
+            )
+            .await;
+        }
         peer.send(
             FrameType::EOpack,
-            &opack! {
-                "_i" => "_late",
-                "_x" => 51u64,
-                "_t" => MessageType::Response.code(),
-                "_c" => opack! { "which" => "second" },
-            },
-        )
-        .await;
-        peer.send(
-            FrameType::EOpack,
-            &response_to(&first, opack! { "which" => "first" }),
+            &response_to(&request, opack! { "which" => "real" }),
         )
         .await;
         peer
     });
 
-    let first = protocol
+    let response = protocol
         .send_command("_first", opack! {})
         .await
-        .expect("first");
+        .expect("the real answer must still arrive");
     assert_eq!(
-        first.content.get("which").and_then(Value::as_str),
-        Some("first")
+        response.content.get("which").and_then(Value::as_str),
+        Some("real")
     );
-
-    // The stashed response is returned without another byte crossing the socket.
-    let second = protocol
-        .send_command("_late", opack! {})
-        .await
-        .expect("stashed");
-    assert_eq!(second.xid, Some(51));
-    assert_eq!(
-        second.content.get("which").and_then(Value::as_str),
-        Some("second")
+    assert!(
+        protocol.stash.is_empty(),
+        "unissued XIDs must be dropped, not stashed: {:?}",
+        protocol.stash.keys().collect::<Vec<_>>()
     );
 
     device.await.expect("the device task must finish");
+}
+
+/// A response that arrives after its exchange timed out is dropped rather than accumulating.
+///
+/// Upstream leaks here too — a cancelled wait leaves its queue entry behind
+/// (`docs/research/companion-port-spec.md` §12 finding 12) — and this port used to leak the same
+/// way from the other side: the timed-out XID stayed correlatable forever, so every slow device
+/// answer added a permanent map entry.
+#[tokio::test]
+async fn a_late_response_after_a_timeout_does_not_accumulate() {
+    let (mut protocol, _events, mut peer) = pair(60).await;
+    protocol.set_timeout(Duration::from_millis(50));
+
+    let (request_sent, request) = tokio::sync::oneshot::channel();
+    let device = tokio::spawn(async move {
+        let (_, request) = peer.recv().await;
+        let _ = request_sent.send(request);
+        peer
+    });
+
+    let error = protocol
+        .send_command("_slow", opack! {})
+        .await
+        .expect_err("a silent device must time out");
+    assert!(matches!(error, Error::Timeout { .. }), "got {error}");
+    assert!(protocol.outstanding.is_empty(), "the XID must be released");
+
+    // The device finally answers, long after the caller gave up.
+    let request = request.await.expect("the device recorded the request");
+    let mut peer = device.await.expect("the device task must finish");
+    peer.send(
+        FrameType::EOpack,
+        &response_to(&request, opack! { "which" => "late" }),
+    )
+    .await;
+
+    protocol.poll_once().await.expect("the frame must be read");
+    assert!(
+        protocol.stash.is_empty(),
+        "a late answer to a dead exchange must be dropped"
+    );
 }
 
 /// Events arriving mid-exchange go to the channel and do not disturb the correlation.

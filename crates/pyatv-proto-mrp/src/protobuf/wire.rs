@@ -187,11 +187,18 @@ pub fn find_length_delimited(buffer: &[u8], number: u32) -> Result<Option<&[u8]>
 }
 
 /// Append a length-delimited field to `out`.
+///
+/// The length conversion is a `try_from` rather than an `as` cast. It cannot fail on any target
+/// this builds for — a `usize` is at most 64 bits everywhere — but `as` would silently truncate on
+/// one where it could, and a truncated protobuf length is a corrupt message rather than a loud
+/// failure. `u64::MAX` as the fallback keeps that case producing something no parser will accept.
 pub fn write_length_delimited(number: u32, payload: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&variant::write(
         (u64::from(number) << 3) | WireType::LengthDelimited.code(),
     ));
-    out.extend_from_slice(&variant::write(payload.len() as u64));
+    out.extend_from_slice(&variant::write(
+        u64::try_from(payload.len()).unwrap_or(u64::MAX),
+    ));
     out.extend_from_slice(payload);
 }
 

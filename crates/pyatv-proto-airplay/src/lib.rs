@@ -16,6 +16,7 @@
 //!
 //! pyatv's RAOP sender advertises `a=rtpmap:96 L16/44100/2` — raw linear PCM, not ALAC — and no ALAC encoding appears anywhere in its RAOP code. Whether ALAC is genuinely unnecessary for parity is an open question in `docs/research/rust-crates.md` §7 that wants a live capture to settle, so no audio codec dependency is taken here yet.
 
+pub mod ap2;
 pub mod auth;
 pub mod codec;
 pub mod error;
@@ -24,11 +25,13 @@ pub mod pairing;
 pub mod raop;
 pub mod rtsp;
 
+pub use ap2::{EventChannelSetup, InfoSettings, remote_control_setup_body};
 pub use auth::{PairSetupProcedure, PairVerifyProcedure, extract_credentials, verify_connection};
 pub use codec::{AirPlayCodec, Frame};
 pub use error::Error;
 pub use http::HttpConnection;
 pub use pairing::{AirPlayPairingHandler, AirPlayPairingOptions};
+pub use rtsp::RtspSession;
 
 /// Convenience alias for fallible AirPlay operations.
 pub type Result<T, E = Error> = core::result::Result<T, E>;

@@ -12,8 +12,9 @@
 //! that event. There is no upstream equivalent of [`ApiState::power_changed`] — pyatv refuses
 //! `await_new_state` outright — see [`crate::facade`] for why this port has one.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use pyatv_core::interface::PowerListener;
 use pyatv_core::{KeyboardFocusState, PowerState};
 use tokio::sync::Notify;
 
@@ -86,9 +87,24 @@ pub struct ApiState {
     pub volume_changed: Notify,
     /// Notified after the power state changed.
     pub power_changed: Notify,
+    /// Where a power change is reported, usually the facade's listener hub.
+    ///
+    /// `CompanionPower._update_power_state` calls `self.listener.powerstate_update(old, new)`
+    /// (`__init__.py:275-278`); this is that call's destination. `None` when nobody is listening,
+    /// which is the case for a `CompanionApi` used on its own.
+    power_listener: Option<Arc<dyn PowerListener>>,
 }
 
 impl ApiState {
+    /// A state that reports power changes to `listener`.
+    #[must_use]
+    pub fn with_power_listener(listener: Option<Arc<dyn PowerListener>>) -> Self {
+        Self {
+            power_listener: listener,
+            ..Self::default()
+        }
+    }
+
     /// The current snapshot.
     ///
     /// A poisoned lock hands back the value the panicking writer left behind rather than failing:
@@ -112,18 +128,28 @@ impl ApiState {
         mutate(&mut observed);
     }
 
-    /// Record a new power state and wake anything waiting on one.
+    /// Record a new power state, wake anything waiting on one, and tell the listener.
+    ///
+    /// The listener is called after the lock is released, so a listener that reads the state back
+    /// — or that calls into the facade — cannot deadlock against this write.
     pub fn set_power(&self, power: PowerState) {
         let mut changed = false;
+        let mut previous = PowerState::Unknown;
         self.update(|observed| {
             changed = observed.power != power || !observed.power_known;
+            previous = observed.power;
             observed.power = power;
             observed.power_known = true;
         });
 
-        if changed {
-            tracing::debug!(?power, "Companion power state changed");
-            self.power_changed.notify_waiters();
+        if !changed {
+            return;
+        }
+
+        tracing::debug!(?power, "Companion power state changed");
+        self.power_changed.notify_waiters();
+        if let Some(listener) = &self.power_listener {
+            listener.power_state_changed(previous, power);
         }
     }
 

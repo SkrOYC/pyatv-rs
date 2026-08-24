@@ -65,7 +65,7 @@ fn any_value() -> impl Strategy<Value = Value> {
         any::<f32>()
             .prop_filter("NaN is not comparable", |number| !number.is_nan())
             .prop_map(Value::Float32),
-        ".{0,50}".prop_map(Value::String),
+        ".{0,50}".prop_map(Value::from),
         proptest::collection::vec(any::<u8>(), 0..300)
             .prop_map(|raw| Value::Data(Bytes::from(raw))),
         any::<[u8; 16]>().prop_map(Value::Uuid),

@@ -1,5 +1,7 @@
 //! The recursive OPACK value model.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 
 use crate::tags;
@@ -125,7 +127,14 @@ pub enum Value {
     /// `0x36`. Keeping a distinct variant lets a decoded payload round-trip byte for byte.
     Float32(f32),
     /// UTF-8 string.
-    String(String),
+    ///
+    /// Held behind an [`Arc`] rather than as a [`String`] so that cloning is a refcount bump
+    /// instead of a copy. The decoder's back-reference table hands out clones of interned values
+    /// and a hostile payload can ask for one clone per input byte, which with an owned `String`
+    /// turned a one-megabyte frame into tens of gigabytes; see [`crate::de`]'s budget discussion.
+    /// `From<&str>`, `From<String>` and [`Value::as_str`] all still work, so the change is
+    /// invisible to callers that do not name the variant's payload type.
+    String(Arc<str>),
     /// Opaque bytes.
     Data(Bytes),
     /// A 16-byte UUID, tag `0x05`, stored raw and unparsed (big-endian RFC 4122 byte order, the
@@ -301,12 +310,18 @@ impl From<f64> for Value {
 
 impl From<&str> for Value {
     fn from(value: &str) -> Self {
-        Self::String(value.to_owned())
+        Self::String(Arc::from(value))
     }
 }
 
 impl From<String> for Value {
     fn from(value: String) -> Self {
+        Self::String(Arc::from(value))
+    }
+}
+
+impl From<Arc<str>> for Value {
+    fn from(value: Arc<str>) -> Self {
         Self::String(value)
     }
 }

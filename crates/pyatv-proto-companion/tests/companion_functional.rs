@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pyatv_core::facade::{FacadeAppleTV, SetupData};
-use pyatv_core::interface::AppleTV;
+use pyatv_core::interface::{AppleTV, DeviceListener, PowerListener};
 use pyatv_core::storage::InfoSettings;
 use pyatv_core::{
     BaseService, FeatureName, FeatureState, InputAction, KeyboardFocusState, PowerState, Protocol,
@@ -41,17 +41,22 @@ async fn connect(device: &FakeCompanionDevice) -> Arc<dyn AppleTV> {
     service.identifier = Some("AA:BB:CC:DD:EE:FF".to_owned());
     service.credentials = Some(credentials);
 
+    // The same wiring `pyatv::connect` does: the hub is taken before the protocol connects, so a
+    // dropped socket reaches whatever the caller registers on the facade afterwards.
+    let mut facade = FacadeAppleTV::new(service.clone());
+    let listeners = facade.listener_hub();
+
     let data = setup(CompanionSetupOptions {
         peer: device.address(),
-        service: service.clone(),
+        service,
         info: InfoSettings::default(),
-        listener: None,
+        listener: Some(Arc::clone(&listeners) as Arc<dyn DeviceListener>),
+        power_listener: Some(listeners as Arc<dyn PowerListener>),
     })
     .await
     .expect("setup must succeed")
     .expect("credentials are present, so Companion must register");
 
-    let mut facade = FacadeAppleTV::new(service);
     facade.add_protocol(data);
     Arc::new(facade)
 }
@@ -553,6 +558,101 @@ async fn a_touch_action_reaches_the_device_clamped() {
 
 /// The bitfield decides availability for the eight media-control features; everything else the
 /// protocol declares is asserted available.
+/// The HID frames the device saw since `mark`.
+///
+/// The trailing `_hidT` of a click is an event, so `click()` returns as soon as it is written
+/// rather than when the device has processed it; settling first is what makes the read
+/// deterministic.
+async fn frames_since(device: &FakeCompanionDevice, mark: usize) -> Vec<String> {
+    tokio::time::sleep(SETTLE).await;
+    let shared = device.state();
+    let state = shared.lock().await;
+    state.commands[mark..]
+        .iter()
+        .filter(|it| *it == "_hidC" || *it == "_hidT")
+        .cloned()
+        .collect()
+}
+
+/// How many commands the device has seen so far, as a starting point for [`frames_since`].
+async fn mark(device: &FakeCompanionDevice) -> usize {
+    device.state().lock().await.commands.len()
+}
+
+/// `TouchGestures::click` takes an [`InputAction`], so all three shapes are reachable.
+///
+/// The trait used to take a `TouchAction` here and fold the four touch *phases* onto two input
+/// actions, which meant [`InputAction::DoubleTap`] could not be expressed through the facade at
+/// all — no phase means "twice". Upstream's signature is `click(self, action: InputAction)`
+/// (`pyatv/interface.py:1312`).
+///
+/// Each click is `_hidC` down, `_hidC` up, then one `_hidT` `Click` at the fixed `(1000, 1000)`
+/// corner (`api.py:373-393`). A single tap and a hold produce the same frames and differ only in
+/// how long the button stays down — 20 ms against a full second — so the hold is identified by the
+/// clock.
+#[tokio::test]
+async fn clicking_reaches_the_device_in_all_three_input_actions() {
+    let device = FakeCompanionDevice::start(PIN_CODE).await;
+    let atv = connect(&device).await;
+    let touch = atv
+        .touch_gestures()
+        .expect("Companion provides TouchGestures");
+
+    let single = mark(&device).await;
+    let started = std::time::Instant::now();
+    touch
+        .click(InputAction::SingleTap)
+        .await
+        .expect("a single tap must be accepted");
+    let single_elapsed = started.elapsed();
+    assert_eq!(
+        frames_since(&device, single).await,
+        ["_hidC", "_hidC", "_hidT"]
+    );
+
+    let double = mark(&device).await;
+    touch
+        .click(InputAction::DoubleTap)
+        .await
+        .expect("a double tap must be accepted");
+    assert_eq!(
+        frames_since(&device, double).await,
+        ["_hidC", "_hidC", "_hidT", "_hidC", "_hidC", "_hidT"],
+        "a double tap repeats the whole down/up/touch sequence"
+    );
+
+    let hold = mark(&device).await;
+    let started = std::time::Instant::now();
+    touch
+        .click(InputAction::Hold)
+        .await
+        .expect("a hold must be accepted");
+    let hold_elapsed = started.elapsed();
+    assert_eq!(
+        frames_since(&device, hold).await,
+        ["_hidC", "_hidC", "_hidT"]
+    );
+
+    // `HOLD_DELAY` is a second and `CLICK_TAP_DELAY` is 20 ms (`api.py:382,389`).
+    assert!(
+        hold_elapsed >= Duration::from_millis(900),
+        "a hold must keep the button down for about a second; took {hold_elapsed:?}"
+    );
+    assert!(
+        single_elapsed < Duration::from_millis(500),
+        "a single tap must not hold; took {single_elapsed:?}"
+    );
+
+    let shared = device.state();
+    assert_eq!(
+        shared.lock().await.latest_button.as_deref(),
+        Some("select"),
+        "every click is a Select press"
+    );
+
+    atv.close().await.expect("closing must succeed");
+}
+
 #[tokio::test]
 async fn media_control_flags_drive_feature_availability() {
     let device = FakeCompanionDevice::start(PIN_CODE).await;
@@ -603,6 +703,114 @@ async fn media_control_flags_drive_feature_availability() {
     atv.close().await.expect("closing must succeed");
 }
 
+/// Companion's own `all_features` filters on the reported state, not on the declared set.
+///
+/// `Features.all_features` (`pyatv/interface.py:1088-1095`) keeps everything whose state is not
+/// `Unsupported`, and `CompanionFeatures` does not override it. That is a wider list than the
+/// declared set, because `CompanionFeatures.get_feature` answers `Unavailable` — not `Unsupported`
+/// — for a feature it never declared (`__init__.py:610-611`); only `PowerState` before any power
+/// state has been observed is genuinely `Unsupported`.
+///
+/// This goes through `setup()`'s `features_impl` directly rather than through the facade, because
+/// the facade's own `FacadeFeatures` answers `Unsupported` for undeclared features and would hide
+/// the difference.
+#[tokio::test]
+async fn companions_own_all_features_filters_on_state() {
+    let device = FakeCompanionDevice::start(PIN_CODE).await;
+    // No power state ever observed, so `PowerState` stays Unsupported.
+    arrange(&device, |state| state.system_status = None).await;
+
+    let credentials = pair(&device).await;
+    let mut service = BaseService::new(Protocol::Companion, device.address().port());
+    service.identifier = Some("AA:BB:CC:DD:EE:FF".to_owned());
+    service.credentials = Some(credentials);
+
+    let data = setup(CompanionSetupOptions {
+        peer: device.address(),
+        service,
+        info: InfoSettings::default(),
+        listener: None,
+        power_listener: None,
+    })
+    .await
+    .expect("setup must succeed")
+    .expect("credentials are present");
+
+    let features = data
+        .features_impl
+        .clone()
+        .expect("Companion reports features");
+    let visible = features.all_features(false);
+
+    assert_eq!(visible.len(), FeatureName::COUNT - 1);
+    assert!(
+        visible
+            .iter()
+            .all(|(_, info)| info.state != FeatureState::Unsupported)
+    );
+    assert!(
+        !visible
+            .iter()
+            .any(|(feature, _)| *feature == FeatureName::PowerState),
+        "PowerState is Unsupported until one is observed and must be filtered out"
+    );
+    assert!(
+        visible
+            .iter()
+            .any(|(feature, _)| *feature == FeatureName::PlayUrl),
+        "an undeclared feature answers Unavailable upstream, so it must survive the filter"
+    );
+    assert_eq!(features.all_features(true).len(), FeatureName::COUNT);
+
+    if let Some(handle) = data.handle {
+        handle.close().await.expect("closing must succeed");
+    }
+}
+
+/// A device that pushes an event alongside every response must not starve the request channel.
+///
+/// `_handle_control_flag_update` answers an `_iMC` by sending a `GetVolume` of its own
+/// (`__init__.py:439-451`). That command pumps the socket, so a device that attaches an `_iMC` to
+/// every response — including the `GetVolume` response — used to keep the background task's drain
+/// loop spinning for ever, and the request channel was never polled again: every subsequent
+/// command hung until its own timeout. The follow-up is queued rather than sent inline now, and
+/// each pass through the task's loop is bounded, so the `select!` is reached again regardless of
+/// what the device does.
+#[tokio::test]
+async fn a_device_that_pushes_an_event_with_every_response_does_not_starve_commands() {
+    let device = FakeCompanionDevice::start(PIN_CODE).await;
+    arrange(&device, |state| {
+        state.echo_media_control = true;
+        state.installed_apps = vec![("com.apple.TVMusic".to_owned(), "Music".to_owned())];
+    })
+    .await;
+
+    let atv = tokio::time::timeout(Duration::from_secs(10), connect(&device))
+        .await
+        .expect("connecting must not hang");
+
+    // The exact symptom: a command issued after the event storm started.
+    let apps = tokio::time::timeout(
+        Duration::from_secs(5),
+        atv.apps().expect("Companion provides Apps").app_list(),
+    )
+    .await
+    .expect("a command must still be served while events keep arriving")
+    .expect("the app list must succeed");
+    assert_eq!(apps.len(), 1);
+
+    // And the pushed flags still reached the shared state, so nothing was dropped to get there.
+    assert_eq!(
+        atv.features().get_feature(FeatureName::Volume).state,
+        FeatureState::Available
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), atv.close())
+        .await
+        .expect("closing must not hang")
+        .expect("closing must succeed");
+}
+
 /// `PowerState` is available only once a power state has actually been observed.
 #[tokio::test]
 async fn the_power_state_feature_follows_whether_one_was_observed() {
@@ -625,6 +833,116 @@ async fn the_power_state_feature_follows_whether_one_was_observed() {
     atv.close().await.expect("closing must succeed");
 }
 
+// ---- Listeners ----
+
+/// A listener that records everything it is told, so a test can assert on it.
+#[derive(Debug, Default)]
+struct Recorder {
+    lost: std::sync::Mutex<Vec<String>>,
+    closed: std::sync::atomic::AtomicUsize,
+    power: std::sync::Mutex<Vec<(PowerState, PowerState)>>,
+}
+
+impl Recorder {
+    fn lost(&self) -> Vec<String> {
+        self.lost.lock().expect("uncontended").clone()
+    }
+
+    fn power(&self) -> Vec<(PowerState, PowerState)> {
+        self.power.lock().expect("uncontended").clone()
+    }
+}
+
+impl pyatv_core::interface::DeviceListener for Recorder {
+    fn connection_lost(&self, reason: &str) {
+        self.lost
+            .lock()
+            .expect("uncontended")
+            .push(reason.to_owned());
+    }
+
+    fn connection_closed(&self) {
+        self.closed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl pyatv_core::interface::PowerListener for Recorder {
+    fn power_state_changed(&self, old_state: PowerState, new_state: PowerState) {
+        self.power
+            .lock()
+            .expect("uncontended")
+            .push((old_state, new_state));
+    }
+}
+
+/// Killing the device mid-session reaches a listener registered on the facade.
+///
+/// The chain is `Actor::run` seeing the socket die, `Stopped::ConnectionLost`, the Companion
+/// session's listener, the facade's hub, and finally the caller's listener. It used to stop at the
+/// first link: `pyatv::connect` passed `listener: None`, so nothing downstream of the actor was
+/// ever called and a caller had no way to learn the device had gone.
+#[tokio::test]
+async fn killing_the_device_mid_session_reaches_a_registered_listener() {
+    let device = FakeCompanionDevice::start(PIN_CODE).await;
+    let atv = connect(&device).await;
+
+    let recorder = Arc::new(Recorder::default());
+    atv.add_listener(&(Arc::clone(&recorder) as Arc<dyn DeviceListener>));
+    assert!(recorder.lost().is_empty());
+
+    device.kill_connections();
+
+    // The actor notices on its next read, which is immediate once the socket closes.
+    for _ in 0..50 {
+        if !recorder.lost().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let lost = recorder.lost();
+    assert_eq!(lost.len(), 1, "the drop must be reported exactly once");
+    assert!(
+        !lost[0].is_empty(),
+        "the listener is told why the connection went away"
+    );
+}
+
+/// Power-state pushes reach a listener registered on the facade.
+///
+/// `CompanionPower._update_power_state` forwards to `listener.powerstate_update(old, new)`
+/// (`__init__.py:275-278`); this is that chain, from the device's `SystemStatus` event through the
+/// session's shared state to the facade's hub.
+#[tokio::test]
+async fn power_state_changes_reach_a_registered_power_listener() {
+    let device = FakeCompanionDevice::start(PIN_CODE).await;
+    let atv = connect(&device).await;
+
+    // Registered after connecting, so the initial `FetchAttentionState` seeding is not counted.
+    let recorder = Arc::new(Recorder::default());
+    atv.add_power_listener(&(Arc::clone(&recorder) as Arc<dyn PowerListener>));
+
+    let power = atv.power().expect("Companion provides Power");
+    power
+        .turn_off(true)
+        .await
+        .expect("turning off must succeed");
+    power.turn_on(true).await.expect("turning on must succeed");
+
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        recorder.power(),
+        vec![
+            (PowerState::On, PowerState::Off),
+            (PowerState::Off, PowerState::On),
+        ],
+        "both transitions are reported, with the state they came from"
+    );
+
+    atv.close().await.expect("closing must succeed");
+}
+
 // ---- Setup and teardown ----
 
 /// The guard clause: no credentials means Companion does not exist, not that it failed.
@@ -638,6 +956,7 @@ async fn setup_declines_without_credentials() {
         service,
         info: InfoSettings::default(),
         listener: None,
+        power_listener: None,
     })
     .await
     .expect("declining is not an error");

@@ -20,7 +20,7 @@ fn sized(value: u64, width: UintWidth) -> Value {
 }
 
 fn string_of(unit: char, count: usize) -> Value {
-    Value::String(std::iter::repeat_n(unit, count).collect())
+    Value::from(std::iter::repeat_n(unit, count).collect::<String>())
 }
 
 fn data_of(byte: u8, count: usize) -> Value {
@@ -254,8 +254,8 @@ fn unpack_endless_dict() {
         .step_by(2)
         .map(|code| {
             (
-                Value::String(char::from(code).to_string()),
-                Value::String(char::from(code + 1).to_string()),
+                Value::from(char::from(code).to_string()),
+                Value::from(char::from(code + 1).to_string()),
             )
         })
         .collect();

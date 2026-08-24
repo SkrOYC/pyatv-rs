@@ -90,11 +90,52 @@ pub struct RaopSettings {
     #[serde(skip_serializing_if = "is_default")]
     pub protocol_version: AirPlayVersion,
     /// Local UDP port for the timing server, or `0` to pick a free one.
+    ///
+    /// A `u32` rather than a `u16` because the file this comes from is written by pyatv too, and
+    /// pyatv's field is a plain pydantic `int` with no bound (`settings.py:152-162`). Deserialising
+    /// into a `u16` made an out-of-range value fail the **whole file**: one nonsense port and every
+    /// stored credential for every device became unreadable. Validation belongs at the point of use
+    /// — see [`RaopSettings::timing`] — where the blast radius is one setting.
     #[serde(skip_serializing_if = "is_default")]
-    pub timing_port: u16,
+    pub timing_port: u32,
     /// Local UDP port for the control server, or `0` to pick a free one.
+    ///
+    /// See [`RaopSettings::timing_port`] for why this is a `u32`.
     #[serde(skip_serializing_if = "is_default")]
-    pub control_port: u16,
+    pub control_port: u32,
+}
+
+impl RaopSettings {
+    /// The timing-server port, or `None` if the stored value is not a usable one.
+    ///
+    /// `0` is `None` too: pyatv's own docstring says "Set to 0 to use random free port", so zero
+    /// and "out of range" both mean "pick one for me".
+    #[must_use]
+    pub fn timing(&self) -> Option<u16> {
+        port(self.timing_port, "timing_port")
+    }
+
+    /// The control-server port, or `None` if the stored value is not a usable one.
+    #[must_use]
+    pub fn control(&self) -> Option<u16> {
+        port(self.control_port, "control_port")
+    }
+}
+
+/// Narrow a stored port to a real one, complaining rather than failing if it is not.
+fn port(value: u32, field: &'static str) -> Option<u16> {
+    match u16::try_from(value) {
+        Ok(0) => None,
+        Ok(port) => Some(port),
+        Err(_) => {
+            tracing::warn!(
+                field,
+                value,
+                "stored port is out of range; picking a free one"
+            );
+            None
+        }
+    }
 }
 
 /// The five per-protocol slots (`pyatv/settings.py:165-172`).
@@ -206,8 +247,32 @@ impl ProtocolSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::ProtocolSettings;
+    use super::{ProtocolSettings, RaopSettings};
     use crate::consts::Protocol;
+
+    /// A port out of `u16` range must cost that one setting, not the whole file.
+    ///
+    /// pyatv writes these as unbounded pydantic `int`s, so anything can legitimately end up in the
+    /// file that both implementations share. Parsing them as `u16` made one bad value fail the
+    /// entire deserialisation, taking every stored credential for every device with it.
+    #[test]
+    fn an_out_of_range_port_is_ignored_rather_than_refusing_the_file() {
+        let settings: RaopSettings =
+            serde_json::from_str(r#"{"timing_port": 70000, "control_port": 6002}"#)
+                .expect("an unusable port must not fail the parse");
+
+        assert_eq!(settings.timing(), None);
+        assert_eq!(settings.control(), Some(6002));
+    }
+
+    /// Zero is pyatv's "pick a free one" sentinel (`settings.py:152-162`), not a real port.
+    #[test]
+    fn zero_means_pick_a_free_port() {
+        let settings = RaopSettings::default();
+        assert_eq!(settings.timing_port, 0);
+        assert_eq!(settings.timing(), None);
+        assert_eq!(settings.control(), None);
+    }
 
     /// The five slots are addressed by protocol, and nothing leaks between them.
     #[test]

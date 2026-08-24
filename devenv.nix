@@ -6,11 +6,13 @@ let
     set -euo pipefail
     cargo fmt --check
     cargo clippy --all-targets --all-features -- -D warnings
-    # `--all-features` is not optional. `pyatv-pairing`'s `test-server` feature gates its reference
-    # HAP accessory, and with it every end-to-end pair-setup/pair-verify test and every negative
-    # path (wrong PIN, corrupted signature, unknown pairing). Without the flag those simply do not
-    # compile into the run and the gate passes while the interesting half of the suite never
-    # executes.
+    # `--all-features` is kept deliberately, though the workspace run does not currently need it.
+    # `pyatv-pairing`'s `test-server` feature gates its reference HAP accessory, and with it every
+    # end-to-end pair-setup/pair-verify test and every negative path (wrong PIN, corrupted
+    # signature, unknown pairing). A `-p pyatv-pairing` run without the flag silently drops all of
+    # them; a `--workspace` run keeps them either way, because `pyatv-proto-companion` dev-depends
+    # on the feature and Cargo unifies features across the workspace. The flag is what stops that
+    # coincidence from being load-bearing.
     cargo nextest run --all-features
   '';
 in

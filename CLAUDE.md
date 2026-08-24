@@ -28,7 +28,7 @@ cargo nextest run --all-features          # or: cargo test --workspace --all-fea
 cargo test --workspace --doc --all-features
 ```
 
-`--all-features` is not decoration: `pyatv-pairing`'s `test-server` feature gates its reference HAP accessory and with it every end-to-end and negative-path pairing test, so a run without the flag skips them silently.
+`--all-features` matters for **single-crate runs**, not for the workspace run. `pyatv-pairing`'s `test-server` feature gates its reference HAP accessory and with it every end-to-end and negative-path pairing test, so `cargo test -p pyatv-pairing` without the flag silently skips them (130 + 2 + 8 tests instead of 130 + 15 + 8 + 5 + 2). A `--workspace` run picks the feature up either way, because `pyatv-proto-companion` dev-depends on `pyatv-pairing` with `features = ["test-server"]` and Cargo unifies features across the workspace — `cargo test --workspace` and `cargo test --workspace --all-features` currently run the same 794 tests. Keep the flag in the gate anyway: it is what makes the guarantee independent of one crate's dev-dependency list.
 
 Warnings are errors. `missing_debug_implementations` and clippy `pedantic` are on at the workspace level (`[workspace.lints]`). Derive `Debug` on public types. Only add `#[allow(...)]` with a written justification comment. Git hooks (rustfmt + clippy) run on commit.
 

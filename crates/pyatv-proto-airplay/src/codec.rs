@@ -30,6 +30,9 @@ use crate::Error;
 /// The header carrying the body length. No chunked transfer encoding is used or accepted.
 pub const CONTENT_LENGTH: &str = "Content-Length";
 
+/// The header naming a body's format.
+pub const CONTENT_TYPE: &str = "Content-Type";
+
 /// Content type for the binary plist bodies AirPlay uses throughout.
 pub const BPLIST_CONTENT_TYPE: &str = "application/x-apple-binary-plist";
 
@@ -46,6 +49,12 @@ pub const USER_AGENT: &str = "AirPlay/550.10";
 /// The protocol token pyatv sends on the pairing connection
 /// (`pyatv/support/http.py:440`, the `protocol` default of `send_and_receive`).
 pub const HTTP_1_1: &str = "HTTP/1.1";
+
+/// The protocol token every RTSP verb travels under, including the ones whose method is an
+/// ordinary HTTP one (`pyatv/support/rtsp.py:262`, the `protocol` default of `exchange`). `GET
+/// /info` and `POST /feedback` are sent as `RTSP/1.0` too, despite their HTTP-shaped method and
+/// path.
+pub const RTSP_1_0: &str = "RTSP/1.0";
 
 /// A request travelling in either direction.
 #[derive(Debug, Clone, PartialEq, Eq)]

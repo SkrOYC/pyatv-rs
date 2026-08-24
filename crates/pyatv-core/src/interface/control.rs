@@ -108,5 +108,10 @@ pub trait TouchGestures: Send + Sync + std::fmt::Debug {
         duration_ms: u32,
     ) -> BoxFuture<'_, Result<()>>;
     /// Send a complete press-and-release.
-    fn click(&self, action: TouchAction) -> BoxFuture<'_, Result<()>>;
+    ///
+    /// Takes an [`InputAction`], not a [`TouchAction`]: upstream's signature is
+    /// `click(self, action: InputAction)` (`pyatv/interface.py:1312-1318`), and the three
+    /// [`InputAction`] variants are exactly the three shapes a click can have — one tap, two taps,
+    /// or one held for a second. [`TouchGestures::action`] is the one that takes a touch *phase*.
+    fn click(&self, action: InputAction) -> BoxFuture<'_, Result<()>>;
 }

@@ -1,22 +1,20 @@
 //! A minimal HTTP/1.1 client over one TCP connection.
 //!
-//! Port of `HttpConnection` (`pyatv/support/http.py:326-499`) restricted to what pairing needs:
-//! `POST` with an optional body, one response per request, keep-alive, and an optional byte-stream
-//! processor pair so that [`pyatv_pairing::session::HapSession`] can be spliced in after
-//! pair-verify.
+//! Port of `HttpConnection` (`pyatv/support/http.py:326-499`): one request at a time, keep-alive,
+//! and an optional byte-stream processor pair so that [`pyatv_pairing::session::HapSession`] can be
+//! spliced in after pair-verify. [`HttpConnection::post`] is what pairing uses;
+//! [`HttpConnection::send`] is the general form the RTSP verbs need.
 //!
 //! Two details are reproduced exactly because a device notices them:
 //!
-//! - **Header order.** `_format_message` (`pyatv/support/http.py:50-80`) emits the start line, then
-//!   a default `User-Agent` only if the caller did not supply one, then `Content-Length` only if
-//!   the body is non-empty, and only then the caller's headers in their own insertion order. The
-//!   caller's `Content-Type` therefore lands *after* `Content-Length`, not before it. See
-//!   [`HttpConnection::post`].
+//! - **Header order**, which [`RequestSpec`] and its tests pin down.
 //! - **`Content-Length`-only framing.** Both directions. See [`crate::codec::parse_frame`].
 //!
 //! This does not use `Framed`: the [`pyatv_pairing::session::HapSession`] wrapper operates on raw
 //! socket reads and writes, below HTTP parsing, exactly as pyatv's `receive_processor`/
 //! `send_processor` do (`pyatv/support/http.py:344-349,387,457`).
+
+mod request;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -26,7 +24,11 @@ use pyatv_pairing::session::HapSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::codec::{CONTENT_LENGTH, Frame, HTTP_1_1, Request, Response, encode_frame, parse_frame};
+pub use request::RequestSpec;
+
+use request::build_request;
+
+use crate::codec::{Frame, Request, Response, encode_frame, parse_frame};
 use crate::{Error, Result};
 
 /// How long to wait for a device to answer one request.
@@ -96,6 +98,20 @@ impl HttpConnection {
         self.remote
     }
 
+    /// The local address of this socket, which the RTSP session URI is built from.
+    ///
+    /// `HttpConnection.local_ip` (`pyatv/support/http.py:352-355`) reads the same value off the
+    /// transport, and `RtspSession.uri` (`pyatv/support/rtsp.py:92-95`) interpolates it into
+    /// `rtsp://{local_ip}/{session_id}`. A receiver sees that string, so it has to be this
+    /// connection's own source address rather than any other interface's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the socket has no local address.
+    pub fn local_address(&self) -> Result<SocketAddr> {
+        Ok(self.stream.local_addr()?)
+    }
+
     /// Whether transport encryption has been enabled.
     #[must_use]
     pub fn is_encrypted(&self) -> bool {
@@ -128,9 +144,35 @@ impl HttpConnection {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<Response> {
-        let request = build_request(path, headers, body);
-        let response = self.send_and_receive(request).await?;
+        self.send(&RequestSpec {
+            method: "POST",
+            uri: path,
+            headers,
+            body,
+            ..RequestSpec::default()
+        })
+        .await
+    }
 
+    /// Send one arbitrary message and await its response.
+    ///
+    /// The general form [`HttpConnection::post`] is a special case of, and the one the RTSP verbs
+    /// need: they are not `POST`, they travel as `RTSP/1.0`, and they carry a `User-Agent` that
+    /// has to precede `Content-Length` rather than follow it (see [`RequestSpec::user_agent`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotAuthenticated`] on `401`/`403` and [`Error::Status`] on any other
+    /// non-`2xx`, unless [`RequestSpec::allow_error`] is set, in which case the response is
+    /// returned whatever its status. Also [`Error::Malformed`] if the reply cannot be parsed and
+    /// [`Error::Io`] if the connection fails or the device does not answer within
+    /// [`REQUEST_TIMEOUT`].
+    pub async fn send(&mut self, spec: &RequestSpec<'_>) -> Result<Response> {
+        let response = self.send_and_receive(build_request(spec)).await?;
+
+        if spec.allow_error {
+            return Ok(response);
+        }
         if matches!(response.status, 401 | 403) {
             return Err(Error::NotAuthenticated {
                 status: response.status,
@@ -258,120 +300,4 @@ fn head_of(message: &[u8]) -> String {
     String::from_utf8_lossy(&message[..end])
         .replace('\r', "\\r")
         .replace('\n', "\\n")
-}
-
-/// Build the request pyatv's `_format_message` would produce for a `POST`.
-///
-/// The three conditional insertions, in upstream's order
-/// (`pyatv/support/http.py:64-74`):
-///
-/// 1. `User-Agent`, only when the caller did not supply one.
-/// 2. `Content-Type`, only from the dedicated parameter — which `post` never passes, so it never
-///    appears here; callers put their own `Content-Type` in `headers` instead, where it lands after
-///    `Content-Length`.
-/// 3. `Content-Length`, only when the body is non-empty. Python's truthiness test means a
-///    zero-length body produces no header at all, not `Content-Length: 0`.
-fn build_request(path: &str, headers: &[(&str, &str)], body: &[u8]) -> Request {
-    let mut wire_headers: Vec<(String, String)> = Vec::with_capacity(headers.len() + 2);
-
-    if !headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("User-Agent"))
-    {
-        wire_headers.push(("User-Agent".to_owned(), DEFAULT_USER_AGENT.to_owned()));
-    }
-    if !body.is_empty() {
-        wire_headers.push((CONTENT_LENGTH.to_owned(), body.len().to_string()));
-    }
-    wire_headers.extend(
-        headers
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
-    );
-
-    Request {
-        method: "POST".to_owned(),
-        uri: path.to_owned(),
-        protocol: HTTP_1_1.to_owned(),
-        headers: wire_headers,
-        body: bytes::Bytes::copy_from_slice(body),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use bytes::BytesMut;
-
-    use super::build_request;
-    use crate::codec::{Frame, encode_frame};
-
-    fn rendered(path: &str, headers: &[(&str, &str)], body: &[u8]) -> String {
-        let mut out = BytesMut::new();
-        encode_frame(
-            &Frame::Request(build_request(path, headers, body)),
-            &mut out,
-        );
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    /// The exact bytes `AirPlayHapPairSetupProcedure.start_pairing` puts on the wire for its first
-    /// request (`pyatv/protocols/airplay/auth/hap.py:20-25,52`): no `Content-Length`, because the
-    /// body is empty, and the four headers in the order the `_AIRPLAY_HEADERS` dict declares them.
-    #[test]
-    fn pin_start_request_matches_pyatv_byte_for_byte() {
-        let wire = rendered(
-            "/pair-pin-start",
-            &[
-                ("User-Agent", "AirPlay/320.20"),
-                ("Connection", "keep-alive"),
-                ("X-Apple-HKP", "3"),
-                ("Content-Type", "application/octet-stream"),
-            ],
-            b"",
-        );
-
-        assert_eq!(
-            wire,
-            "POST /pair-pin-start HTTP/1.1\r\n\
-             User-Agent: AirPlay/320.20\r\n\
-             Connection: keep-alive\r\n\
-             X-Apple-HKP: 3\r\n\
-             Content-Type: application/octet-stream\r\n\r\n"
-        );
-    }
-
-    /// `Content-Length` is inserted *before* the caller's headers, so the caller's `Content-Type`
-    /// follows it. Getting this backwards is the easy mistake, since every other HTTP client emits
-    /// `Content-Type` first.
-    #[test]
-    fn content_length_precedes_the_callers_headers() {
-        let wire = rendered(
-            "/pair-setup",
-            &[
-                ("User-Agent", "AirPlay/320.20"),
-                ("Connection", "keep-alive"),
-                ("X-Apple-HKP", "3"),
-                ("Content-Type", "application/octet-stream"),
-            ],
-            &[0x00, 0x01, 0x02, 0x03, 0x04, 0x05],
-        );
-
-        assert_eq!(
-            wire,
-            "POST /pair-setup HTTP/1.1\r\n\
-             Content-Length: 6\r\n\
-             User-Agent: AirPlay/320.20\r\n\
-             Connection: keep-alive\r\n\
-             X-Apple-HKP: 3\r\n\
-             Content-Type: application/octet-stream\r\n\r\n\
-             \x00\x01\x02\x03\x04\x05"
-        );
-    }
-
-    /// A caller that supplies no `User-Agent` gets the default, in first position.
-    #[test]
-    fn a_default_user_agent_is_added_when_absent() {
-        let wire = rendered("/anything", &[("Connection", "keep-alive")], b"");
-        assert!(wire.starts_with("POST /anything HTTP/1.1\r\nUser-Agent: pyatv-rs/"));
-    }
 }

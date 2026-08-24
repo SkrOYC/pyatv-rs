@@ -125,10 +125,37 @@ impl Storage for FileStorage {
 /// Upstream truncates the real file and writes into it (`file_storage.py:46-48`), which loses
 /// every stored credential if the process dies mid-write. Renaming a complete sibling into place
 /// is atomic on every platform this targets and costs nothing.
+///
+/// Two things the rename dance has to get right, and did not:
+///
+/// * **Permissions.** A fresh temporary file is created at whatever the umask allows, typically
+///   `0644`, and the rename carries that mode onto the real file — so a settings file the user had
+///   locked down to `0600` quietly became world-readable the first time anything was saved into
+///   it. This file holds every device credential. [`apply_permissions`] copies the existing file's
+///   mode across, or uses `0600` when creating one.
+/// * **Durability.** Renaming a file whose contents are still in the page cache is atomic with
+///   respect to *other processes*, not with respect to a crash: the rename can reach the disk
+///   before the data does, leaving a file that is present and empty. [`std::fs::File::sync_all`]
+///   before the rename is what makes the guarantee real.
 fn write_atomically(path: &Path, contents: &str) -> Result<()> {
-    let temporary = path.with_extension("conf.tmp");
+    use std::io::Write as _;
 
-    std::fs::write(&temporary, format!("{contents}\n")).map_err(Error::Io)?;
+    let temporary = path.with_extension("conf.tmp");
+    let mut file = std::fs::File::create(&temporary).map_err(Error::Io)?;
+
+    // The permissions go on before a single byte of credential does, so there is no window in
+    // which the file is both readable and non-empty.
+    let written = apply_permissions(&file, path)
+        .and_then(|()| file.write_all(contents.as_bytes()))
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all());
+    drop(file);
+
+    if let Err(error) = written {
+        drop(std::fs::remove_file(&temporary));
+        return Err(Error::Io(error));
+    }
+
     match std::fs::rename(&temporary, path) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -137,6 +164,35 @@ fn write_atomically(path: &Path, contents: &str) -> Result<()> {
             Err(Error::Io(error))
         }
     }
+}
+
+/// Give the temporary file the mode the real file already has, or `0600` if there is no real file.
+///
+/// `0600` rather than the umask default because this file stores pairing credentials: on a shared
+/// machine, `0644` hands every local account the ability to control the user's Apple TV. pyatv
+/// itself does not do this — it writes with plain `open(..., "w")` — but pyatv also never creates
+/// the file with anything other than the umask, so matching it would mean matching a weakness.
+#[cfg(unix)]
+fn apply_permissions(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// Owner read/write only.
+    const CREDENTIALS_MODE: u32 = 0o600;
+
+    let mode = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.permissions().mode() & 0o7777,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CREDENTIALS_MODE,
+        Err(error) => return Err(error),
+    };
+
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+}
+
+/// Windows has no mode bits to carry across, and its ACL inheritance already does the right thing
+/// for a file created inside the user's profile.
+#[cfg(not(unix))]
+fn apply_permissions(_file: &std::fs::File, _path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -149,10 +205,10 @@ mod tests {
     use crate::storage::Storage;
 
     /// A scratch directory that cleans itself up, so the tests need no dev-dependency.
-    struct TempDir(std::path::PathBuf);
+    pub(super) struct TempDir(std::path::PathBuf);
 
     impl TempDir {
-        fn new(name: &str) -> Self {
+        pub(super) fn new(name: &str) -> Self {
             let path = std::env::temp_dir()
                 .join(format!("pyatv-rs-storage-{name}-{}", std::process::id()));
             drop(std::fs::remove_dir_all(&path));
@@ -160,7 +216,7 @@ mod tests {
             Self(path)
         }
 
-        fn file(&self, name: &str) -> std::path::PathBuf {
+        pub(super) fn file(&self, name: &str) -> std::path::PathBuf {
             self.0.join(name)
         }
     }
@@ -171,7 +227,7 @@ mod tests {
         }
     }
 
-    fn config(identifier: &str) -> BaseConfig {
+    pub(super) fn config(identifier: &str) -> BaseConfig {
         let mut config = BaseConfig::new("Living Room", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
         let mut service = BaseService::new(Protocol::Companion, 49153);
         service.identifier = Some(identifier.to_owned());
@@ -263,5 +319,66 @@ mod tests {
     fn the_default_path_is_the_one_pyatv_uses() {
         let path = FileStorage::default_path().expect("HOME is set in the test environment");
         assert!(path.ends_with(".pyatv.conf"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::FileStorage;
+    use super::tests::{TempDir, config};
+    use crate::storage::Storage;
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("the file must exist")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    /// A file the user locked down must not be widened by a save.
+    ///
+    /// The atomic write creates a sibling at the umask default — `0644` on a typical box — and
+    /// renames it over the real file, which carries that mode across. Every device credential
+    /// lives in this file.
+    #[test]
+    fn saving_preserves_an_existing_files_permissions() {
+        let dir = TempDir::new("permissions-existing");
+        let path = dir.file("settings.conf");
+
+        let storage = FileStorage::new(&path);
+        storage
+            .update_settings(&config("companion-id"))
+            .expect("update must succeed");
+        storage.save().expect("save must succeed");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod must succeed");
+
+        let storage = FileStorage::new(&path);
+        storage.load().expect("load must succeed");
+        storage
+            .update_settings(&config("another-id"))
+            .expect("update must succeed");
+        storage.save().expect("save must succeed");
+
+        assert_eq!(mode_of(&path), 0o600, "the user's mode must survive a save");
+    }
+
+    /// A file this crate creates starts at `0600`, not at whatever the umask happens to allow.
+    #[test]
+    fn a_newly_created_settings_file_is_owner_only() {
+        let dir = TempDir::new("permissions-new");
+        let path = dir.file("settings.conf");
+
+        let storage = FileStorage::new(&path);
+        storage
+            .update_settings(&config("companion-id"))
+            .expect("update must succeed");
+        storage.save().expect("save must succeed");
+
+        assert_eq!(mode_of(&path), 0o600, "credentials are not world-readable");
     }
 }

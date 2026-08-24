@@ -38,10 +38,20 @@
 //! them distinct, which is what the encoder's byte-keyed table already assumed.
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::collections::hash_map::{DefaultHasher, RandomState};
+use std::hash::{BuildHasher, Hash, Hasher};
 
 use crate::value::Value;
+
+/// How many values may share one digest before the table stops confirming candidates with `==`.
+///
+/// Reaching this needs 64 *distinct* values with the same 64-bit digest, which for a real payload
+/// is not going to happen and which [`RandomState`] stops an attacker from arranging in advance.
+/// The cap is there so the scan is bounded even if one somehow does: past it the value is recorded
+/// unconditionally, which may record a duplicate and shift the numbering of everything after it —
+/// a wrong decode of a payload nothing legitimate can produce, in exchange for a hard bound on the
+/// work per value.
+const MAX_BUCKET: usize = 64;
 
 /// Encoder-side table, keyed by encoded bytes (`opack.py:116-130`).
 #[derive(Debug, Default)]
@@ -70,11 +80,20 @@ impl PackTable {
 /// The bucket map exists only so the "have I seen this value already?" test is not a linear scan;
 /// a hostile payload made of thousands of distinct short strings would otherwise cost quadratic
 /// time. Buckets are keyed by a hash that is *consistent with*, but coarser than, [`PartialEq`],
-/// and candidates are always confirmed with `==`.
+/// and candidates are confirmed with `==`.
+///
+/// The digest comes from a per-table [`RandomState`] rather than from `DefaultHasher::new()`.
+/// `DefaultHasher::new()` is documented to be SipHash-1-3 with a **fixed, zero key**, so its
+/// digests are the same in every process and an attacker can precompute thousands of short strings
+/// that all land in one bucket — which restores exactly the quadratic behaviour the buckets exist
+/// to remove. Seeding per table makes that unplannable; [`MAX_BUCKET`] bounds it even if it
+/// somehow happens.
 #[derive(Debug, Default)]
 pub(crate) struct UnpackTable {
     values: Vec<Value>,
     buckets: HashMap<u64, Vec<usize>>,
+    /// Per-table random seed for [`digest_of`].
+    hasher: RandomState,
 }
 
 impl UnpackTable {
@@ -90,21 +109,21 @@ impl UnpackTable {
 
     /// Record a decoded value unless an equal one is already present.
     pub(crate) fn record(&mut self, value: &Value) {
-        let digest = digest_of(value);
+        let digest = self.digest_of(value);
         let bucket = self.buckets.entry(digest).or_default();
-        if bucket.iter().any(|&index| self.values[index] == *value) {
+        if bucket.len() < MAX_BUCKET && bucket.iter().any(|&index| self.values[index] == *value) {
             return;
         }
         bucket.push(self.values.len());
         self.values.push(value.clone());
     }
-}
 
-/// Hash a value in a way that agrees with [`PartialEq`] for every non-NaN input.
-fn digest_of(value: &Value) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hash_into(value, &mut hasher);
-    hasher.finish()
+    /// Hash a value in a way that agrees with [`PartialEq`] for every non-NaN input.
+    fn digest_of(&self, value: &Value) -> u64 {
+        let mut hasher = self.hasher.build_hasher();
+        hash_into(value, &mut hasher);
+        hasher.finish()
+    }
 }
 
 fn hash_into(value: &Value, hasher: &mut DefaultHasher) {
@@ -157,8 +176,8 @@ mod tests {
     #[test]
     fn unpack_table_dedupes_by_typed_equality() {
         let mut table = UnpackTable::default();
-        table.record(&Value::String("a".into()));
-        table.record(&Value::String("a".into()));
+        table.record(&Value::from("a"));
+        table.record(&Value::from("a"));
         assert_eq!(table.len(), 1);
 
         // Python would treat all three of these as equal and record only the first.
@@ -172,7 +191,7 @@ mod tests {
         });
         table.record(&Value::Float(1.0));
         assert_eq!(table.len(), 4);
-        assert_eq!(table.get(0), Some(&Value::String("a".into())));
+        assert_eq!(table.get(0), Some(&Value::from("a")));
         assert_eq!(table.get(4), None);
     }
 }

@@ -4,8 +4,8 @@
 //! with `CPython`'s defaults, which differ from `serde_json`'s compact output in two ways:
 //!
 //! - separators are `", "` and `": "`, not `","` and `":"`;
-//! - `ensure_ascii=True`, so every non-ASCII character is escaped as `\uXXXX` (a surrogate pair
-//!   above the BMP) instead of being written as UTF-8.
+//! - `ensure_ascii=True`, so every character outside the printable ASCII range `U+0020..=U+007E`
+//!   is escaped as `\uXXXX` — a surrogate pair above the BMP — instead of being written as UTF-8.
 //!
 //! Reproducing both makes the file this crate writes byte-identical to the one pyatv writes, which
 //! is what lets [`crate::storage::Storage::save`] use a plain string comparison for change
@@ -50,17 +50,28 @@ impl Formatter for PythonFormatter {
         writer.write_all(b": ")
     }
 
-    /// `ensure_ascii=True`: escape everything above U+007F.
+    /// `ensure_ascii=True`: escape everything outside `U+0020..=U+007E`.
     ///
-    /// `serde_json` hands this method the runs of text between the escapes it already knows about
-    /// (quotes, backslashes, control characters), so only the non-ASCII case is left to handle.
+    /// `serde_json` hands this method the runs of text between the escapes it already knows about —
+    /// quotes, backslashes and the C0 controls below `U+0020` — so what is left to handle is
+    /// everything *above* printable ASCII.
+    ///
+    /// That includes `U+007F`, which is where this used to be wrong. `CPython`'s `ESCAPE_ASCII`
+    /// pattern is `([\\"]|[^\ -~])`, i.e. anything outside space through tilde, so
+    /// `json.dumps("\x7f")` produces `"\u007f"`; `serde_json` only escapes below `U+0020` and
+    /// `char::is_ascii` says DEL is ASCII, so it went out raw. A settings file with a DEL in a
+    /// device name — Apple TV names come from the device, not from validation here — would then
+    /// differ byte for byte from pyatv's and be rewritten on every save.
     fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> io::Result<()>
     where
         W: ?Sized + io::Write,
     {
+        /// The last character `json.dumps` leaves unescaped, `~`.
+        const LAST_PRINTABLE: char = '\u{7E}';
+
         let mut ascii_from = 0;
         for (index, character) in fragment.char_indices() {
-            if character.is_ascii() {
+            if character.is_ascii() && character <= LAST_PRINTABLE {
                 continue;
             }
 
@@ -131,6 +142,27 @@ mod tests {
         assert_eq!(
             to_python_json(&value).expect("serialising must succeed"),
             r#"{"a": "quote\" tab\t"}"#
+        );
+    }
+
+    /// `json.dumps("x\x7fy")` is `'"x\u007fy"'`: DEL is above `~`, so `ensure_ascii` escapes it
+    /// even though it is ASCII. `serde_json` does not, which is why this needs handling here.
+    #[test]
+    fn del_is_escaped_even_though_it_is_ascii() {
+        let value = serde_json::json!({"a": "x\u{7f}y"});
+        assert_eq!(
+            to_python_json(&value).expect("serialising must succeed"),
+            r#"{"a": "x\u007fy"}"#
+        );
+    }
+
+    /// The boundary either side of it: `~` stays, and the C0 controls stay `serde_json`'s job.
+    #[test]
+    fn the_printable_range_is_left_alone() {
+        let value = serde_json::json!({"a": " ~"});
+        assert_eq!(
+            to_python_json(&value).expect("serialising must succeed"),
+            r#"{"a": " ~"}"#
         );
     }
 }

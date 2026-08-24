@@ -1110,10 +1110,13 @@ dependencies = [
  "plist",
  "pyatv-core",
  "pyatv-pairing",
+ "rand 0.10.2",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1121,11 +1124,13 @@ name = "pyatv-proto-companion"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "hex",
  "plist",
  "pyatv-core",
  "pyatv-opack",
  "pyatv-pairing",
  "rand 0.10.2",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

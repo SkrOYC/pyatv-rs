@@ -6,7 +6,7 @@
 //! answer reflects live device state rather than the static declaration.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::consts::Protocol;
 use crate::features::{FeatureInfo, FeatureName, FeatureState};
@@ -15,8 +15,25 @@ use crate::interface::Features;
 use super::DEFAULT_PRIORITIES;
 
 /// Feature reporting for the assembled facade.
+///
+/// # Why the lock
+///
+/// [`super::FacadeAppleTV`] hands this out as an `Arc<dyn Features>` from `features()`, which takes
+/// `&self`, and registers protocols into it from `add_protocol`, which takes `&mut self`. Reaching
+/// through the `Arc` with `Arc::get_mut` looks like it should work — and it did, right up until a
+/// caller held on to a handle from an earlier `features()` call, at which point `get_mut` returned
+/// `None` and the whole registration was **silently discarded**, leaving that protocol's features
+/// permanently `Unsupported`. Owning the mutability here instead removes the failure mode rather
+/// than papering over it, and has the better property besides: a handle taken before a protocol
+/// connected sees that protocol's features afterwards.
 #[derive(Debug, Default)]
 pub struct FacadeFeatures {
+    state: RwLock<State>,
+}
+
+/// The registry itself, behind [`FacadeFeatures`]'s lock.
+#[derive(Debug, Default)]
+struct State {
     owners: HashMap<FeatureName, (Protocol, Arc<dyn Features>)>,
     /// Set when at least one protocol registered a push updater, which is how upstream answers
     /// [`FeatureName::PushUpdates`] without asking any protocol (`facade.py:289-295`).
@@ -29,32 +46,48 @@ impl FacadeFeatures {
     /// `add_mapping` (`facade.py:274-284`): a feature already claimed by a higher-priority
     /// protocol keeps its owner, so registration order does not matter.
     pub fn add_mapping(
-        &mut self,
+        &self,
         protocol: Protocol,
         features: &BTreeSet<FeatureName>,
         instance: &Arc<dyn Features>,
     ) {
+        let mut state = self.write();
         for feature in features {
-            let replace = match self.owners.get(feature) {
+            let replace = match state.owners.get(feature) {
                 None => true,
                 Some((incumbent, _)) => has_higher_priority(protocol, *incumbent),
             };
             if replace {
-                self.owners
+                state
+                    .owners
                     .insert(*feature, (protocol, Arc::clone(instance)));
             }
         }
     }
 
     /// Record that some protocol can push now-playing updates.
-    pub fn set_push_updates(&mut self, available: bool) {
-        self.push_updates = available;
+    pub fn set_push_updates(&self, available: bool) {
+        self.write().push_updates = available;
     }
 
     /// The protocol that answers for a feature, if any protocol declared it.
     #[must_use]
     pub fn owner(&self, feature: FeatureName) -> Option<Protocol> {
-        self.owners.get(&feature).map(|(protocol, _)| *protocol)
+        self.read()
+            .owners
+            .get(&feature)
+            .map(|(protocol, _)| *protocol)
+    }
+
+    /// A poisoned lock hands back what the panicking writer left behind rather than failing:
+    /// reporting "features are unreadable" would be strictly worse than reporting a registry that
+    /// is missing one protocol's mappings.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, State> {
+        self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, State> {
+        self.state.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -73,13 +106,22 @@ fn has_higher_priority(first: Protocol, second: Protocol) -> bool {
 
 impl Features for FacadeFeatures {
     fn get_feature(&self, feature: FeatureName) -> FeatureInfo {
-        if feature == FeatureName::PushUpdates && self.push_updates {
-            return FeatureInfo::available();
-        }
-        match self.owners.get(&feature) {
-            Some((_, instance)) => instance.get_feature(feature),
-            None => FeatureInfo::unsupported(),
-        }
+        // The owning protocol is cloned out and the guard dropped before asking it, so a protocol
+        // whose own `get_feature` reaches back into the facade cannot deadlock against this lock.
+        let owner = {
+            let state = self.read();
+            if feature == FeatureName::PushUpdates && state.push_updates {
+                return FeatureInfo::available();
+            }
+            state
+                .owners
+                .get(&feature)
+                .map(|(_, instance)| Arc::clone(instance))
+        };
+
+        owner.map_or_else(FeatureInfo::unsupported, |instance| {
+            instance.get_feature(feature)
+        })
     }
 
     /// Every feature, filtered to the supported ones unless `include_unsupported` is set.
@@ -129,7 +171,7 @@ mod tests {
 
     #[test]
     fn the_highest_priority_protocol_answers_for_a_shared_feature() {
-        let mut facade = FacadeFeatures::default();
+        let facade = FacadeFeatures::default();
         // Registered lowest-priority first on purpose.
         facade.add_mapping(
             Protocol::Companion,
@@ -151,7 +193,7 @@ mod tests {
 
     #[test]
     fn a_lower_priority_protocol_never_displaces_the_incumbent() {
-        let mut facade = FacadeFeatures::default();
+        let facade = FacadeFeatures::default();
         facade.add_mapping(
             Protocol::Mrp,
             &declare([FeatureName::Play]),
@@ -179,7 +221,7 @@ mod tests {
 
     #[test]
     fn push_updates_is_available_when_any_protocol_registered_an_updater() {
-        let mut facade = FacadeFeatures::default();
+        let facade = FacadeFeatures::default();
         assert_eq!(
             facade.get_feature(FeatureName::PushUpdates).state,
             FeatureState::Unsupported
@@ -193,7 +235,7 @@ mod tests {
 
     #[test]
     fn unsupported_features_are_filtered_out_unless_requested() {
-        let mut facade = FacadeFeatures::default();
+        let facade = FacadeFeatures::default();
         facade.add_mapping(
             Protocol::Companion,
             &declare([FeatureName::AppList]),
