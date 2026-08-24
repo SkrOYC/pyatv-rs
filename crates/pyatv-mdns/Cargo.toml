@@ -12,12 +12,9 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-hickory-proto = { version = "0.26.1", optional = true }
 mdns-sd = "0.21.0"
 pyatv-core.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
-[features]
-hickory-proto = ["dep:hickory-proto"]
+unicode-normalization = "0.1.25"

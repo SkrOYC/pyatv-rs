@@ -6,10 +6,14 @@
 //!
 //! `docs/research/pyatv-architecture.md` §3 documents the scan flow this crate reproduces: browse every service type, group responses by IP, merge each protocol's device-info extractor output, and materialise one config per physical device.
 
+//! The [`dns`] module is the sans-io half of all of this: a hand-written DNS/DNS-SD codec ported from pyatv's `pyatv/support/dns.py`, with no sockets and no dependency on the rest of the crate.
+
 pub mod browse;
+pub mod dns;
 pub mod knock;
 pub mod service_types;
 pub mod unicast;
 
 pub use browse::{MulticastScanner, ScanOptions};
+pub use dns::{DnsError, DnsMessage, DnsQuestion, DnsResource, QueryType, ServiceInstanceName};
 pub use service_types::ServiceType;

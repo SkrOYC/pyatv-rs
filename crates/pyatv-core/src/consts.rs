@@ -221,6 +221,62 @@ pub enum TouchAction {
     Click = 5,
 }
 
+impl Protocol {
+    /// The protocol's display name, exactly as `pyatv/convert.py:54-62` (`protocol_str`) renders
+    /// it. The string appears in `atvremote scan` output and in the display form of
+    /// [`crate::models::BaseService`], so it is part of the observable contract.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mrp => "MRP",
+            Self::Dmap => "DMAP",
+            Self::AirPlay => "AirPlay",
+            Self::Companion => "Companion",
+            Self::Raop => "RAOP",
+        }
+    }
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl DeviceModel {
+    /// The model's display name, exactly as `pyatv/convert.py:65-81` (`model_str`) renders it.
+    ///
+    /// [`DeviceModel::Unknown`] renders as the literal `"Unknown"` because upstream looks the model
+    /// up with `dict.get(device_model, "Unknown")` and has no entry for it. Callers that want the
+    /// raw advertised model string to win instead should use
+    /// [`crate::device_info::DeviceInfo::model_str`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AppleTvGen1 => "Apple TV 1",
+            Self::Gen2 => "Apple TV 2",
+            Self::Gen3 => "Apple TV 3",
+            Self::Gen4 => "Apple TV 4",
+            Self::Gen4K => "Apple TV 4K",
+            Self::HomePod => "HomePod",
+            Self::HomePodMini => "HomePod Mini",
+            Self::AirPortExpress => "AirPort Express (gen 1)",
+            Self::AirPortExpressGen2 => "AirPort Express (gen 2)",
+            Self::AppleTv4KGen2 => "Apple TV 4K (gen 2)",
+            Self::Music => "Music/iTunes",
+            Self::AppleTv4KGen3 => "Apple TV 4K (gen 3)",
+            Self::HomePodGen2 => "HomePod (gen 2)",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DeviceModel, Protocol, TouchAction};
@@ -253,5 +309,47 @@ mod tests {
         assert_eq!(TouchAction::Hold as u8, 3);
         assert_eq!(TouchAction::Release as u8, 4);
         assert_eq!(TouchAction::Click as u8, 5);
+    }
+
+    /// `atvremote scan` prints these strings verbatim, so they are pinned against
+    /// `pyatv/convert.py::protocol_str`.
+    #[test]
+    fn protocol_display_matches_convert_protocol_str() {
+        assert_eq!(Protocol::Mrp.to_string(), "MRP");
+        assert_eq!(Protocol::Dmap.to_string(), "DMAP");
+        assert_eq!(Protocol::AirPlay.to_string(), "AirPlay");
+        assert_eq!(Protocol::Companion.to_string(), "Companion");
+        assert_eq!(Protocol::Raop.to_string(), "RAOP");
+    }
+
+    /// Pinned against `pyatv/convert.py::model_str`.
+    #[test]
+    fn device_model_display_matches_convert_model_str() {
+        assert_eq!(DeviceModel::AppleTvGen1.to_string(), "Apple TV 1");
+        assert_eq!(DeviceModel::Gen2.to_string(), "Apple TV 2");
+        assert_eq!(DeviceModel::Gen3.to_string(), "Apple TV 3");
+        assert_eq!(DeviceModel::Gen4.to_string(), "Apple TV 4");
+        assert_eq!(DeviceModel::Gen4K.to_string(), "Apple TV 4K");
+        assert_eq!(DeviceModel::HomePod.to_string(), "HomePod");
+        assert_eq!(DeviceModel::HomePodMini.to_string(), "HomePod Mini");
+        assert_eq!(
+            DeviceModel::AirPortExpress.to_string(),
+            "AirPort Express (gen 1)"
+        );
+        assert_eq!(
+            DeviceModel::AirPortExpressGen2.to_string(),
+            "AirPort Express (gen 2)"
+        );
+        assert_eq!(
+            DeviceModel::AppleTv4KGen2.to_string(),
+            "Apple TV 4K (gen 2)"
+        );
+        assert_eq!(DeviceModel::Music.to_string(), "Music/iTunes");
+        assert_eq!(
+            DeviceModel::AppleTv4KGen3.to_string(),
+            "Apple TV 4K (gen 3)"
+        );
+        assert_eq!(DeviceModel::HomePodGen2.to_string(), "HomePod (gen 2)");
+        assert_eq!(DeviceModel::Unknown.to_string(), "Unknown");
     }
 }
