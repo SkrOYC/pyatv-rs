@@ -3,13 +3,15 @@
 //! Ports `pyatv/interface.py::BaseConfig` (`pyatv/interface.py:1320-1468`) together with its only
 //! concrete subclass `pyatv/conf.py::AppleTV` (`pyatv/conf.py:17-96`). Upstream splits them so a
 //! caller can hand-build a config without the scanner; here one struct covers both, because the
-//! abstract half carries no state beyond the Zeroconf properties.
+//! abstract half carries no state beyond the Zeroconf properties — which this struct holds too,
+//! see [`BaseConfig::set_properties`].
 //!
 //! The service collection is a `Vec` rather than a map because `AppleTV._services` is a
 //! `Dict[Protocol, BaseService]` whose `services` property returns `list(...values())` — i.e. it is
 //! already keyed by protocol *and* insertion-ordered, and [`BaseConfig::add_service`] preserves
 //! both properties.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 use crate::consts::Protocol;
@@ -55,6 +57,12 @@ pub struct BaseConfig {
     pub device_info: DeviceInfo,
     /// Every discovered service, at most one per protocol, in discovery order.
     pub services: Vec<BaseService>,
+    /// Every TXT record the scan saw for this device, keyed by DNS-SD service type.
+    ///
+    /// Private because of the key invariants below; read it through [`BaseConfig::properties`],
+    /// [`BaseConfig::property`] or [`BaseConfig::has_properties`] and write it through
+    /// [`BaseConfig::set_properties`].
+    properties: HashMap<String, HashMap<String, String>>,
 }
 
 impl BaseConfig {
@@ -71,7 +79,84 @@ impl BaseConfig {
             deep_sleep: false,
             device_info: DeviceInfo::default(),
             services: Vec::new(),
+            properties: HashMap::new(),
         }
+    }
+
+    /// Record the per-service-type TXT records the scan collected for this device.
+    ///
+    /// The scanner-side half of `AppleTV(properties=...)` (`pyatv/conf.py:25-37`), fed by
+    /// `BaseScanner._properties[address]` (`pyatv/core/scan.py:227-231`). Kept off
+    /// [`BaseConfig::new`] so a hand-built config stays as cheap to write as upstream's, where the
+    /// argument is optional.
+    ///
+    /// Two key invariants the caller must uphold, both inherited from upstream:
+    ///
+    /// - The outer key is the DNS-SD service type **without a trailing dot**, exactly as pyatv
+    ///   spells it: `"_airplay._tcp.local"`, `"_raop._tcp.local"`. That is the literal RAOP and
+    ///   DMAP look themselves up by at connect time
+    ///   (`pyatv/protocols/raop/__init__.py:562-567`, `pyatv/protocols/dmap/__init__.py:696-703`).
+    /// - Inner keys are ASCII-lowercased, as on [`BaseService::properties`]. Read them back with
+    ///   [`BaseConfig::property`], which lowercases before looking up.
+    pub fn set_properties(&mut self, properties: HashMap<String, HashMap<String, String>>) {
+        self.properties = properties;
+    }
+
+    /// [`BaseConfig::set_properties`] in builder form.
+    #[must_use]
+    pub fn with_properties(mut self, properties: HashMap<String, HashMap<String, String>>) -> Self {
+        self.set_properties(properties);
+        self
+    }
+
+    /// The TXT record a given DNS-SD service type advertised, if the scan saw that type.
+    ///
+    /// Ports `BaseConfig.properties` (`pyatv/interface.py:1373-1376`) at its only real call sites,
+    /// which index it rather than iterating: `core.config.properties.get(service_type)` in RAOP's
+    /// `_device_info` (`pyatv/protocols/raop/__init__.py:564`) and the `in` test plus lookup in
+    /// DMAP's (`pyatv/protocols/dmap/__init__.py:699-702`).
+    ///
+    /// `service_type` is matched as spelled, so pass the dotless form —
+    /// `"_airplay._tcp.local"`, not `"_airplay._tcp.local."`.
+    ///
+    /// Note this is **not** the same data as [`BaseService::properties`]: a service type that
+    /// produced no [`BaseService`] at all still lands here, which is the entire reason
+    /// `_airport._tcp.local` and `_sleep-proxy._udp.local` are visible to a device-info extractor.
+    #[must_use]
+    pub fn properties(&self, service_type: &str) -> Option<&HashMap<String, String>> {
+        self.properties.get(service_type)
+    }
+
+    /// Whether the scan saw a given DNS-SD service type for this device.
+    ///
+    /// `service_type in core.config.properties` (`pyatv/protocols/dmap/__init__.py:699`).
+    #[must_use]
+    pub fn has_properties(&self, service_type: &str) -> bool {
+        self.properties.contains_key(service_type)
+    }
+
+    /// One TXT key from one service type's record, matched case-insensitively.
+    ///
+    /// The [`BaseService::property`] convention applied to the config-level map: the stored inner
+    /// keys are lowercase, so a wire-cased literal has to be folded before the lookup.
+    #[must_use]
+    pub fn property(&self, service_type: &str, key: &str) -> Option<&str> {
+        let properties = self.properties.get(service_type)?;
+        if let Some(value) = properties.get(key) {
+            return Some(value.as_str());
+        }
+        properties
+            .get(&key.to_ascii_lowercase())
+            .map(String::as_str)
+    }
+
+    /// Every service type the scan saw for this device, with its TXT record.
+    ///
+    /// The whole `Mapping` upstream's `BaseConfig.properties` property returns, for the callers
+    /// that genuinely want to walk it rather than index it.
+    #[must_use]
+    pub fn all_properties(&self) -> &HashMap<String, HashMap<String, String>> {
+        &self.properties
     }
 
     /// Add a service, merging it into the existing one when the protocol is already known.
@@ -187,6 +272,10 @@ impl std::fmt::Display for BaseConfig {
     /// Reproduces `pyatv/interface.py:1448-1463` (`BaseConfig.__str__`), which is exactly what
     /// `atvremote scan` prints per device. The column alignment, the ` - ` list prefix and the
     /// Python-style `None`/`True`/`False` renderings are all part of that output.
+    ///
+    /// [`BaseConfig::properties`] is deliberately absent: upstream's `__str__` never prints the
+    /// Zeroconf property map, only the name, device info, address, MAC, deep-sleep flag,
+    /// identifiers and services.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Upstream builds both blocks with `"\n".join(...)`, then interpolates them followed by a
         // literal "\n". An empty list therefore still costs one blank line. Reproduced, not tidied.
@@ -217,6 +306,7 @@ impl std::fmt::Display for BaseConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::BaseConfig;
@@ -378,6 +468,42 @@ mod tests {
             Some(Protocol::Mrp)
         );
         assert_eq!(config.enabled_services().count(), 0);
+    }
+
+    /// The map RAOP and DMAP index at connect time, keyed by the dotless service type.
+    #[test]
+    fn properties_are_keyed_by_service_type_and_read_case_insensitively() {
+        let config = config().with_properties(HashMap::from([(
+            "_airplay._tcp.local".to_owned(),
+            HashMap::from([("deviceid".to_owned(), "AA:BB:CC:DD:EE:FF".to_owned())]),
+        )]));
+
+        assert!(config.has_properties("_airplay._tcp.local"));
+        assert!(!config.has_properties("_raop._tcp.local"));
+        // The trailing-dot spelling is a different key, as it is upstream.
+        assert!(!config.has_properties("_airplay._tcp.local."));
+
+        assert_eq!(
+            config
+                .properties("_airplay._tcp.local")
+                .and_then(|it| it.get("deviceid"))
+                .map(String::as_str),
+            Some("AA:BB:CC:DD:EE:FF")
+        );
+        assert_eq!(
+            config.property("_airplay._tcp.local", "DeviceID"),
+            Some("AA:BB:CC:DD:EE:FF")
+        );
+        assert_eq!(config.property("_airplay._tcp.local", "missing"), None);
+        assert_eq!(config.property("_raop._tcp.local", "deviceid"), None);
+        assert_eq!(config.all_properties().len(), 1);
+    }
+
+    #[test]
+    fn properties_default_to_empty() {
+        let config = config();
+        assert!(config.all_properties().is_empty());
+        assert!(config.properties("_airplay._tcp.local").is_none());
     }
 
     #[test]

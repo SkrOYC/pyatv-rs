@@ -11,10 +11,12 @@
 pub mod browse;
 pub mod dns;
 pub mod knock;
+pub mod mdns;
+pub mod scan;
 pub mod service;
 pub mod service_types;
-pub mod unicast;
 
-pub use browse::{MulticastScanner, ScanOptions};
+pub use browse::{MulticastScanner, ScanOptions, UnicastScanner, scan};
 pub use dns::{DnsError, DnsMessage, DnsQuestion, DnsResource, QueryType, ServiceInstanceName};
+pub use scan::build_configs;
 pub use service_types::ServiceType;

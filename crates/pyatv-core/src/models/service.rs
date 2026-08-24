@@ -25,7 +25,17 @@ pub struct BaseService {
     pub requires_password: bool,
     /// Whether the service must be paired before use.
     pub pairing: PairingRequirement,
-    /// Raw mDNS TXT record properties, lowercased keys.
+    /// Raw mDNS TXT record properties.
+    ///
+    /// **Invariant: every key is ASCII-lowercased.** Upstream stores these in a
+    /// `CaseInsensitiveDict` (`pyatv/support/collections.py:53-130`), so pyatv code reads them by
+    /// whatever casing the wire uses — `properties["SystemBuildVersion"]` and
+    /// `properties["systembuildversion"]` are the same entry there. A plain [`HashMap`] cannot do
+    /// that, so the lowercasing happens once, on the way in
+    /// (`pyatv_mdns::dns::CaseInsensitiveMap::insert`), and every writer must uphold it.
+    ///
+    /// Consequence: **do not index this map with a wire-cased key.** `properties.get("Model")`
+    /// silently returns `None`. Use [`BaseService::property`], which lowercases first.
     pub properties: HashMap<String, String>,
     /// Credentials previously negotiated for this service, in pyatv's colon-separated hex format.
     pub credentials: Option<String>,
@@ -52,6 +62,27 @@ impl BaseService {
             credentials: None,
             password: None,
         }
+    }
+
+    /// Look up a TXT property by any casing of its key.
+    ///
+    /// The stand-in for indexing pyatv's `CaseInsensitiveDict` (`BaseService.properties`), which
+    /// upstream does with the wire spelling: `properties.get("Machine ID")`,
+    /// `properties.get("UniqueIdentifier")`. [`BaseService::properties`] stores lowercased keys, so
+    /// going through this accessor is what makes those spellings keep working.
+    ///
+    /// Prefer it over `service.properties.get(key)` in every new call site; the direct form is
+    /// correct only when the key literal is already lowercase.
+    #[must_use]
+    pub fn property(&self, key: &str) -> Option<&str> {
+        // Fast path: the caller already spelled the key the way it is stored, which is the common
+        // case and avoids allocating for it.
+        if let Some(value) = self.properties.get(key) {
+            return Some(value.as_str());
+        }
+        self.properties
+            .get(&key.to_ascii_lowercase())
+            .map(String::as_str)
     }
 
     /// Fold another discovery result for the same protocol into this one.
@@ -135,6 +166,27 @@ mod tests {
         let mut service = BaseService::new(Protocol::AirPlay, 7000);
         service.credentials = credentials.map(ToOwned::to_owned);
         service
+    }
+
+    /// pyatv reads these keys by their wire casing out of a `CaseInsensitiveDict`; the accessor is
+    /// what keeps that working over a lowercase-keyed `HashMap`.
+    #[test]
+    fn property_lookup_ignores_key_case() {
+        let mut service = BaseService::new(Protocol::Mrp, 49152);
+        service
+            .properties
+            .insert("systembuildversion".into(), "18M60".into());
+        service.properties.insert("model".into(), "J305AP".into());
+
+        for spelling in [
+            "SystemBuildVersion",
+            "systembuildversion",
+            "SYSTEMBUILDVERSION",
+        ] {
+            assert_eq!(service.property(spelling), Some("18M60"), "{spelling}");
+        }
+        assert_eq!(service.property("Model"), Some("J305AP"));
+        assert_eq!(service.property("Machine ID"), None);
     }
 
     /// `self.credentials = other.credentials or self.credentials`.

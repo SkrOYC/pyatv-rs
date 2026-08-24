@@ -26,7 +26,10 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-/// Discover devices and print one line per device, then one per service.
+/// Discover devices and print each one.
+///
+/// `BaseConfig`'s `Display` is `pyatv/interface.py:1448-1463` verbatim, which is exactly what
+/// upstream's `atvremote scan` prints — so the formatting belongs there, not here.
 async fn scan(cli: &Cli) -> Result<()> {
     let options = ScanOptions {
         timeout: Duration::from_secs(cli.scan_timeout),
@@ -36,10 +39,7 @@ async fn scan(cli: &Cli) -> Result<()> {
     };
 
     for device in pyatv::scan(options).await? {
-        println!("{}: {}", device.name, device.address);
-        for service in &device.services {
-            println!("  {:?} port {}", service.protocol, service.port);
-        }
+        println!("{device}");
     }
 
     Ok(())

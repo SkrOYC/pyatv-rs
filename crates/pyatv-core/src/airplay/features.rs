@@ -148,6 +148,19 @@ pub fn parse_features(features: &str) -> Result<AirPlayFlags, InvalidFeatureStri
         None => low,
         Some(high) => {
             let high = word(high).ok_or_else(invalid)?;
+            // Deliberate divergence. Upstream concatenates the two capture groups as *text* and
+            // parses once: `value = upper + value; int(value, 16)`
+            // (`pyatv/protocols/airplay/utils.py:104-118`). Because its regex accepts one to eight
+            // hex digits per word, a low word shorter than eight digits shifts the high word down
+            // by the missing nibbles — `"0xE,0x1"` parses as `int("1E", 16) == 0x1E` upstream, not
+            // as `0x1_0000_000E`.
+            //
+            // That is a bug, not a wire format: receivers always advertise both halves zero-padded
+            // to eight digits (`sf`/`ft` are fixed-width 32-bit words), so for every real TXT
+            // record the two readings agree bit for bit. Shifting is what the documented meaning
+            // — "0x12345678,0xabcdef12 => 0xabcdef1212345678" — actually says, and it keeps a
+            // short-but-legal string from silently landing bits in the wrong half. Pinned by
+            // `parse_features_shifts_short_low_words`.
             (high << 32) | low
         }
     };
@@ -205,11 +218,10 @@ pub fn get_protocol_version(
         AirPlayVersion::V1 => AirPlayMajorVersion::V1,
         AirPlayVersion::Auto => {
             let features = service
-                .properties
-                .get("ft")
+                .property("ft")
                 .filter(|it| !it.is_empty())
-                .or_else(|| service.properties.get("features"))
-                .map_or("0x0", String::as_str);
+                .or_else(|| service.property("features"))
+                .unwrap_or("0x0");
 
             let parsed = parse_features(features).unwrap_or(AirPlayFlags::empty());
             if parsed.intersects(
@@ -313,6 +325,29 @@ mod tests {
             AirPlayFlags::IS_CAR_PLAY
                 | AirPlayFlags::SUPPORTS_AIRPLAY_PHOTO
                 | AirPlayFlags::SUPPORTS_AIRPLAY_VIDEO_V1
+        );
+    }
+
+    /// Pins the deliberate divergence documented in [`parse_features`]: the high word is shifted
+    /// by a fixed 32 bits, where upstream's string concatenation would shift it by however many
+    /// hex digits the low word happened to have.
+    ///
+    /// `"0xE,0x1"` is `int("1E", 16) == 0x1E` in pyatv and `0x1_0000_000E` here. No real receiver
+    /// emits an unpadded word, so the difference is unreachable in practice.
+    #[test]
+    fn parse_features_shifts_short_low_words() {
+        assert_eq!(
+            parse_features("0xE,0x1").expect("valid").bits(),
+            0x1_0000_000E
+        );
+        assert_ne!(parse_features("0xE,0x1").expect("valid").bits(), 0x1E);
+
+        // Zero-padded — the shape every receiver actually advertises — agrees with upstream.
+        assert_eq!(
+            parse_features("0x0000000E,0x00000001")
+                .expect("valid")
+                .bits(),
+            0x1_0000_000E
         );
     }
 

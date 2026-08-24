@@ -12,7 +12,7 @@
 //! # Sans-io
 //!
 //! Nothing here touches a socket, a clock, or a task. [`DnsMessage::unpack`] takes a byte slice and
-//! [`DnsMessage::pack`] returns one. Transport lives in [`crate::browse`] and [`crate::unicast`].
+//! [`DnsMessage::pack`] returns one. Transport lives in [`crate::mdns`].
 //!
 //! # Robustness
 //!

@@ -40,7 +40,7 @@ impl AudioProperties {
     pub fn from_service(service: &BaseService) -> Self {
         // A closure cannot be generic over the parsed type, so this is a function.
         fn read<T: std::str::FromStr>(service: &BaseService, key: &str) -> Option<T> {
-            service.properties.get(key).and_then(|raw| raw.parse().ok())
+            service.property(key).and_then(|raw| raw.parse().ok())
         }
 
         let defaults = Self::default();

@@ -13,7 +13,9 @@ Repository, reproducible devenv toolchain, Cargo workspace with all crates scaff
 - Config: `rustfmt.toml`, `rust-toolchain.toml`, `deny.toml`, `.config/nextest.toml`, `.github/workflows/ci.yml`.
 - `docs/research/` — seven grounded deep-dives; `docs/ARCHITECTURE.md`; `docs/RISKS.md`; this roadmap; `CLAUDE.md`.
 
-## Step 1 — Discovery
+## Step 1 — Discovery (in progress, branch `feat/discovery`)
+
+Spec of record: `docs/research/discovery-port-spec.md` (line-cited against pyatv `b277a4c`). Decision taken: port pyatv's own hand-written mDNS stack (codec + unicast/multicast scanners) instead of wrapping `mdns-sd` — see `docs/ARCHITECTURE.md`. Landed so far: the sans-io DNS codec (`pyatv_mdns::dns`), the core config/service models with pyatv's exact merge and priority rules, the device-model/version lookup tables, and the AirPlay feature/status-flag parsers (`pyatv_core::{device_info,airplay}`).
 
 Make `scan()` real. Multicast mDNS browse/resolve of all service types in `pyatv-mdns`, parsing the TXT records into device models (the AirPlay 64-bit feature/status flags, model identifiers, OS/build version for the tvOS-15 gating heuristic). Populate `pyatv-core`'s config/service models and the `DeviceInfo` trait. Unicast host-scan and the sleeping-device "knock" (ports 3689/7000/49152/32498) can be a follow-up within this phase. Deliverable: `atvremote scan` lists real devices on the LAN with correct identifiers, model, and advertised protocols. (`docs/research/pyatv-architecture.md`, `docs/research/airplay-raop-dmap.md`)
 

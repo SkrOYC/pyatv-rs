@@ -2,8 +2,6 @@
 //!
 //! Ports `pyatv/protocols/airplay/utils.py:24-34,44-47,121-180,262-278`.
 
-use std::collections::HashMap;
-
 use crate::consts::PairingRequirement;
 use crate::device_info::matches_hardware_identifier;
 use crate::models::BaseService;
@@ -55,12 +53,12 @@ pub enum CredentialsKind {
 ///
 /// Upstream calls `int(flags, 16)`, which raises on garbage. Here a malformed value reads as `0`:
 /// one badly-behaved receiver should not abort a whole scan.
-fn get_flags(properties: &HashMap<String, String>) -> u64 {
-    let raw = properties
-        .get("sf")
+fn get_flags(service: &BaseService) -> u64 {
+    let raw = service
+        .property("sf")
         .filter(|it| !it.is_empty())
-        .or_else(|| properties.get("flags").filter(|it| !it.is_empty()))
-        .map_or("0x0", String::as_str);
+        .or_else(|| service.property("flags").filter(|it| !it.is_empty()))
+        .unwrap_or("0x0");
 
     let digits = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X"));
     match digits {
@@ -77,14 +75,13 @@ fn get_flags(properties: &HashMap<String, String>) -> u64 {
 #[must_use]
 pub fn is_password_required(service: &BaseService) -> bool {
     if service
-        .properties
-        .get("pw")
+        .property("pw")
         .is_some_and(|it| it.eq_ignore_ascii_case("true"))
     {
         return true;
     }
 
-    get_flags(&service.properties) & PASSWORD_BIT != 0
+    get_flags(service) & PASSWORD_BIT != 0
 }
 
 /// Whether the service must be paired before use.
@@ -98,11 +95,11 @@ pub fn is_password_required(service: &BaseService) -> bool {
 ///   absence of a bit is being read as proof that pairing is unnecessary.
 #[must_use]
 pub fn get_pairing_requirement(service: &BaseService) -> PairingRequirement {
-    if get_flags(&service.properties) & (LEGACY_PAIRING_BIT | PIN_REQUIRED) != 0 {
+    if get_flags(service) & (LEGACY_PAIRING_BIT | PIN_REQUIRED) != 0 {
         return PairingRequirement::Mandatory;
     }
 
-    if service.properties.get("act").is_some_and(|it| it == "2") {
+    if service.property("act").is_some_and(|it| it == "2") {
         return PairingRequirement::Unsupported;
     }
 
@@ -123,13 +120,9 @@ pub fn get_pairing_requirement(service: &BaseService) -> PairingRequirement {
 pub fn update_service_details(service: &mut BaseService) {
     service.requires_password = is_password_required(service);
 
-    let model = service
-        .properties
-        .get("model")
-        .map_or("", String::as_str)
-        .to_owned();
+    let model = service.property("model").unwrap_or("").to_owned();
 
-    service.pairing = if service.properties.get("acl").is_some_and(|it| it == "1") {
+    service.pairing = if service.property("acl").is_some_and(|it| it == "1") {
         PairingRequirement::Disabled
     } else if UNSUPPORTED_MODEL_PREFIXES
         .iter()
@@ -159,7 +152,7 @@ pub fn update_service_details(service: &mut BaseService) {
 /// A non-numeric `osvers` reads as version `0`. Upstream lets `float()` raise instead.
 #[must_use]
 pub fn is_remote_control_supported(service: &BaseService, credentials: CredentialsKind) -> bool {
-    let model = service.properties.get("model").map_or("", String::as_str);
+    let model = service.property("model").unwrap_or("");
 
     if model.starts_with("AudioAccessory") {
         return credentials == CredentialsKind::Transient;
@@ -169,9 +162,8 @@ pub fn is_remote_control_supported(service: &BaseService, credentials: Credentia
     }
 
     let major: u32 = service
-        .properties
-        .get("osvers")
-        .map_or("0", String::as_str)
+        .property("osvers")
+        .unwrap_or("0")
         .split('.')
         .next()
         .unwrap_or("0")

@@ -64,6 +64,20 @@ impl ServiceType {
         }
     }
 
+    /// The name pyatv spells this service type by, i.e. [`ServiceType::as_str`] without the
+    /// trailing dot of the root label.
+    ///
+    /// This is `mdns.Service.type` (`pyatv/core/mdns.py:39-46`) and therefore the key
+    /// `BaseScanner._properties` — and so [`pyatv_core::BaseConfig::properties`] — is keyed by
+    /// (`pyatv/core/scan.py:227-231`). Protocol modules look themselves up in that map with the
+    /// literals from their own `scan()`, e.g. `"_raop._tcp.local"`, so the two spellings have to
+    /// agree exactly.
+    #[must_use]
+    pub fn property_key(self) -> &'static str {
+        // `as_str` returns a `'static` literal, so the trimmed subslice is `'static` too.
+        self.as_str().trim_end_matches('.')
+    }
+
     /// The protocol this service type provides, if any.
     #[must_use]
     pub const fn protocol(self) -> Option<Protocol> {
