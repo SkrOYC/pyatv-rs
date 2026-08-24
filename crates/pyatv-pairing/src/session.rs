@@ -17,7 +17,7 @@
 //! ```
 
 use crate::{
-    Result,
+    Error, Result,
     chacha::{Chacha20Cipher, NonceLayout},
 };
 
@@ -91,10 +91,19 @@ impl HapSession {
     ///
     /// A trailing partial frame is retained for the next call, so this can be fed raw socket reads.
     ///
+    /// A length prefix larger than [`FRAME_LENGTH`] is rejected outright rather than buffered.
+    /// Nothing this codec produces can exceed it — [`HapSession::encrypt`] chunks at exactly that
+    /// size — so a bigger prefix is either a desynchronised stream or a peer trying to make the
+    /// controller hold up to 64 KiB per frame while it feeds one byte at a time. pyatv has no such
+    /// check (`pyatv/auth/hap_session.py:36-51` trusts the prefix), which is survivable there only
+    /// because the same desync would fail the tag a moment later — after the memory was already
+    /// committed.
+    ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Aead`] if a frame's tag does not verify. The session is not
-    /// recoverable after that: pyatv advances the inbound counter before decrypting
+    /// Returns [`crate::Error::MalformedResponse`] for an over-long length prefix, and
+    /// [`crate::Error::Aead`] if a frame's tag does not verify. The session is not recoverable
+    /// after either: pyatv advances the inbound counter before decrypting
     /// (`pyatv/support/chacha20.py:68-70`), so the stream is permanently out of step with the peer.
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         self.buffer.extend_from_slice(ciphertext);
@@ -106,8 +115,13 @@ impl HapSession {
             let Some(length) = rest.get(..LENGTH_PREFIX_LEN) else {
                 break;
             };
-            let block_length =
-                usize::from(u16::from_le_bytes([length[0], length[1]])) + AUTH_TAG_LENGTH;
+            let plaintext_length = usize::from(u16::from_le_bytes([length[0], length[1]]));
+            if plaintext_length > FRAME_LENGTH {
+                return Err(Error::MalformedResponse(format!(
+                    "frame claims {plaintext_length} plaintext bytes, over the {FRAME_LENGTH}-byte HAP cap"
+                )));
+            }
+            let block_length = plaintext_length + AUTH_TAG_LENGTH;
             let Some(block) = rest.get(LENGTH_PREFIX_LEN..LENGTH_PREFIX_LEN + block_length) else {
                 break;
             };
@@ -280,5 +294,30 @@ mod tests {
         framed[0] = 31;
 
         assert!(remote.decrypt(&framed).is_err());
+    }
+
+    /// A prefix over the frame cap is refused immediately, without buffering the bytes it promises.
+    /// `FRAME_LENGTH` itself must still be accepted — that is the largest frame the encoder emits.
+    #[test]
+    fn an_over_long_length_prefix_is_rejected_without_buffering() {
+        use crate::Error;
+
+        let mut session = HapSession::new(&OUT_KEY, &IN_KEY);
+        // 1025 bytes of plaintext claimed, one byte over the cap, with no payload behind it.
+        let prefix = u16::try_from(FRAME_LENGTH + 1).unwrap().to_le_bytes();
+
+        assert!(matches!(
+            session.decrypt(&prefix),
+            Err(Error::MalformedResponse(_))
+        ));
+
+        // A maximum-size frame is still ordinary traffic.
+        let (mut local, mut remote) = peer();
+        let framed = local.encrypt(&vec![0x5Au8; FRAME_LENGTH]).expect("encrypt");
+        assert_eq!(&framed[..2], &[0x00, 0x04]);
+        assert_eq!(
+            remote.decrypt(&framed).expect("decrypt").len(),
+            FRAME_LENGTH
+        );
     }
 }

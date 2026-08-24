@@ -85,6 +85,15 @@ pub trait PairingHandler: Send + Sync + std::fmt::Debug {
     /// Whether a successful exchange has produced credentials.
     fn has_paired(&self) -> bool;
 
+    /// The service being paired.
+    ///
+    /// Ports `PairingHandler.service` (`pyatv/interface.py:257-260`), which upstream's `atvremote`
+    /// reads straight after `finish()` to print the new credentials
+    /// (`pyatv/scripts/atvremote.py:238`). Returned by value rather than by reference because
+    /// [`PairingHandler::finish`] writes the credentials into it behind a lock, and a lock guard
+    /// cannot outlive the call.
+    fn service(&self) -> BaseService;
+
     /// Supply the PIN shown on the device.
     ///
     /// # Errors

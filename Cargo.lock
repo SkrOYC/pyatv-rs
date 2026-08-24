@@ -1041,8 +1041,8 @@ dependencies = [
  "srp",
  "subtle",
  "thiserror",
- "tracing",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

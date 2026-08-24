@@ -133,6 +133,164 @@ fn the_m1_proof_uses_the_unpadded_generator() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// SRP: the leading-zero public values
+// ---------------------------------------------------------------------------------------------
+
+/// The three exchanges in the main vector file all have a full-width `A` and `B` — the generator
+/// asserts it, because they were meant to be the representative case. That leaves the ~1-in-256
+/// case untested, and it is the one where `srptools`' minimal-length integer encoding stops
+/// agreeing with "hash the bytes you were given": pyatv parses `B` as an integer and hashes it in
+/// its shortest big-endian form, and puts the same shortest form of `A` on the wire.
+///
+/// `gen_hap_srp_kat.py --leading-zero` searches a deterministic seed sequence for a client `a` and
+/// a server `b` that produce short public values, then emits three exchanges — short `A`, short
+/// `B`, and both — through the same pyatv code path as the main vectors. This port has to
+/// reproduce pyatv's `A`, `M1`, `K` and `M2` for all three.
+#[test]
+fn leading_zero_public_values_reproduce_pyatvs_a_m1_and_m2() {
+    let kat = Kat::load_leading_zero();
+
+    for case in ["leading_zero_a", "leading_zero_b", "leading_zero_both"] {
+        let srp = format!("{case}/srp");
+        let expected_a = kat.bytes(&format!("{srp}/client_public_a"));
+        let expected_b = kat.bytes(&format!("{srp}/server_public_b"));
+
+        // The vector really exercises what it claims: a short value is 383 bytes, not 384.
+        assert_eq!(
+            expected_a.len(),
+            kat.length(&format!("{case}/client_public_a_len")),
+            "{case}: A"
+        );
+        assert_eq!(
+            expected_b.len(),
+            kat.length(&format!("{case}/server_public_b_len")),
+            "{case}: B"
+        );
+        assert_ne!(expected_a[0], 0, "{case}: pyatv never sends a padded A");
+        assert_ne!(expected_b[0], 0, "{case}: pyatv never sends a padded B");
+
+        let mut client = HapSrpClient::with_pin(
+            kat.text(&format!("{srp}/pin")),
+            kat.array(&format!("{srp}/client_ephemeral_secret")),
+        );
+
+        // `A` on the wire is the minimal form, so a 383-byte value stays 383 bytes.
+        assert_eq!(client.public_key(), expected_a, "{case}: A on the wire");
+
+        let proof = client
+            .process_challenge(&kat.bytes(&format!("{srp}/salt")), &expected_b)
+            .unwrap_or_else(|error| panic!("{case}: pyatv's B must be accepted: {error}"));
+
+        assert_eq!(
+            proof,
+            kat.bytes(&format!("{srp}/client_proof_m1")),
+            "{case}: M1"
+        );
+        assert_eq!(
+            client.session_key(),
+            Some(&kat.bytes(&format!("{srp}/session_key_k"))[..]),
+            "{case}: K"
+        );
+        client
+            .verify_device_proof(&kat.bytes(&format!("{srp}/server_proof_m2")))
+            .unwrap_or_else(|error| panic!("{case}: pyatv's M2 must verify: {error}"));
+    }
+}
+
+/// A device that zero-pads `B` out to the modulus width is describing the same integer, so it must
+/// produce the same `M1` — that is the whole point of normalising rather than hashing the slice.
+/// Conversely, *hashing* the padded form is what a naive port does, and this pins that it really
+/// would produce a different proof: without that assertion the test above could pass for a port
+/// that never normalises anything.
+#[test]
+fn padding_b_changes_nothing_but_hashing_the_padding_would() {
+    use sha2::Sha512;
+    use srp::{Group, groups::G3072, utils::compute_m1_rfc5054};
+
+    let kat = Kat::load_leading_zero();
+    let srp = "leading_zero_b/srp";
+
+    let minimal_b = kat.bytes(&format!("{srp}/server_public_b"));
+    let mut padded_b = vec![0u8];
+    padded_b.extend_from_slice(&minimal_b);
+    assert_eq!(padded_b.len(), 384);
+
+    let expected_m1 = kat.bytes(&format!("{srp}/client_proof_m1"));
+    let salt = kat.bytes(&format!("{srp}/salt"));
+    let seed: [u8; 32] = kat.array(&format!("{srp}/client_ephemeral_secret"));
+
+    let mut from_padded = HapSrpClient::with_pin(kat.text(&format!("{srp}/pin")), seed);
+    assert_eq!(
+        from_padded.process_challenge(&salt, &padded_b).unwrap(),
+        expected_m1,
+        "a zero-padded B is the same integer and must give pyatv's M1"
+    );
+
+    // The negative control: hashing the padded slice, as `srp`'s own API would if handed the wire
+    // bytes untouched, gives a proof no accessory would accept.
+    let naive = compute_m1_rfc5054::<Sha512>(
+        &G3072::generator(),
+        true,
+        PAIR_SETUP_USERNAME,
+        &salt,
+        &kat.bytes(&format!("{srp}/client_public_a")),
+        &padded_b,
+        &kat.bytes(&format!("{srp}/session_key_k")),
+    );
+    assert_ne!(
+        naive.as_slice(),
+        &expected_m1[..],
+        "the control is vacuous: padding B made no difference to the hash"
+    );
+}
+
+/// The same thing one level up: driven through the whole state machine from pyatv's own M2 and M4
+/// bytes, the short `A` has to go into the M3 `PublicKey` TLV unpadded. A port that widened `A` to
+/// the modulus would still compute a self-consistent `M1` and only fail against a real device.
+#[test]
+fn the_state_machine_puts_a_short_a_on_the_wire_unpadded() {
+    let kat = Kat::load_leading_zero();
+
+    for case in ["leading_zero_a", "leading_zero_both"] {
+        let srp = format!("{case}/srp");
+        let seed: [u8; 32] = kat.array(&format!("{srp}/client_ephemeral_secret"));
+
+        let (mut setup, _) = PairSetup::start_with(
+            PairSetupOptions {
+                pin: Some(kat.text(&format!("{srp}/pin")).parse().unwrap()),
+                ..PairSetupOptions::default()
+            },
+            seed,
+            b"leading-zero-client".to_vec(),
+        );
+
+        let m3 = Tlv8::decode(
+            &setup
+                .handle_m2(&kat.bytes(&format!("{srp}/m2_message")))
+                .unwrap_or_else(|error| panic!("{case}: {error}")),
+        )
+        .unwrap();
+
+        let public_key = field(&m3, TlvValue::PublicKey);
+        assert_eq!(public_key.len(), 383, "{case}: A stays minimal on the wire");
+        assert_eq!(
+            public_key,
+            kat.bytes(&format!("{srp}/client_public_a")),
+            "{case}: A"
+        );
+        assert_eq!(
+            field(&m3, TlvValue::Proof),
+            kat.bytes(&format!("{srp}/client_proof_m1")),
+            "{case}: M1"
+        );
+
+        setup
+            .handle_m4(&kat.bytes(&format!("{srp}/m4_message")))
+            .unwrap_or_else(|error| panic!("{case}: pyatv's M4 proof must verify: {error}"));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Pair-setup
 // ---------------------------------------------------------------------------------------------
 

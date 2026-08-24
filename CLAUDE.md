@@ -24,9 +24,11 @@ Before considering any change complete, the following must all pass (there is a 
 ```
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo nextest run          # or: cargo test --workspace
-cargo test --workspace --doc
+cargo nextest run --all-features          # or: cargo test --workspace --all-features
+cargo test --workspace --doc --all-features
 ```
+
+`--all-features` is not decoration: `pyatv-pairing`'s `test-server` feature gates its reference HAP accessory and with it every end-to-end and negative-path pairing test, so a run without the flag skips them silently.
 
 Warnings are errors. `missing_debug_implementations` and clippy `pedantic` are on at the workspace level (`[workspace.lints]`). Derive `Debug` on public types. Only add `#[allow(...)]` with a written justification comment. Git hooks (rustfmt + clippy) run on commit.
 

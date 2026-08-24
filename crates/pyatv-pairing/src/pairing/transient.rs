@@ -36,10 +36,22 @@ pub const TRANSIENT_PIN: u32 = 3939;
 ///
 /// Drive it in order: [`TransientPairSetup::start`], [`TransientPairSetup::handle_m2`],
 /// [`TransientPairSetup::handle_m4`], then [`TransientPairSetup::encryption_keys`].
-#[derive(Debug)]
 pub struct TransientPairSetup {
     srp: HapSrpClient,
     verified: bool,
+}
+
+// Hand-written rather than derived. `HapSrpClient` already redacts its own fields, so a derived
+// impl would be safe today; writing it out means a future field on this struct cannot leak by
+// default, and it keeps the whole `pairing` module's `Debug` policy in one style.
+impl std::fmt::Debug for TransientPairSetup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransientPairSetup")
+            .field("srp", &"<redacted>")
+            .field("verified", &self.verified)
+            .finish()
+    }
 }
 
 impl TransientPairSetup {
@@ -168,6 +180,27 @@ mod tests {
             setup.encryption_keys("Control-Salt", "out", "in"),
             Err(Error::OutOfOrder(_))
         ));
+    }
+
+    /// A `Debug` print must not expose the fixed PIN, the ephemeral exponent or the session key —
+    /// which for this flow *is* the transport-key IKM.
+    #[test]
+    fn debug_redacts_the_srp_state() {
+        let (mut setup, _) = TransientPairSetup::start_with([0x11; 32]);
+        setup
+            .handle_m2(
+                &Tlv8::new()
+                    .with_byte(TlvValue::SeqNo, State::M2 as u8)
+                    .with(TlvValue::Salt, vec![0u8; 16])
+                    .with(TlvValue::PublicKey, vec![1u8; 384])
+                    .encode(),
+            )
+            .expect("M2");
+
+        let rendered = format!("{setup:?}");
+        assert!(!rendered.contains(&hex::encode([0x11u8; 32])), "{rendered}");
+        assert!(!rendered.contains("3939"), "{rendered}");
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]

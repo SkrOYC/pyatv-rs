@@ -4,6 +4,8 @@
 //! `MrpPairSetupProcedure` (`pyatv/protocols/mrp/auth.py:26-82`); Companion and AirPlay drive the
 //! identical sequence with different framing.
 
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
 use crate::{
     Error, HapCredentials, Result,
     hkdf_derive::{expand, pairing as salts},
@@ -16,8 +18,27 @@ use crate::{
 
 use super::{decode_response, random_pairing_id, require_owned};
 
+/// Which message the machine is waiting for.
+///
+/// pyatv has no equivalent: `MrpPairSetupProcedure` infers its position from which coroutine the
+/// caller happens to await next (`pyatv/protocols/mrp/auth.py:26-82`), so replaying an M2 or an M4
+/// there quietly restarts or re-runs a step. Making the position explicit means a device (or a
+/// MITM) that re-sends a message gets [`Error::OutOfOrder`] instead of a second SRP exchange keyed
+/// on the same ephemeral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// M1 has been produced; the device must answer with M2.
+    AwaitingM2,
+    /// M3 has been produced; the device must answer with M4.
+    AwaitingM4,
+    /// M5 has been produced; the device must answer with M6.
+    AwaitingM6,
+    /// M6 has been accepted and credentials handed back.
+    Complete,
+}
+
 /// Everything a caller can vary about a pair-setup run.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct PairSetupOptions {
     /// The PIN shown on the device. May be supplied later with [`PairSetup::set_pin`], because the
     /// device only displays it in response to M1.
@@ -40,12 +61,56 @@ pub struct PairSetupOptions {
     pub additional_data: Vec<(u8, Vec<u8>)>,
 }
 
+// Hand-written so that logging a caller's options cannot print the PIN. Whether a name and extra
+// tags are present is useful in a log; their contents are the caller's business.
+impl std::fmt::Debug for PairSetupOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairSetupOptions")
+            .field(
+                "pin",
+                if self.pin.is_some() {
+                    &"<set>"
+                } else {
+                    &"None"
+                },
+            )
+            .field("name", &self.name.is_some())
+            .field(
+                "additional_tags",
+                &self
+                    .additional_data
+                    .iter()
+                    .map(|(tag, _)| *tag)
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
 /// The controller half of HAP pair-setup, as a sans-io state machine.
 ///
 /// Drive it in order: [`PairSetup::start`], [`PairSetup::handle_m2`], [`PairSetup::handle_m4`],
 /// [`PairSetup::handle_m6`]. Each `handle_*` takes the TLV8 body the device sent and returns the
-/// TLV8 body to send next, except the last, which returns the credentials to persist.
-#[derive(Debug)]
+/// TLV8 body to send next, except the last, which returns the credentials to persist. Taking a step
+/// out of that order — including replaying one the device already answered — is
+/// [`Error::OutOfOrder`], never a panic and never a silent restart.
+///
+/// ```
+/// use pyatv_pairing::{Error, PairSetup};
+///
+/// // M1 exists the moment the machine does; send it and wait for the device's M2.
+/// let (mut setup, m1) = PairSetup::start(None);
+/// assert!(!m1.is_empty());
+///
+/// // The device only shows its PIN in response to M1, so it is supplied afterwards.
+/// setup.set_pin(1111);
+///
+/// // From here it is strictly M2 -> M3, M4 -> M5, M6 -> credentials. Anything else is refused
+/// // before a byte of crypto runs.
+/// assert!(matches!(setup.handle_m4(&[]), Err(Error::OutOfOrder(_))));
+/// assert!(matches!(setup.handle_m6(&[]), Err(Error::OutOfOrder(_))));
+/// ```
 pub struct PairSetup {
     options: PairSetupOptions,
     /// The controller's long-term Ed25519 seed, which is *also* the SRP ephemeral secret `a`.
@@ -55,7 +120,44 @@ pub struct PairSetup {
     srp: Option<HapSrpClient>,
     /// `Pair-Setup-Encrypt` key, derived in M4 and reused to open M6.
     setup_encrypt_key: Option<[u8; 32]>,
+    phase: Phase,
 }
+
+// Hand-written: the derived `Debug` would print the controller's long-term Ed25519 seed — which is
+// also the SRP exponent `a` and ends up persisted as `ltsk` — and the `Pair-Setup-Encrypt` key that
+// opens M6. `options` is redacted wholesale because it carries the PIN.
+impl std::fmt::Debug for PairSetup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairSetup")
+            .field("phase", &self.phase)
+            .field("seed", &"<redacted>")
+            .field("setup_encrypt_key", &"<redacted>")
+            .field("pin", &"<redacted>")
+            .field("client_id", &hex::encode(&self.client_id))
+            .field("name", &self.options.name.is_some())
+            .field("additional_tags", &self.options.additional_data.len())
+            .finish_non_exhaustive()
+    }
+}
+
+// `Zeroize` is deliberately not implemented: a public `zeroize()` on a live state machine is a
+// footgun, since the caller could wipe the seed and keep driving the exchange. Only the drop
+// behaviour is exposed, through the `ZeroizeOnDrop` marker.
+impl Drop for PairSetup {
+    fn drop(&mut self) {
+        self.seed.zeroize();
+        if let Some(key) = self.setup_encrypt_key.as_mut() {
+            key.zeroize();
+        }
+        // `options.pin` is a `u32` on the stack; clear it rather than leave the PIN behind.
+        self.options.pin = None;
+        // `HapSrpClient` wipes its own PIN, exponent and session key when it drops.
+        self.srp = None;
+    }
+}
+
+impl ZeroizeOnDrop for PairSetup {}
 
 impl PairSetup {
     /// Begin pairing, returning the machine and the M1 TLV to send.
@@ -97,6 +199,7 @@ impl PairSetup {
             client_id,
             srp: None,
             setup_encrypt_key: None,
+            phase: Phase::AwaitingM2,
         };
 
         (setup, request)
@@ -117,10 +220,15 @@ impl PairSetup {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::MissingPin`] if no PIN has been supplied, [`Error::HapError`] if the device
-    /// refused, [`Error::UnexpectedState`] on a state mismatch, [`Error::MissingTlv`] if `Salt` or
-    /// `PublicKey` is absent, and [`Error::SrpPublicKey`] if `B mod N == 0`.
+    /// Returns [`Error::OutOfOrder`] if M2 has already been handled, [`Error::MissingPin`] if no
+    /// PIN has been supplied, [`Error::HapError`] if the device refused,
+    /// [`Error::UnexpectedState`] on a state mismatch, [`Error::MissingTlv`] if `Salt` or
+    /// `PublicKey` is absent, and [`Error::SrpPublicKey`] if `B` is out of range or `B mod N == 0`.
     pub fn handle_m2(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        if self.phase != Phase::AwaitingM2 {
+            return Err(Error::OutOfOrder("pair-setup M2 has already been handled"));
+        }
+
         let response = decode_response(payload, State::M2)?;
         let salt = require_owned(&response, TlvValue::Salt)?;
         let device_public_key = require_owned(&response, TlvValue::PublicKey)?;
@@ -137,6 +245,7 @@ impl PairSetup {
             .to_vec();
 
         self.srp = Some(srp);
+        self.phase = Phase::AwaitingM4;
         Ok(request)
     }
 
@@ -152,6 +261,16 @@ impl PairSetup {
     /// wrong, [`Error::ProofMismatch`] if the accessory's proof does not match, and
     /// [`Error::Aead`] if the outgoing payload cannot be sealed.
     pub fn handle_m4(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        match self.phase {
+            Phase::AwaitingM4 => {}
+            Phase::AwaitingM2 => {
+                return Err(Error::OutOfOrder("pair-setup M2 has not been handled"));
+            }
+            Phase::AwaitingM6 | Phase::Complete => {
+                return Err(Error::OutOfOrder("pair-setup M4 has already been handled"));
+            }
+        }
+
         let srp = self
             .srp
             .as_ref()
@@ -197,6 +316,7 @@ impl PairSetup {
 
         let encrypted = seal(&setup_encrypt_key, PAIR_SETUP_M5_NONCE, &inner.encode())?;
         self.setup_encrypt_key = Some(setup_encrypt_key);
+        self.phase = Phase::AwaitingM6;
 
         Ok(Tlv8::new()
             .with_byte(TlvValue::SeqNo, State::M5 as u8)
@@ -217,6 +337,14 @@ impl PairSetup {
     /// does not decrypt, [`Error::MissingTlv`] if the inner TLV is incomplete, and
     /// [`Error::SetupSignature`] if the accessory's signature does not verify.
     pub fn handle_m6(&mut self, payload: &[u8]) -> Result<HapCredentials> {
+        match self.phase {
+            Phase::AwaitingM6 => {}
+            Phase::AwaitingM2 | Phase::AwaitingM4 => {
+                return Err(Error::OutOfOrder("pair-setup M4 has not been handled"));
+            }
+            Phase::Complete => return Err(Error::OutOfOrder("pair-setup is already complete")),
+        }
+
         let setup_encrypt_key = self
             .setup_encrypt_key
             .ok_or(Error::OutOfOrder("pair-setup M4 has not been handled"))?;
@@ -248,6 +376,8 @@ impl PairSetup {
             return Err(Error::SetupSignature);
         }
 
+        self.phase = Phase::Complete;
+
         // Field order is (ltpk, ltsk, atv_id, client_id): the *accessory's* public key next to the
         // *controller's* private one (`pyatv/auth/hap_srp.py:231-233`).
         Ok(HapCredentials {
@@ -260,66 +390,4 @@ impl PairSetup {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{PairSetup, PairSetupOptions};
-    use crate::{
-        Error,
-        tlv8::{Method, State, Tlv8, TlvValue},
-    };
-
-    #[test]
-    fn m1_requests_pair_setup_in_state_one() {
-        let (_, request) = PairSetup::start(Some(1111));
-        let tlv = Tlv8::decode(&request).unwrap();
-
-        assert_eq!(
-            tlv.get(TlvValue::Method).map(|value| value[0]),
-            Some(Method::PairSetup as u8)
-        );
-        assert_eq!(
-            tlv.get(TlvValue::SeqNo).map(|value| value[0]),
-            Some(State::M1 as u8)
-        );
-    }
-
-    #[test]
-    fn m2_without_a_pin_is_refused_before_any_crypto_runs() {
-        let (mut setup, _) = PairSetup::start(None);
-        let m2 = Tlv8::new()
-            .with_byte(TlvValue::SeqNo, State::M2 as u8)
-            .with(TlvValue::Salt, vec![0u8; 16])
-            .with(TlvValue::PublicKey, vec![1u8; 384])
-            .encode();
-
-        assert!(matches!(setup.handle_m2(&m2), Err(Error::MissingPin)));
-    }
-
-    #[test]
-    fn steps_taken_out_of_order_are_refused() {
-        let (mut setup, _) = PairSetup::start_with(
-            PairSetupOptions {
-                pin: Some(1111),
-                ..PairSetupOptions::default()
-            },
-            [0x11; 32],
-            b"client".to_vec(),
-        );
-
-        assert!(matches!(setup.handle_m4(&[]), Err(Error::OutOfOrder(_))));
-        assert!(matches!(setup.handle_m6(&[]), Err(Error::OutOfOrder(_))));
-    }
-
-    #[test]
-    fn a_missing_salt_is_reported_as_a_missing_tlv() {
-        let (mut setup, _) = PairSetup::start(Some(1111));
-        let m2 = Tlv8::new()
-            .with_byte(TlvValue::SeqNo, State::M2 as u8)
-            .with(TlvValue::PublicKey, vec![1u8; 384])
-            .encode();
-
-        assert!(matches!(
-            setup.handle_m2(&m2),
-            Err(Error::MissingTlv(TlvValue::Salt))
-        ));
-    }
-}
+mod tests;

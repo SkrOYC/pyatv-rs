@@ -6,7 +6,12 @@ let
     set -euo pipefail
     cargo fmt --check
     cargo clippy --all-targets --all-features -- -D warnings
-    cargo nextest run
+    # `--all-features` is not optional. `pyatv-pairing`'s `test-server` feature gates its reference
+    # HAP accessory, and with it every end-to-end pair-setup/pair-verify test and every negative
+    # path (wrong PIN, corrupted signature, unknown pairing). Without the flag those simply do not
+    # compile into the run and the gate passes while the interesting half of the suite never
+    # executes.
+    cargo nextest run --all-features
   '';
 in
 {

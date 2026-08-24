@@ -42,9 +42,37 @@ Usage
     PYTHONPATH=/path/to/pyatv \
         /tmp/pyvenv/bin/python crates/pyatv-pairing/tests/kat/gen_hap_srp_kat.py \
         > crates/pyatv-pairing/tests/kat/hap_srp_kat.json
+    PYTHONPATH=/path/to/pyatv \
+        /tmp/pyvenv/bin/python crates/pyatv-pairing/tests/kat/gen_hap_srp_kat.py \
+        --leading-zero \
+        > crates/pyatv-pairing/tests/kat/hap_srp_kat_leading_zero.json
 
-The script is deterministic: re-running it must produce a byte-identical file.
+The script is deterministic: re-running it must produce byte-identical files.
 It writes JSON to stdout and progress/assertions to stderr.
+
+The leading-zero vectors
+------------------------
+
+``--leading-zero`` emits a second, independent document covering the ~1-in-256
+case that the main vectors deliberately exclude: an ``A`` or a ``B`` whose
+big-endian value has a leading zero byte.
+
+This matters because ``srptools`` parses both public values as *integers*
+(``srptools/common.py:126-131``) and re-serialises them through
+``int_to_bytes`` — the shortest big-endian encoding — everywhere it hashes them
+(``context.get_common_session_key_proof``, ``..._proof_hash``). pyatv likewise
+puts ``binascii.unhexlify(session.public)`` on the wire, i.e. a 383-byte ``A``
+when that is what the value is. A port that hashes the raw 384-byte wire slice,
+or that pads ``A`` out to the modulus width, therefore agrees with pyatv for 255
+exchanges out of 256 and silently produces a different ``M1`` for the 256th,
+which the accessory rejects as a wrong PIN.
+
+The seeds are not hand-picked: ``find_leading_zero_material`` walks a
+deterministic SHA-512-based sequence and takes the first index whose value has
+the property, so the search is reproducible and the emitted indices can be
+re-derived by anyone. Three exchanges are emitted — short ``A`` only, short
+``B`` only, and both at once — because the two encodings enter ``M1`` at
+different positions and a port can get one right while getting the other wrong.
 """
 
 from __future__ import annotations
@@ -156,11 +184,22 @@ class FixedUrandom:
 # --------------------------------------------------------------------------
 
 
-def srp_exchange(pin: int) -> Dict[str, Any]:
+def srp_exchange(
+    pin: int,
+    client_seed: bytes = CONTROLLER_SEED,
+    server_private: bytes = ACCESSORY_SRP_PRIVATE,
+    expected_a_len: int = 384,
+    expected_b_len: int = 384,
+) -> Dict[str, Any]:
     """Drive pyatv's client against a pinned `srptools` server session.
 
     Returns the vector plus the live `SRPAuthHandler`, so the caller can go on
     to `step3`/`step4` with the same session state.
+
+    `expected_a_len`/`expected_b_len` are assertions, not requests: they pin the
+    minimal-encoding width the caller believes it has arranged, so a vector can
+    never quietly stop exercising the case it was generated for. The defaults
+    are the full modulus width, i.e. the ordinary case.
     """
     salt_hex = hx(SRP_SALT)
 
@@ -175,23 +214,26 @@ def srp_exchange(pin: int) -> Dict[str, Any]:
     server_session = SRPServerSession(
         new_context(None),
         verifier_hex,
-        hx(ACCESSORY_SRP_PRIVATE),
+        hx(server_private),
     )
     server_public = binascii.unhexlify(server_session.public)
-    assert len(server_public) == 384, (
-        "the pinned `b` produced a `B` with a leading zero byte; every "
-        "implementation renders `B` minimally, but a short `B` makes this "
-        "vector unrepresentative -- pick a different `b`"
+    assert len(server_public) == expected_b_len, (
+        "`B` is %d bytes, wanted %d -- `srptools` renders it minimally, so its "
+        "width is a property of the pinned `b` and the caller has to say which "
+        "case this vector is for" % (len(server_public), expected_b_len)
     )
 
     # Controller: `SRPAuthHandler.step1`/`step2` verbatim.
     handler = SRPAuthHandler()
     handler.pairing_id = CLIENT_IDENTIFIER.encode()
-    with FixedUrandom(CONTROLLER_SEED, CONTROLLER_X25519_SECRET):
+    with FixedUrandom(client_seed, CONTROLLER_X25519_SECRET):
         auth_public, verify_public = handler.initialize()
     handler.step1(pin)
     client_public, client_proof = handler.step2(server_public, SRP_SALT)
-    assert len(client_public) == 384, "`A` has a leading zero byte; pick another `a`"
+    assert len(client_public) == expected_a_len, "`A` is %d bytes, wanted %d" % (
+        len(client_public),
+        expected_a_len,
+    )
 
     # Accessory checks the controller's M1 and answers with its own M2 proof.
     server_session.process(handler._session.public, salt_hex)
@@ -243,8 +285,8 @@ def srp_exchange(pin: int) -> Dict[str, Any]:
     vector = {
         "username": "Pair-Setup",
         "pin": str(pin),
-        "client_ephemeral_secret": hx(CONTROLLER_SEED),
-        "server_ephemeral_secret": hx(ACCESSORY_SRP_PRIVATE),
+        "client_ephemeral_secret": hx(client_seed),
+        "server_ephemeral_secret": hx(server_private),
         "salt": salt_hex,
         "verifier": verifier_hex,
         "server_public_b": hx(server_public),
@@ -529,9 +571,149 @@ def transport_keys(ikm: bytes) -> List[Dict[str, str]]:
 
 
 # --------------------------------------------------------------------------
+# Leading-zero `A`/`B` search
+# --------------------------------------------------------------------------
+
+# Width of the 3072-bit modulus, i.e. the length of a public value with no
+# leading zero byte.
+MODULUS_LEN = 384
+
+
+def derived_seed(label: bytes, index: int) -> bytes:
+    """A deterministic 32-byte seed, so a search result is reproducible.
+
+    SHA-512 rather than SHA-256 only because `hashlib` is already imported for
+    the SRP context; the first 32 bytes are taken, matching the width of every
+    other seed in this file.
+    """
+    return hashlib.sha512(label + index.to_bytes(4, "big")).digest()[:32]
+
+
+def find_leading_zero_material(pin: int) -> Dict[str, Any]:
+    """Search for a client `a` and a server `b` whose public values are short.
+
+    `A = g^a % N` and `B = (k*v + g^b) % N` are both effectively uniform over
+    `[0, N)`, and `N` begins `0xFF...`, so roughly one value in 256 has a
+    leading zero byte. Walking `derived_seed` and taking the first index that
+    hits is expected to need ~256 tries for each and costs one modexp per try.
+
+    `B` depends on the verifier, which depends on the PIN and the salt, so the
+    server search is done against the same `SRP_SALT`/`pin` the emitted vector
+    uses.
+    """
+    context = new_context(str(pin))
+    user_context = new_context(str(pin))
+    password_hash = user_context.get_common_password_hash(int(hx(SRP_SALT), 16))
+    verifier = user_context.get_common_password_verifier(password_hash)
+
+    def search(label: bytes, public_of, limit: int = 100000) -> Dict[str, Any]:
+        for index in range(limit):
+            seed = derived_seed(label, index)
+            public = public_of(int.from_bytes(seed, "big"))
+            if len(int_to_bytes(public)) < MODULUS_LEN:
+                return {"index": index, "seed": seed, "len": len(int_to_bytes(public))}
+        raise AssertionError("no leading-zero value for %r within %d" % (label, limit))
+
+    client = search(b"leading-zero-a", context.get_client_public)
+    server = search(
+        b"leading-zero-b",
+        lambda private: context.get_server_public(verifier, private),
+    )
+
+    log(
+        "  found `a` at index %d (A is %d bytes), `b` at index %d (B is %d bytes)"
+        % (client["index"], client["len"], server["index"], server["len"])
+    )
+    return {"client": client, "server": server}
+
+
+def leading_zero_document() -> Dict[str, Any]:
+    """Three exchanges: short `A`, short `B`, and both at once."""
+    log("searching for leading-zero `A` and `B` seeds (PIN %d)" % PIN_CODE)
+    material = find_leading_zero_material(PIN_CODE)
+    client_seed = material["client"]["seed"]
+    server_private = material["server"]["seed"]
+    short_a = material["client"]["len"]
+    short_b = material["server"]["len"]
+
+    log("leading-zero `A` only")
+    a_only = srp_exchange(
+        PIN_CODE,
+        client_seed=client_seed,
+        expected_a_len=short_a,
+        expected_b_len=MODULUS_LEN,
+    )
+    log("leading-zero `B` only")
+    b_only = srp_exchange(
+        PIN_CODE,
+        server_private=server_private,
+        expected_a_len=MODULUS_LEN,
+        expected_b_len=short_b,
+    )
+    log("leading-zero `A` and `B`")
+    both = srp_exchange(
+        PIN_CODE,
+        client_seed=client_seed,
+        server_private=server_private,
+        expected_a_len=short_a,
+        expected_b_len=short_b,
+    )
+
+    return {
+        "_comment": (
+            "Known-answer vectors for the ~1-in-256 case where an SRP public "
+            "value has a leading zero byte. srptools hashes A and B as "
+            "integers, i.e. in their shortest big-endian form, and pyatv puts "
+            "the same short form of A on the wire; a port that hashes the raw "
+            "384-byte slice agrees with pyatv everywhere except here. "
+            "Generated by tests/kat/gen_hap_srp_kat.py --leading-zero. Every "
+            "field is lowercase hex unless its name says otherwise. Do not "
+            "edit by hand: regenerate."
+        ),
+        "_source": {
+            "pyatv": "pyatv/auth/hap_srp.py",
+            "srptools": (
+                "srptools/utils.py:int_to_bytes, "
+                "srptools/context.py:get_common_session_key_proof"
+            ),
+            "srp_group": "RFC 5054 3072-bit MODP, generator 5, SHA-512",
+        },
+        "search": {
+            "client_seed_label": "leading-zero-a",
+            "client_seed_index": material["client"]["index"],
+            "server_private_label": "leading-zero-b",
+            "server_private_index": material["server"]["index"],
+            "seed_derivation": "sha512(label || u32be(index))[:32]",
+            "modulus_len": MODULUS_LEN,
+        },
+        "leading_zero_a": {
+            "client_public_a_len": short_a,
+            "server_public_b_len": MODULUS_LEN,
+            "srp": a_only["vector"],
+        },
+        "leading_zero_b": {
+            "client_public_a_len": MODULUS_LEN,
+            "server_public_b_len": short_b,
+            "srp": b_only["vector"],
+        },
+        "leading_zero_both": {
+            "client_public_a_len": short_a,
+            "server_public_b_len": short_b,
+            "srp": both["vector"],
+        },
+    }
+
+
+# --------------------------------------------------------------------------
 
 
 def main() -> None:
+    if "--leading-zero" in sys.argv[1:]:
+        json.dump(leading_zero_document(), sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        log("done")
+        return
+
     log("pair-setup SRP exchange (PIN %d)" % PIN_CODE)
     exchange = srp_exchange(PIN_CODE)
     setup = pair_setup_vector(exchange)

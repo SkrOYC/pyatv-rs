@@ -12,10 +12,26 @@
 //!   the fresh Ed25519 pair is immediately discarded in favour of the stored `ltsk`
 //!   (`hap_srp.py:84-124`). This port only generates what each flow actually needs.
 //!
-//! `zeroize` is available as a non-default feature on both dalek crates but is deliberately not
-//! enabled: `docs/research/crate-verification-2026-08-24.md` did not verify that feature's
-//! resolution against the rest of the pinned tree, and turning it on is a dependency change rather
-//! than a code change. Secrets in this crate live in plain `[u8; 32]`/`Vec<u8>` and are not wiped.
+//! ## Zeroization
+//!
+//! An earlier revision of this file claimed `zeroize` was "a non-default feature on both dalek
+//! crates", deliberately left off. **That was wrong on both counts and is corrected here.**
+//! `zeroize` is in the *default* feature set of `ed25519-dalek` 3.0.0 (`default = ["fast",
+//! "zeroize"]`) and of `x25519-dalek` 3.0.0 (`default = ["precomputed-tables", "zeroize"]`), so it
+//! has been on since the crate was first added, and `zeroize 1.9.0` was already in the resolved
+//! tree via `curve25519-dalek`. `SigningKey` and `EphemeralSecret` therefore already wipe
+//! themselves on drop.
+//!
+//! What was genuinely missing was the material this crate holds *outside* those types: the raw
+//! `[u8; 32]` seeds and the `Vec<u8>` session keys. `zeroize` is now a direct dependency at the
+//! same `1.9.0` the tree already resolved (`cargo tree -d` shows no second generation), and the
+//! types that own long-term or session secrets implement `ZeroizeOnDrop` by hand:
+//! [`crate::srp_hap::HapSrpClient`], [`crate::PairSetup`], [`crate::PairVerify`],
+//! [`crate::pairing::SessionKeys`] and [`crate::legacy_auth::LegacyPairVerify`].
+//!
+//! The helpers below are deliberately *not* zeroizing: [`random_seed`], [`ed25519_public_key`] and
+//! [`sign`] take or return plain arrays that the caller owns, and wiping a value on its way out of
+//! a function would be theatre. Zeroization belongs to whoever holds the secret for a while.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::SysRng;

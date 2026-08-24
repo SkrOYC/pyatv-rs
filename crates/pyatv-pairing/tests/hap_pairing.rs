@@ -60,7 +60,7 @@ mod against_reference_accessory {
         hkdf_derive::transport,
         pairing::PairSetupOptions,
         server::{CLIENT_IDENTIFIER, PIN_CODE, ReferenceAccessory},
-        srp_hap::ed25519_public_key,
+        srp_hap::{PAIR_SETUP_M5_NONCE, ed25519_public_key, open},
         tlv8::{ErrorCode, FLAG_TRANSIENT_PAIRING, Tlv8, TlvValue},
     };
 
@@ -294,31 +294,146 @@ mod against_reference_accessory {
         ));
     }
 
-    /// The optional `Name` TLV and `additional_data` ride inside the encrypted M5 payload;
-    /// Companion always sends a name, MRP never does, and nothing in pyatv ever sends extra tags.
-    #[test]
-    fn pair_setup_carries_an_optional_name_and_extra_tags() {
+    /// Drive pair-setup as far as M5 and hand back the accessory's view of it: the decrypted inner
+    /// TLV, plus the still-live machines so the caller can finish the exchange.
+    ///
+    /// The inner payload is the only place `Name` and `additional_data` are observable — they ride
+    /// inside the AEAD envelope — so asserting on them means actually opening it, which the
+    /// accessory can do because it derived the same `Pair-Setup-Encrypt` key.
+    fn m5_inner_tlv(options: PairSetupOptions) -> (ReferenceAccessory, PairSetup, Vec<u8>, Tlv8) {
         let mut accessory = ReferenceAccessory::new();
-        let (mut setup, m1) = PairSetup::start_with(
-            PairSetupOptions {
-                pin: Some(PIN_CODE),
-                name: Some(b"opack-encoded-name".to_vec()),
-                additional_data: vec![(0x1B, vec![0x01])],
-            },
-            [0x42; 32],
-            b"fixed-client-id".to_vec(),
-        );
+        let (mut setup, m1) =
+            PairSetup::start_with(options, [0x42; 32], b"fixed-client-id".to_vec());
 
         let m2 = accessory.handle_pair_setup(&m1).unwrap();
         let m3 = setup.handle_m2(&m2).unwrap();
         let m4 = accessory.handle_pair_setup(&m3).unwrap();
         let m5 = setup.handle_m4(&m4).unwrap();
-        let m6 = accessory.handle_pair_setup(&m5).unwrap();
-        let credentials = setup.handle_m6(&m6).unwrap();
 
+        let encrypted = Tlv8::decode(&m5)
+            .unwrap()
+            .get(TlvValue::EncryptedData)
+            .expect("M5 carries an EncryptedData entry")
+            .clone();
+        let plaintext = open(
+            &accessory.setup_encrypt_key().unwrap(),
+            PAIR_SETUP_M5_NONCE,
+            &encrypted,
+        )
+        .expect("the accessory's own key must open M5");
+
+        (accessory, setup, m5, Tlv8::decode(&plaintext).unwrap())
+    }
+
+    /// The optional `Name` TLV and `additional_data` ride inside the encrypted M5 payload;
+    /// Companion always sends a name, MRP never does, and nothing in pyatv ever sends extra tags.
+    ///
+    /// Wire order is load-bearing: pyatv builds the dict as `Identifier, PublicKey, Signature`,
+    /// then `Name` if present, then merges `additional_data` last (`hap_srp.py:183-198`), and
+    /// `write_tlv` walks an insertion-ordered dict. Some accessories parse positionally, so this
+    /// asserts the exact tag sequence rather than just membership.
+    #[test]
+    fn pair_setup_m5_carries_the_name_and_extra_tags_in_pyatvs_order() {
+        let (mut accessory, mut setup, m5_bytes, inner) = m5_inner_tlv(PairSetupOptions {
+            pin: Some(PIN_CODE),
+            name: Some(b"opack-encoded-name".to_vec()),
+            additional_data: vec![(0x1B, vec![0x01])],
+        });
+
+        assert_eq!(
+            inner.tags().collect::<Vec<_>>(),
+            vec![
+                TlvValue::Identifier as u8,
+                TlvValue::PublicKey as u8,
+                TlvValue::Signature as u8,
+                TlvValue::Name as u8,
+                0x1B,
+            ]
+        );
+        assert_eq!(
+            inner.get(TlvValue::Identifier).unwrap()[..],
+            b"fixed-client-id"[..]
+        );
+        assert_eq!(
+            inner.get(TlvValue::PublicKey).unwrap()[..],
+            ed25519_public_key(&[0x42; 32])[..]
+        );
+        assert_eq!(inner.get(TlvValue::Signature).unwrap().len(), 64);
+        assert_eq!(
+            inner.get(TlvValue::Name).unwrap()[..],
+            b"opack-encoded-name"[..]
+        );
+        assert_eq!(inner.get_raw(0x1B).unwrap()[..], [0x01][..]);
+
+        // The accessory accepts all of it: the extra tags are ignored, and the signature it checks
+        // is over the same identity the `Identifier` entry names.
+        let m6 = accessory.handle_pair_setup(&m5_bytes).unwrap();
+        let credentials = setup.handle_m6(&m6).unwrap();
         assert_eq!(credentials.client_id, b"fixed-client-id");
         assert_eq!(credentials.ltsk, vec![0x42; 32]);
         assert_eq!(setup.client_id(), b"fixed-client-id");
+        assert_eq!(accessory.pairings().len(), 1);
+    }
+
+    /// MRP sends no `Name`, so the inner TLV must be exactly the three mandatory entries.
+    #[test]
+    fn pair_setup_m5_omits_the_name_when_none_is_given() {
+        let (_, _, _, inner) = m5_inner_tlv(PairSetupOptions {
+            pin: Some(PIN_CODE),
+            ..PairSetupOptions::default()
+        });
+
+        assert_eq!(
+            inner.tags().collect::<Vec<_>>(),
+            vec![
+                TlvValue::Identifier as u8,
+                TlvValue::PublicKey as u8,
+                TlvValue::Signature as u8,
+            ]
+        );
+    }
+
+    /// `additional_data` is merged with `dict.update` **after** the mandatory entries
+    /// (`hap_srp.py:197-198`), so a caller that reuses one of their tags overwrites it — and Python
+    /// `dict[key] = value` leaves the key where it already was rather than moving it to the end.
+    /// No pyatv call site does this, but the parameter exists and the semantic is not obvious, so
+    /// it is pinned here.
+    ///
+    /// The consequence is also pinned: overwriting `Identifier` desynchronises it from the
+    /// signature, which is computed over the real `client_id`, and the accessory rejects M5. That
+    /// is the correct outcome — this port's reference accessory verifies that signature where
+    /// pyatv's does not.
+    #[test]
+    fn additional_data_overwrites_a_mandatory_tag_in_place() {
+        let (mut accessory, mut setup, m5, inner) = m5_inner_tlv(PairSetupOptions {
+            pin: Some(PIN_CODE),
+            name: None,
+            additional_data: vec![(TlvValue::Identifier as u8, b"overwritten".to_vec())],
+        });
+
+        // Replaced in place: still first, and there is no second `Identifier` entry.
+        assert_eq!(
+            inner.tags().collect::<Vec<_>>(),
+            vec![
+                TlvValue::Identifier as u8,
+                TlvValue::PublicKey as u8,
+                TlvValue::Signature as u8,
+            ]
+        );
+        assert_eq!(
+            inner.get(TlvValue::Identifier).unwrap()[..],
+            b"overwritten"[..]
+        );
+
+        // The signature still covers `fixed-client-id`, so the accessory refuses the pairing.
+        let m6 = accessory.handle_pair_setup(&m5).unwrap();
+        assert!(matches!(
+            setup.handle_m6(&m6),
+            Err(Error::HapError {
+                code: ErrorCode::Authentication
+            })
+        ));
+        assert!(accessory.pairings().is_empty());
     }
 
     /// Pairing twice from the same controller identity must produce the same credentials, which is

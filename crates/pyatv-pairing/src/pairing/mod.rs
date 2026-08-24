@@ -57,26 +57,40 @@ use crate::{
 
 /// Decode a device response, rejecting error codes and unexpected states.
 ///
-/// pyatv's `_get_pairing_data` (`pyatv/protocols/mrp/auth.py:19-23`) raises on an `Error` TLV and
-/// ignores everything else, including `SeqNo`. The error check is ported as-is — it must run before
-/// the state check, because an accessory that rejects a PIN answers M3 with `{SeqNo: 4, Error: 2}`
-/// and the informative failure is the error code, not the state.
+/// pyatv's `_get_pairing_data` (`pyatv/protocols/mrp/auth.py:19-23`) raises on the **presence** of
+/// an `Error` TLV — `if TlvValue.Error in tlv` — without reading its value at all, and ignores
+/// everything else including `SeqNo`. The presence rule is ported as-is, which is why a
+/// zero-length `Error` entry is a failure here rather than being silently skipped: a device that
+/// says "error" and gives no code has still said error, and continuing would run the rest of the
+/// handshake against a peer that has already given up. An empty value maps to
+/// [`Error::UnknownHapError`] with code `0`, which is not a code any accessory assigns.
+///
+/// The error check must run before the state check, because an accessory that rejects a PIN
+/// answers M3 with `{SeqNo: 4, Error: 2}` and the informative failure is the error code, not the
+/// state.
+///
+/// `SeqNo` is additionally required to be exactly one byte. pyatv never inspects it at all, and its
+/// `read_tlv` would happily hand back a multi-byte run left by TLV8's same-tag concatenation; a
+/// state that needs two bytes is a malformed message, not a state this port has not heard of.
 fn decode_response(payload: &[u8], expected: State) -> Result<Tlv8> {
     let tlv = Tlv8::decode(payload)?;
 
-    if let Some(code) = tlv.get(TlvValue::Error).and_then(|value| value.first()) {
+    if let Some(value) = tlv.get(TlvValue::Error) {
+        let code = value.first().copied().unwrap_or(0);
         return Err(
-            ErrorCode::from_code(*code).map_or(Error::UnknownHapError(*code), |code| {
+            ErrorCode::from_code(code).map_or(Error::UnknownHapError(code), |code| {
                 Error::HapError { code }
             }),
         );
     }
 
-    let actual = tlv
-        .get(TlvValue::SeqNo)
-        .and_then(|value| value.first())
-        .copied()
-        .ok_or(Error::MissingTlv(TlvValue::SeqNo))?;
+    let seq_no = tlv.require(TlvValue::SeqNo)?;
+    let [actual] = seq_no[..] else {
+        return Err(Error::MalformedResponse(format!(
+            "SeqNo is {} bytes, expected exactly 1",
+            seq_no.len()
+        )));
+    };
 
     if actual == expected as u8 {
         Ok(tlv)
@@ -169,6 +183,49 @@ mod tests {
         assert!(matches!(
             decode_response(&payload, State::M4),
             Err(Error::UnknownHapError(0x42))
+        ));
+    }
+
+    /// pyatv raises on the *presence* of an `Error` entry, never on its value
+    /// (`pyatv/protocols/mrp/auth.py:19-23`). A zero-length one therefore has to fail too, rather
+    /// than falling through to the state check as if the device had said nothing.
+    #[test]
+    fn an_empty_error_tlv_still_fails() {
+        let payload = Tlv8::new()
+            .with_byte(TlvValue::SeqNo, 4)
+            .with(TlvValue::Error, bytes::Bytes::new())
+            .encode();
+
+        assert!(matches!(
+            decode_response(&payload, State::M4),
+            Err(Error::UnknownHapError(0x00))
+        ));
+    }
+
+    /// A `SeqNo` that is not exactly one byte is a malformed message. TLV8 concatenates same-tag
+    /// runs, so an accessory (or a MITM) can produce one trivially, and taking only the first byte
+    /// would let it pick a state while smuggling data past the check.
+    #[test]
+    fn a_multi_byte_seq_no_is_rejected() {
+        let payload = Tlv8::new()
+            .with(TlvValue::SeqNo, bytes::Bytes::from_static(&[2, 0]))
+            .encode();
+
+        assert!(matches!(
+            decode_response(&payload, State::M2),
+            Err(Error::MalformedResponse(_))
+        ));
+    }
+
+    #[test]
+    fn an_empty_seq_no_is_rejected() {
+        let payload = Tlv8::new()
+            .with(TlvValue::SeqNo, bytes::Bytes::new())
+            .encode();
+
+        assert!(matches!(
+            decode_response(&payload, State::M2),
+            Err(Error::MalformedResponse(_))
         ));
     }
 

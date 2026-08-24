@@ -7,13 +7,26 @@ use srp::{
     utils::{compute_m1_rfc5054, compute_m2},
 };
 use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::{Error, Result};
+use crate::{Error, Result, srp_encoding::minimal_be};
 
 /// The literal SRP username the HAP profile uses. Not a per-device identity.
 ///
 /// `pyatv/auth/hap_srp.py:140` passes this as `SRPContext`'s username for every pairing.
 pub const PAIR_SETUP_USERNAME: &[u8] = b"Pair-Setup";
+
+/// Byte width of the HAP profile's modulus `N` — the 3072-bit RFC 5054 group, so 384 bytes.
+///
+/// Any SRP public value wider than this is out of range by definition, and forwarding one into
+/// `srp` is not merely wrong but fatal: `Client::process_reply` calls `BoxedUint::resize` (through
+/// `validate_b_pub` and `utils::monty_form`) to bring the value down to `N`'s precision, and
+/// `crypto_bigint`'s `Resize` **panics** rather than erroring when the value does not fit;
+/// `utils::compute_u_padded` would underflow `n.len() - b_pub.len()` first in a release build.
+/// TLV8 fragments values across same-tag entries with no length ceiling
+/// ([`crate::tlv8`]), so a hostile or broken accessory can produce a 385-byte `PublicKey` with no
+/// effort at all. Both directions therefore range-check before any bignum touches the value.
+pub const MODULUS_LEN: usize = 384;
 
 /// 3072-bit group, SHA-512, username folded into `x` — matching `srptools`' defaults.
 type HapClient = Client<G3072, Sha512>;
@@ -26,7 +39,6 @@ type HapClient = Client<G3072, Sha512>;
 /// attempts.
 ///
 /// pyatv's equivalent is `SRPAuthHandler.step1`/`step2` (`pyatv/auth/hap_srp.py:138-163`).
-#[derive(Debug)]
 pub struct HapSrpClient {
     /// The PIN shown on the device, stringified as pyatv does.
     pin: String,
@@ -38,7 +50,35 @@ pub struct HapSrpClient {
     exchange: Option<Exchange>,
 }
 
-#[derive(Debug)]
+// Hand-written: the derived `Debug` would print the PIN, the ephemeral exponent `a` and — through
+// `Exchange` — the SRP session key `K`, which is the IKM for every transport key in the session.
+// Only `A` is public, and even that is abbreviated because it is 384 bytes of noise in a log line.
+impl std::fmt::Debug for HapSrpClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HapSrpClient")
+            .field("pin", &"<redacted>")
+            .field("ephemeral_secret", &"<redacted>")
+            .field("public_key_len", &self.public_key.len())
+            .field("challenge_processed", &self.exchange.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+// `Zeroize` itself is deliberately not implemented for the state machines: a public `zeroize()`
+// would let a caller wipe a live exchange and then keep driving it. Only the drop is exposed, as
+// the `ZeroizeOnDrop` marker.
+impl Drop for HapSrpClient {
+    fn drop(&mut self) {
+        self.pin.zeroize();
+        self.ephemeral_secret.zeroize();
+        // `exchange` wipes itself; dropping it here is only for symmetry with the fields above.
+        self.exchange = None;
+    }
+}
+
+impl ZeroizeOnDrop for HapSrpClient {}
+
 struct Exchange {
     /// SRP session key `K = SHA512(S)`.
     session_key: Vec<u8>,
@@ -47,6 +87,36 @@ struct Exchange {
     /// The accessory proof `M2 = H(A | M1 | K)` we expect back in M4.
     expected_device_proof: Vec<u8>,
 }
+
+// Hand-written for the same reason as [`HapSrpClient`]'s: `session_key` is `K`. The two proofs are
+// public values but are redacted together for uniformity — a proof leaked before it is sent is a
+// PIN-guessing oracle for whoever reads the log.
+impl std::fmt::Debug for Exchange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Exchange")
+            .field("session_key", &"<redacted>")
+            .field("client_proof", &"<redacted>")
+            .field("expected_device_proof", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Zeroize for Exchange {
+    fn zeroize(&mut self) {
+        self.session_key.zeroize();
+        self.client_proof.zeroize();
+        self.expected_device_proof.zeroize();
+    }
+}
+
+impl Drop for Exchange {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Exchange {}
 
 impl HapSrpClient {
     /// Start an exchange for a numeric `pin` with a given ephemeral secret.
@@ -66,10 +136,16 @@ impl HapSrpClient {
     /// Start an exchange for a PIN that is already in its exact on-the-wire string form.
     #[must_use]
     pub fn with_pin(pin: &str, ephemeral_secret: [u8; 32]) -> Self {
+        // `compute_public_ephemeral` already trims leading zero bytes, but `A` goes on the wire and
+        // into `M1`/`M2` so the minimal form is a wire-format requirement, not an implementation
+        // detail of that crate — route it through the shared helper and let the tests pin it.
+        let public_key =
+            minimal_be(&HapClient::new().compute_public_ephemeral(&ephemeral_secret)).to_vec();
+
         Self {
             pin: pin.to_owned(),
             ephemeral_secret,
-            public_key: HapClient::new().compute_public_ephemeral(&ephemeral_secret),
+            public_key,
             exchange: None,
         }
     }
@@ -85,13 +161,24 @@ impl HapSrpClient {
 
     /// Consume the accessory's M2 (`salt` and `B`) and produce the client proof `M1` for M3.
     ///
+    /// `B` is normalised to `srptools`' minimal big-endian form before anything else touches it,
+    /// because that is the encoding pyatv hashes into `M1` — see [`crate::srp_encoding`]. Values
+    /// wider than [`MODULUS_LEN`] are rejected outright rather than handed to `srp`, which would
+    /// panic on them.
+    ///
     /// The proof is computed with an **unpadded** `H(g)`; see the module documentation for why the
     /// crate's own `process_reply` proof cannot be used.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::SrpPublicKey`] if `B mod N == 0`, the safeguard RFC 5054 requires.
+    /// Returns [`Error::SrpPublicKey`] if `B` is wider than the modulus or if `B mod N == 0`, the
+    /// safeguard RFC 5054 requires.
     pub fn process_challenge(&mut self, salt: &[u8], device_public_key: &[u8]) -> Result<Vec<u8>> {
+        let device_public_key = minimal_be(device_public_key);
+        if device_public_key.len() > MODULUS_LEN {
+            return Err(Error::SrpPublicKey { peer: "accessory" });
+        }
+
         let client = HapClient::new();
         let verifier = client
             .process_reply(
@@ -175,7 +262,7 @@ mod tests {
     use sha2::{Digest, Sha512};
     use srp::{Group, groups::G3072, utils::compute_hash_n_xor_hash_g};
 
-    use super::{HapClient, HapSrpClient, PAIR_SETUP_USERNAME};
+    use super::{HapClient, HapSrpClient, MODULUS_LEN, PAIR_SETUP_USERNAME};
 
     /// `srptools` renders `H(N) XOR H(g)` and `H(I)` through an integer, so a leading zero byte in
     /// either would make its hashed input shorter than RustCrypto's fixed-width one. Both constants
@@ -191,6 +278,18 @@ mod tests {
         assert_eq!(hex::encode(&username_hash[..1]), "cd");
     }
 
+    /// [`MODULUS_LEN`] has to be the real width of `N`, not a guess; read it back off the group.
+    #[test]
+    fn the_modulus_length_matches_the_group() {
+        use srp::bigint::modular::ConstMontyParams;
+
+        assert_eq!(
+            G3072::PARAMS.modulus().to_be_bytes().len(),
+            MODULUS_LEN,
+            "the 3072-bit group is 384 bytes wide"
+        );
+    }
+
     #[test]
     fn a_is_deterministic_in_the_ephemeral_secret() {
         let first = HapSrpClient::new(1111, [0x11; 32]);
@@ -200,6 +299,9 @@ mod tests {
         assert_eq!(first.public_key(), second.public_key());
         assert_ne!(first.public_key(), other.public_key());
         assert!(!first.public_key().is_empty());
+        // Minimal encoding: `A` is at most the modulus width and never carries a leading zero.
+        assert!(first.public_key().len() <= MODULUS_LEN);
+        assert_ne!(first.public_key()[0], 0);
     }
 
     #[test]
@@ -218,7 +320,7 @@ mod tests {
         let salt = [0x5A; 16];
         let mut client = HapSrpClient::new(1111, [0x11; 32]);
         // Any `B` with `B mod N != 0` will do; `N` starts `ff…`, so this is in range.
-        let device_public_key = vec![0x33u8; 384];
+        let device_public_key = vec![0x33u8; MODULUS_LEN];
 
         let proof = client.process_challenge(&salt, &device_public_key).unwrap();
         let padded = HapClient::new()
@@ -237,10 +339,74 @@ mod tests {
         assert_eq!(client.session_key().map(<[u8]>::len), Some(64));
     }
 
+    /// A `B` with a leading zero byte must hash as its minimal form, i.e. identically to the same
+    /// value sent without the padding. `srptools` parses `B` as an integer and re-serialises it
+    /// minimally, so the two encodings are the same number and must produce the same `M1`.
+    #[test]
+    fn a_leading_zero_in_b_does_not_change_the_proof() {
+        let salt = [0x5A; 16];
+        let mut padded_b = vec![0x00u8; 1];
+        padded_b.extend(std::iter::repeat_n(0x33u8, MODULUS_LEN - 1));
+        let trimmed_b = &padded_b[1..];
+
+        let mut from_padded = HapSrpClient::new(1111, [0x11; 32]);
+        let mut from_trimmed = HapSrpClient::new(1111, [0x11; 32]);
+
+        assert_eq!(
+            from_padded.process_challenge(&salt, &padded_b).unwrap(),
+            from_trimmed.process_challenge(&salt, trimmed_b).unwrap()
+        );
+        assert_eq!(from_padded.session_key(), from_trimmed.session_key());
+    }
+
     #[test]
     fn a_zero_device_public_key_is_rejected() {
         let mut client = HapSrpClient::new(1111, [0x11; 32]);
-        assert!(client.process_challenge(&[0u8; 16], &[0u8; 384]).is_err());
+        assert!(
+            client
+                .process_challenge(&[0u8; 16], &[0u8; MODULUS_LEN])
+                .is_err()
+        );
+    }
+
+    /// A `B` wider than `N` must be refused, not forwarded: `srp` panics on it. The boundary is
+    /// exercised from both sides so a future off-by-one shows up as a test failure rather than as
+    /// an abort in the field.
+    #[test]
+    fn an_oversized_device_public_key_is_rejected_rather_than_panicking() {
+        use crate::Error;
+
+        for length in [MODULUS_LEN - 1, MODULUS_LEN] {
+            let mut client = HapSrpClient::new(1111, [0x11; 32]);
+            assert!(
+                client
+                    .process_challenge(&[0u8; 16], &vec![0x33u8; length])
+                    .is_ok(),
+                "{length} bytes is in range and must be accepted"
+            );
+        }
+
+        for length in [MODULUS_LEN + 1, 512] {
+            let mut client = HapSrpClient::new(1111, [0x11; 32]);
+            assert!(
+                matches!(
+                    client.process_challenge(&[0u8; 16], &vec![0x33u8; length]),
+                    Err(Error::SrpPublicKey { peer: "accessory" })
+                ),
+                "{length} bytes is out of range and must be refused"
+            );
+        }
+    }
+
+    /// Leading zeros do not count towards the width: a 385-byte `B` whose first byte is zero is a
+    /// perfectly ordinary 384-byte value and must be accepted, normalised.
+    #[test]
+    fn an_oversized_but_leading_zero_padded_key_is_accepted() {
+        let mut padded = vec![0x00u8];
+        padded.extend(std::iter::repeat_n(0x33u8, MODULUS_LEN));
+
+        let mut client = HapSrpClient::new(1111, [0x11; 32]);
+        assert!(client.process_challenge(&[0u8; 16], &padded).is_ok());
     }
 
     #[test]
@@ -248,5 +414,27 @@ mod tests {
         let client = HapSrpClient::new(1111, [0x11; 32]);
         assert!(client.session_key().is_none());
         assert!(client.verify_device_proof(&[0u8; 64]).is_err());
+    }
+
+    /// A `Debug` print must not expose the PIN, the ephemeral exponent or the session key.
+    #[test]
+    fn debug_redacts_every_secret() {
+        let mut client = HapSrpClient::new(1234, [0x11; 32]);
+        client
+            .process_challenge(&[0x5A; 16], &vec![0x33u8; MODULUS_LEN])
+            .unwrap();
+
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("1234"), "the PIN leaked: {rendered}");
+        assert!(!rendered.contains(&hex::encode([0x11u8; 32])));
+        assert!(!rendered.contains(&hex::encode(client.session_key().unwrap())));
+        assert!(!rendered.contains(&hex::encode(client.client_proof().unwrap())));
+        assert!(rendered.contains("<redacted>"));
+
+        // The inner state has its own `Debug`; check it directly too, since it is what a future
+        // `#[derive(Debug)]` on the outer type would print.
+        let inner = format!("{:?}", client.exchange.as_ref().unwrap());
+        assert!(!inner.contains(&hex::encode(client.session_key().unwrap())));
+        assert!(inner.contains("<redacted>"));
     }
 }

@@ -167,6 +167,31 @@ impl ReferenceAccessory {
         ed25519_public_key(&self.seed)
     }
 
+    /// The `Pair-Setup-Encrypt` key for the exchange in progress.
+    ///
+    /// Exposed so a test can open the controller's M5 and assert on the plaintext TLV — the field
+    /// order and the `Name`/`additional_data` merge semantics are wire-visible behaviour that is
+    /// otherwise only observable as "the accessory accepted it". This is the accessory's own key
+    /// material and would never be published by a real device; the whole [`crate::server`] module
+    /// is behind the test-only `test-server` feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfOrder`] if pair-setup M3 has not been accepted yet.
+    pub fn setup_encrypt_key(&self) -> Result<[u8; 32]> {
+        let session_key = self
+            .setup
+            .as_ref()
+            .and_then(|session| session.session_key.as_deref())
+            .ok_or(Error::OutOfOrder("pair-setup M3 has not been accepted"))?;
+
+        expand(
+            crate::hkdf_derive::pairing::SETUP_ENCRYPT_SALT,
+            crate::hkdf_derive::pairing::SETUP_ENCRYPT_INFO,
+            session_key,
+        )
+    }
+
     /// Derive one channel's transport keys from the last completed exchange.
     ///
     /// The role swap is the caller's problem, exactly as it is in pyatv: pass the info strings in

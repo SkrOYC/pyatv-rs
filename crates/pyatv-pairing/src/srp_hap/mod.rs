@@ -29,6 +29,16 @@
 //! `cd …`. Neither has a leading zero, so the two encodings agree; [`HapSrpClient`]'s tests pin those
 //! first bytes so a future group or hash change cannot silently break the equivalence.
 //!
+//! ### The place minimal-length encoding *does* diverge: `A` and `B`
+//!
+//! `A` and `B` are not constants, and roughly one value in 256 has a leading zero byte. `srptools`
+//! hashes both as integers, i.e. minimally, while `srp` hashes exactly the slice it is handed —
+//! which for `B` is the raw wire payload. [`HapSrpClient`] therefore normalises both through
+//! [`crate::srp_encoding::minimal_be`] before hashing, and puts the minimal `A` on the wire, which
+//! is what pyatv transmits (`binascii.unhexlify(session.public)`, `hap_srp.py:159`).
+//! `tests/kat/hap_srp_kat_leading_zero.json` carries a pair of exchanges generated against pyatv
+//! that were searched for exactly this case, so the rule is pinned rather than reasoned about.
+//!
 //! Relying on a `#[doc(hidden)]` module is a real risk, and `srp` 0.7 is still a release candidate.
 //! The hermetic round trips in `tests/hap_pairing.rs` are what actually guard this.
 
@@ -36,7 +46,7 @@ mod client;
 mod handshake;
 mod keys;
 
-pub use client::{HapSrpClient, PAIR_SETUP_USERNAME};
+pub use client::{HapSrpClient, MODULUS_LEN, PAIR_SETUP_USERNAME};
 pub use handshake::{
     PAIR_SETUP_M5_NONCE, PAIR_SETUP_M6_NONCE, PAIR_VERIFY_M2_NONCE, PAIR_VERIFY_M3_NONCE,
     handshake_nonce, open, seal,

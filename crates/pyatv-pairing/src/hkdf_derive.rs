@@ -18,15 +18,20 @@ pub const KEY_LEN: usize = 32;
 ///
 /// # Errors
 ///
-/// Returns [`Error::KeyLength`] only if the HKDF expansion is asked for an impossible output
-/// length, which cannot happen for the fixed [`KEY_LEN`] used here.
+/// [`Hkdf::expand`] fails only when the requested output exceeds `255 * HashLen` — 16 320 bytes for
+/// SHA-512 — which [`KEY_LEN`] cannot. The branch is unreachable and is reported as
+/// [`Error::MalformedResponse`] rather than [`Error::KeyLength`]: the earlier `KeyLength { expected:
+/// 32, actual: 0 }` described the *input* as being zero bytes long, which is both untrue (the IKM
+/// is whatever the caller passed) and actively misleading during debugging, since an empty IKM is
+/// perfectly legal for HKDF and never produces this error.
 pub fn expand(salt: &str, info: &str, ikm: &[u8]) -> Result<[u8; KEY_LEN]> {
     let mut output = [0u8; KEY_LEN];
     Hkdf::<Sha512>::new(Some(salt.as_bytes()), ikm)
         .expand(info.as_bytes(), &mut output)
-        .map_err(|_| Error::KeyLength {
-            expected: KEY_LEN,
-            actual: 0,
+        .map_err(|_| {
+            Error::MalformedResponse(format!(
+                "HKDF-SHA512 refused a {KEY_LEN}-byte expansion for info {info:?}"
+            ))
         })?;
     Ok(output)
 }

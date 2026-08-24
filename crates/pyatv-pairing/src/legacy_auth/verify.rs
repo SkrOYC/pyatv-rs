@@ -23,6 +23,7 @@
 //! after verification.
 
 use ed25519_dalek::{Signer, SigningKey};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{
     VERIFY_AES_IV_LABEL, VERIFY_AES_KEY_LABEL, VERIFY_M1_PREFIX, VERIFY_M3_PREFIX,
@@ -34,13 +35,36 @@ use crate::{Error, HapCredentials, Result};
 const PUBLIC_KEY_LEN: usize = 32;
 
 /// Drives the legacy AirPlay pair-verify exchange, bytes in and bytes out.
-#[derive(Debug)]
 pub struct LegacyPairVerify {
     signing_key: SigningKey,
     /// The X25519 secret, which is the same seed the Ed25519 key uses.
     verify_secret: [u8; PUBLIC_KEY_LEN],
     verify_public: [u8; PUBLIC_KEY_LEN],
 }
+
+// Hand-written: `SigningKey`'s own `Debug` prints only its public half, but `verify_secret` is the
+// raw credential seed — the whole legacy identity — and the derived impl would print all 32 bytes.
+// `SigningKey` and `verify_secret` are the same bytes here (see the module docs), so both go.
+impl std::fmt::Debug for LegacyPairVerify {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LegacyPairVerify")
+            .field("signing_key", &"<redacted>")
+            .field("verify_secret", &"<redacted>")
+            .field("verify_public", &hex::encode(self.verify_public))
+            .finish()
+    }
+}
+
+impl Drop for LegacyPairVerify {
+    fn drop(&mut self) {
+        // `SigningKey` wipes itself — `ed25519-dalek` 3.0's default features include `zeroize` —
+        // but `verify_secret` is a bare copy of the same seed and has to be wiped by hand.
+        self.verify_secret.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for LegacyPairVerify {}
 
 impl LegacyPairVerify {
     /// Start a pair-verify against stored legacy credentials.
@@ -105,7 +129,16 @@ impl LegacyPairVerify {
         signed.extend_from_slice(&device_public);
         let signature = self.signing_key.sign(&signed).to_bytes();
 
-        let encrypted = ctr_encrypt_at_offset(&key, &iv, opaque.len() as u64, signature.as_slice());
+        // `usize` is at most 64 bits on every target this crate builds for, so the conversion never
+        // fails; going through `try_from` rather than `as` keeps it that way if one ever isn't, and
+        // keeps the cast out of a `#[deny]`-ed lint's way.
+        let skip = u64::try_from(opaque.len()).map_err(|_| {
+            Error::MalformedResponse(format!(
+                "pair-verify reply's opaque blob is {} bytes, which does not fit a CTR offset",
+                opaque.len()
+            ))
+        })?;
+        let encrypted = ctr_encrypt_at_offset(&key, &iv, skip, signature.as_slice());
 
         let mut body = Vec::with_capacity(VERIFY_M3_PREFIX.len() + encrypted.len());
         body.extend_from_slice(&VERIFY_M3_PREFIX);

@@ -6,9 +6,10 @@
 use crate::{
     Error, Result,
     hkdf_derive::{expand, pairing as salts},
+    srp_encoding::minimal_be,
     srp_hap::{
-        PAIR_SETUP_M5_NONCE, PAIR_SETUP_M6_NONCE, PAIR_SETUP_USERNAME, open, random_seed, seal,
-        sign, verify_signature,
+        MODULUS_LEN, PAIR_SETUP_M5_NONCE, PAIR_SETUP_M6_NONCE, PAIR_SETUP_USERNAME, open,
+        random_seed, seal, sign, verify_signature,
     },
     tlv8::{ErrorCode, State, Tlv8, TlvValue},
 };
@@ -59,7 +60,14 @@ impl ReferenceAccessory {
             .as_mut()
             .ok_or(Error::OutOfOrder("pair-setup M1 has not been handled"))?;
 
-        let client_public_key = request.require(TlvValue::PublicKey)?.clone();
+        // Same normalise-then-range-check as the controller applies to `B`
+        // (`crate::srp_hap::HapSrpClient::process_challenge`): `srptools` hashes `A` as an integer,
+        // and `srp`'s `Server::process_reply` panics inside `crypto_bigint`'s `Resize` on a value
+        // wider than `N` rather than returning an error.
+        let client_public_key = minimal_be(request.require(TlvValue::PublicKey)?).to_vec();
+        if client_public_key.len() > MODULUS_LEN {
+            return Err(Error::SrpPublicKey { peer: "controller" });
+        }
         let client_proof = request.require(TlvValue::Proof)?.clone();
 
         // `g_no_pad = true` is the HAP profile. The crate's own doc comment on

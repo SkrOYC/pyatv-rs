@@ -20,3 +20,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { version = "0.7.19", features = ["codec"] }
 tracing.workspace = true
+
+[dev-dependencies]
+pyatv-pairing = { workspace = true, features = ["test-server"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

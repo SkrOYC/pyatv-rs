@@ -35,14 +35,19 @@ rand = "0.10.2"
 rand_core = "0.10.1"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
-srp = "0.7.0-rc.3"
+# Pinned exactly. `crate::srp_hap` calls into `srp::utils`, which the crate marks
+# `#[doc(hidden)] pub` and therefore keeps outside its semver promise, and 0.7 is still a release
+# candidate. A patch bump that renamed `compute_m1_rfc5054` or flipped its `g_no_pad` argument would
+# break HAP interop, so upgrades have to be a deliberate act followed by a `tests/kat` re-run.
+srp = "=0.7.0-rc.3"
 subtle = "2.6.1"
 thiserror.workspace = true
-tracing.workspace = true
 x25519-dalek = "3.0.0"
+zeroize = "1.9.0"
 
 [dev-dependencies]
 hex = "0.4.3"
 serde_json = "1.0.151"
 sha2 = "0.11.0"
-srp = "0.7.0-rc.3"
+# Same exact pin as the normal dependency above, for the same reason.
+srp = "=0.7.0-rc.3"

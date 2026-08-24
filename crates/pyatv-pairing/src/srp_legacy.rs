@@ -75,8 +75,12 @@ static PRIME_BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| PRIME.to_bytes_be());
 
 /// `srptools`' `int_to_bytes`: shortest big-endian encoding, `b"\x00"` for zero
 /// (`srptools/utils.py:22-53`).
+///
+/// `BigUint::to_bytes_be` is already minimal for every value including zero, so the
+/// [`crate::srp_encoding::minimal_be`] pass is a no-op here — it is applied anyway so both SRP
+/// profiles demonstrably share one implementation of the rule rather than two that happen to agree.
 fn int_to_bytes(value: &BigUint) -> Vec<u8> {
-    value.to_bytes_be()
+    crate::srp_encoding::minimal_be(&value.to_bytes_be()).to_vec()
 }
 
 /// `SRPContext.pad`: right-justify to the byte length of `N` (`srptools/context.py:64-71`).

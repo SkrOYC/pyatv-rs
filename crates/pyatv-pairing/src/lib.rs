@@ -17,6 +17,7 @@ pub mod pairing;
 #[cfg(feature = "test-server")]
 pub mod server;
 pub mod session;
+mod srp_encoding;
 pub mod srp_hap;
 pub mod srp_legacy;
 pub mod tlv8;
@@ -28,3 +29,24 @@ pub use tlv8::{Tlv8, TlvValue};
 
 /// Convenience alias for fallible pairing operations.
 pub type Result<T, E = Error> = core::result::Result<T, E>;
+
+#[cfg(test)]
+mod zeroize_policy {
+    //! A compile-time inventory of the types that hold a secret for longer than one call.
+    //!
+    //! Wiping cannot be observed from safe Rust — reading the memory after the drop is exactly the
+    //! undefined behaviour `zeroize` exists to make pointless — so what is checkable is that each
+    //! type still claims the guarantee. Removing a `Drop` impl silently would otherwise be
+    //! invisible; here it is a compile error naming the type.
+
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+    #[test]
+    fn every_long_lived_secret_holder_wipes_itself() {
+        assert_zeroize_on_drop::<crate::PairSetup>();
+        assert_zeroize_on_drop::<crate::PairVerify>();
+        assert_zeroize_on_drop::<crate::SessionKeys>();
+        assert_zeroize_on_drop::<crate::srp_hap::HapSrpClient>();
+        assert_zeroize_on_drop::<crate::legacy_auth::LegacyPairVerify>();
+    }
+}

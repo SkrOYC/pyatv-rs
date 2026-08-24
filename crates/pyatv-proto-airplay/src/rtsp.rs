@@ -2,6 +2,16 @@
 //!
 //! Sits directly on [`crate::codec`]. See `docs/research/airplay-raop-dmap.md` for the request
 //! sequences and `docs/research/rust-crates.md` §5 for the framing decisions.
+//!
+//! # What is already built
+//!
+//! [`crate::codec`] parses and encodes both roles and implements `tokio_util::codec::Decoder` and
+//! `Encoder`, so `Framed<TcpStream, AirPlayCodec>` works today. [`crate::http::HttpConnection`]
+//! drives the same parser over a raw socket instead, because the post-pair-verify
+//! [`pyatv_pairing::session::HapSession`] framing sits *below* HTTP and a `Framed` leaves no seam
+//! to insert it at. An RTSP session can either grow on top of `HttpConnection` — adding `CSeq`,
+//! `Session` and the non-`POST` verbs, and consuming the reverse requests it currently logs and
+//! drops — or use `Framed` and forgo encryption. The first is what pyatv does.
 
 use crate::Result;
 use crate::codec::Response;

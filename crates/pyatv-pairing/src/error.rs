@@ -32,10 +32,6 @@ pub enum Error {
     #[error("SRP proof did not verify")]
     ProofMismatch,
 
-    /// An Ed25519 signature did not verify.
-    #[error("signature verification failed")]
-    SignatureMismatch,
-
     /// An AEAD open or seal operation failed.
     #[error("{operation} failed: authentication tag did not verify")]
     Aead {
@@ -108,13 +104,101 @@ pub enum Error {
 }
 
 impl From<Error> for pyatv_core::Error {
+    /// Collapse a pairing error into the crate-wide one.
+    ///
+    /// The split that matters to callers is "the peer is not who the credentials say it is, or does
+    /// not accept who we say we are" versus "the exchange broke down". Everything in the first
+    /// group becomes [`pyatv_core::Error::Authentication`] so a caller can decide to re-pair
+    /// instead of retrying: the two SRP/AEAD failures, both Ed25519 signature checks, the accessory
+    /// identifier check, and the device's own `Authentication` HAP error code — which is exactly
+    /// what a wrong PIN, or a controller the accessory has forgotten, comes back as.
+    /// Everything else stays [`pyatv_core::Error::Pairing`], including the other HAP error codes,
+    /// which describe a device state (busy, backing off, out of pairing slots) rather than a
+    /// rejected identity.
     fn from(error: Error) -> Self {
         match error {
-            Error::ProofMismatch | Error::SignatureMismatch | Error::Aead { .. } => {
-                Self::Authentication(error.to_string())
-            }
+            Error::ProofMismatch
+            | Error::Aead { .. }
+            | Error::SetupSignature
+            | Error::VerifySignature
+            | Error::IdentifierMismatch { .. }
+            | Error::HapError {
+                code: crate::tlv8::ErrorCode::Authentication,
+            } => Self::Authentication(error.to_string()),
             Error::InvalidCredentials(message) => Self::InvalidCredentials(message),
             other => Self::Pairing(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use crate::tlv8::ErrorCode;
+
+    fn mapped(error: Error) -> pyatv_core::Error {
+        error.into()
+    }
+
+    /// Every identity failure has to land in `Authentication`, because that is the variant callers
+    /// key "these credentials are dead, re-pair" off. Regressing one of these to `Pairing` would
+    /// turn a permanent failure into an infinite retry loop.
+    #[test]
+    fn identity_failures_map_to_authentication() {
+        let cases = [
+            Error::ProofMismatch,
+            Error::Aead {
+                operation: "decrypt",
+            },
+            Error::SetupSignature,
+            Error::VerifySignature,
+            Error::IdentifierMismatch {
+                expected: "aa".to_owned(),
+                actual: "bb".to_owned(),
+            },
+            Error::HapError {
+                code: ErrorCode::Authentication,
+            },
+        ];
+
+        for case in cases {
+            let rendered = case.to_string();
+            assert!(
+                matches!(mapped(case), pyatv_core::Error::Authentication(_)),
+                "{rendered}"
+            );
+        }
+    }
+
+    /// The other HAP codes describe a device state, not a rejected identity.
+    #[test]
+    fn device_state_errors_stay_pairing_errors() {
+        let cases = [
+            Error::HapError {
+                code: ErrorCode::Busy,
+            },
+            Error::HapError {
+                code: ErrorCode::MaxPeers,
+            },
+            Error::UnknownHapError(0x42),
+            Error::OutOfOrder("nothing has happened yet"),
+            Error::MissingPin,
+        ];
+
+        for case in cases {
+            let rendered = case.to_string();
+            assert!(
+                matches!(mapped(case), pyatv_core::Error::Pairing(_)),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_parse_failures_keep_their_own_variant() {
+        assert!(matches!(
+            mapped(Error::InvalidCredentials("bad hex".to_owned())),
+            pyatv_core::Error::InvalidCredentials(message) if message == "bad hex"
+        ));
     }
 }

@@ -11,6 +11,18 @@
 //!
 //! Nesting is not supported: HAP TLV8 is single-level, matching pyatv's own module caveat.
 //!
+//! ## One deliberate encoder divergence: zero-length values
+//!
+//! pyatv's `write_tlv` loops `while len(value) > 0` (`pyatv/auth/hap_tlv8.py:105-123`), so a
+//! zero-length value emits nothing and the tag vanishes. [`Tlv8::encode`] emits `tag, 0x00`
+//! instead, which round-trips back through [`Tlv8::decode`] as the same message. That is a
+//! conscious choice: dropping the tag would make `encode(decode(x)) != x` for any peer message
+//! carrying an empty entry, and the tag it matters for is `Error`, whose mere *presence* is a
+//! failure (`if TlvValue.Error in tlv`, `pyatv/protocols/mrp/auth.py:19-23`, mirrored in
+//! [`crate::pairing`]'s `decode_response`); an encoder that cannot say "present and empty" cannot
+//! express that state at all. Nothing this port sends ever carries an empty value, so the
+//! divergence is unreachable outbound and both encoders decode identically inbound.
+//!
 //! **Entries are kept in insertion order, not tag-numeric order.** pyatv's `write_tlv`
 //! (`pyatv/auth/hap_tlv8.py:105-123`, see `docs/research/hap-pairing-port-spec.md` §1.6) iterates
 //! a plain Python `dict`, which is insertion-ordered as of 3.7+; every call site builds its dict
@@ -233,8 +245,10 @@ impl Tlv8 {
         self.get_raw(tag as u8)
     }
 
-    /// Read a raw tag byte.
-    fn get_raw(&self, tag: u8) -> Option<&Bytes> {
+    /// Read a raw tag byte: the counterpart to [`Tlv8::with_raw`], for the tags pyatv has not
+    /// catalogued.
+    #[must_use]
+    pub fn get_raw(&self, tag: u8) -> Option<&Bytes> {
         self.entries
             .iter()
             .find_map(|(t, value)| (*t == tag).then_some(value))

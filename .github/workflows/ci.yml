@@ -52,9 +52,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - run: cargo nextest run --workspace --profile ci
+      # `--all-features` is load-bearing: `pyatv-pairing`'s `test-server` feature gates the
+      # reference HAP accessory and, with it, every end-to-end and negative-path pairing test.
+      # Without the flag they are not compiled into the run at all.
+      - run: cargo nextest run --workspace --all-features --profile ci
       # nextest does not run doctests, so they need a separate pass.
-      - run: cargo test --workspace --doc
+      - run: cargo test --workspace --doc --all-features
 
   msrv:
     name: Minimum supported Rust version

@@ -190,10 +190,14 @@ impl Chacha20Cipher {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Aead`] if the AEAD seal fails.
+    /// Returns [`Error::Aead`] if the AEAD seal fails, or [`Error::MalformedResponse`] if the
+    /// outbound counter has reached `u64::MAX`. The latter is unreachable in any real session —
+    /// `2^64` frames — but wrapping it would silently reuse a nonce under a live key, which for a
+    /// stream cipher discloses the XOR of two plaintexts. `checked_add` makes the impossible case
+    /// an error rather than a catastrophe; Python has no such edge, its counter is unbounded.
     pub fn encrypt(&mut self, data: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>> {
         let nonce = self.out_nonce();
-        self.out_counter += 1;
+        self.out_counter = next_counter(self.out_counter, "outbound")?;
         seal(&self.out_cipher, &nonce, data, aad)
     }
 
@@ -222,10 +226,11 @@ impl Chacha20Cipher {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Aead`] if the tag does not verify.
+    /// Returns [`Error::Aead`] if the tag does not verify, or [`Error::MalformedResponse`] if the
+    /// inbound counter has reached `u64::MAX`; see [`Chacha20Cipher::encrypt`].
     pub fn decrypt(&mut self, data: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>> {
         let nonce = self.in_nonce();
-        self.in_counter += 1;
+        self.in_counter = next_counter(self.in_counter, "inbound")?;
         open(&self.in_cipher, &nonce, data, aad)
     }
 
@@ -242,6 +247,16 @@ impl Chacha20Cipher {
     ) -> Result<Vec<u8>> {
         open(&self.in_cipher, nonce, data, aad)
     }
+}
+
+/// Advance a direction's message counter, refusing to wrap.
+fn next_counter(counter: u64, direction: &'static str) -> Result<u64> {
+    counter.checked_add(1).ok_or_else(|| {
+        Error::MalformedResponse(format!(
+            "the {direction} ChaCha20 message counter is exhausted; the session must be torn down \
+             rather than reuse a nonce"
+        ))
+    })
 }
 
 /// `aad=None` in Python means "no associated data", which the AEAD treats as an empty slice.
@@ -414,6 +429,36 @@ mod tests {
                 .is_err()
         );
         assert!(cipher.decrypt_with_nonce(&sealed, &nonce, None).is_err());
+    }
+
+    /// An exhausted counter must be an error, never a wrap: a wrapped nonce reused under a live key
+    /// leaks the XOR of two plaintexts. Reaching this state honestly takes `2^64` frames, so the
+    /// counters are set by hand.
+    #[test]
+    fn an_exhausted_counter_is_refused_rather_than_wrapping() {
+        use crate::Error;
+
+        let mut cipher = Chacha20Cipher::with_padded_counter(&FAKE_KEY, &FAKE_KEY);
+        cipher.out_counter = u64::MAX;
+        cipher.in_counter = u64::MAX;
+
+        assert!(matches!(
+            cipher.encrypt(b"one too many", None),
+            Err(Error::MalformedResponse(_))
+        ));
+        assert!(matches!(
+            cipher.decrypt(&[0u8; AUTH_TAG_LENGTH], None),
+            Err(Error::MalformedResponse(_))
+        ));
+        // Neither direction may have wrapped back to zero.
+        assert_eq!(
+            cipher.out_nonce(),
+            NonceLayout::PaddedCounter.nonce(u64::MAX)
+        );
+        assert_eq!(
+            cipher.in_nonce(),
+            NonceLayout::PaddedCounter.nonce(u64::MAX)
+        );
     }
 
     /// `aad=None` and `aad=b""` are the same thing to the AEAD, which is what pyatv relies on when

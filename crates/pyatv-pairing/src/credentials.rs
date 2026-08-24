@@ -4,8 +4,12 @@
 //! replicates byte-for-byte so users can migrate an existing `pyatv` credential export. pyatv
 //! distinguishes its four authentication types by inspecting which fields of one `HapCredentials`
 //! struct happen to be empty, and marks transient pairing with the literal ASCII bytes
-//! `"transient"` sitting in the `ltpk` slot. That sentinel scheme is not reproduced: the type is
-//! modelled as an enum and the sentinel only appears in the parser and formatter.
+//! `"transient"` sitting in the `ltpk` slot. **Both of those are reproduced exactly** — the
+//! sentinel really does live in `ltpk` (see [`HapCredentials::transient`]), because it is part of
+//! the on-disk format and a credential written by either implementation has to be readable by the
+//! other. What this port adds on top is [`AuthenticationType`] as a real enum plus a *fallible*
+//! classifier, [`HapCredentials::try_authentication_type`], so the field combinations pyatv rejects
+//! outright are distinguishable from the four it accepts.
 //!
 //! The field naming is confusing upstream and is kept for interop: `ltsk` is the *controller's*
 //! long-term secret key while `ltpk` is the *device's* long-term public key, despite both reading
@@ -28,6 +32,11 @@ pub enum AuthenticationType {
 
 /// The sentinel pyatv stores in the `ltpk` slot to mark transient credentials.
 const TRANSIENT_SENTINEL: &[u8] = b"transient";
+
+/// Render one field's occupancy for the classifier's error message, without leaking its bytes.
+fn populated(field: &[u8]) -> &'static str {
+    if field.is_empty() { "empty" } else { "set" }
+}
 
 /// Credentials for one paired service.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -74,17 +83,66 @@ impl HapCredentials {
     }
 
     /// Classify these credentials by which fields are populated, matching pyatv's rules.
+    ///
+    /// This is `HapCredentials._get_auth_type` (`pyatv/auth/hap_pairing.py:47-70`) branch for
+    /// branch, including its **fifth** branch: a combination that matches none of the four named
+    /// types raises `InvalidCredentialsError` upstream rather than being coerced into the closest
+    /// one. The two shapes that reach it in practice are `("", "", atv_id, client_id)` — a HAP
+    /// credential that lost its keys — and `(ltpk, "", "", "")` — a device public key with nothing
+    /// to pair it to. Both are corrupt storage, not a pairing generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCredentials`] for any other combination of populated fields.
+    pub fn try_authentication_type(&self) -> Result<AuthenticationType> {
+        // pyatv tests all-empty *before* the sentinel; the order is irrelevant because the
+        // sentinel makes `ltpk` non-empty, but it is kept for a line-by-line reading.
+        if self.ltpk.is_empty()
+            && self.ltsk.is_empty()
+            && self.atv_id.is_empty()
+            && self.client_id.is_empty()
+        {
+            return Ok(AuthenticationType::Null);
+        }
+        if self.ltpk == TRANSIENT_SENTINEL {
+            return Ok(AuthenticationType::Transient);
+        }
+        if self.ltpk.is_empty()
+            && !self.ltsk.is_empty()
+            && self.atv_id.is_empty()
+            && !self.client_id.is_empty()
+        {
+            return Ok(AuthenticationType::Legacy);
+        }
+        if !self.ltpk.is_empty()
+            && !self.ltsk.is_empty()
+            && !self.atv_id.is_empty()
+            && !self.client_id.is_empty()
+        {
+            return Ok(AuthenticationType::Hap);
+        }
+
+        Err(Error::InvalidCredentials(format!(
+            "no authentication type has this shape: ltpk {}, ltsk {}, atv_id {}, client_id {}",
+            populated(&self.ltpk),
+            populated(&self.ltsk),
+            populated(&self.atv_id),
+            populated(&self.client_id),
+        )))
+    }
+
+    /// Classify these credentials, treating a shape pyatv rejects as "not paired".
+    ///
+    /// The infallible convenience form of [`HapCredentials::try_authentication_type`], for the call
+    /// sites that only want to pick a procedure. **A malformed combination reports
+    /// [`AuthenticationType::Null`]**, which is the conservative answer — it selects the
+    /// pass-through procedure rather than feeding half a credential into a real handshake. Use
+    /// [`HapCredentials::try_authentication_type`] where the difference between "nothing stored"
+    /// and "storage is corrupt" is worth reporting to the user.
     #[must_use]
     pub fn authentication_type(&self) -> AuthenticationType {
-        if self.ltpk == TRANSIENT_SENTINEL {
-            AuthenticationType::Transient
-        } else if self.ltpk.is_empty() && self.ltsk.is_empty() {
-            AuthenticationType::Null
-        } else if self.ltpk.is_empty() && self.atv_id.is_empty() {
-            AuthenticationType::Legacy
-        } else {
-            AuthenticationType::Hap
-        }
+        self.try_authentication_type()
+            .unwrap_or(AuthenticationType::Null)
     }
 
     /// Parse pyatv's colon-separated lowercase-hex credential string.
@@ -211,6 +269,98 @@ mod tests {
     #[test]
     fn null_credentials_render_as_three_colons() {
         assert_eq!(HapCredentials::null().to_string(), ":::");
+    }
+
+    /// pyatv's fifth branch: these two shapes raise `InvalidCredentialsError` rather than being
+    /// classified (`pyatv/auth/hap_pairing.py:47-70`). The infallible accessor has to answer `Null`
+    /// for them, which is the shape that selects the pass-through procedure.
+    #[test]
+    fn shapes_pyatv_rejects_are_errors_and_read_as_null() {
+        let cases = [
+            // A HAP credential that lost both keys.
+            HapCredentials {
+                ltpk: Vec::new(),
+                ltsk: Vec::new(),
+                atv_id: b"atv".to_vec(),
+                client_id: b"client".to_vec(),
+            },
+            // A device public key with nothing to pair it to.
+            HapCredentials {
+                ltpk: vec![0xAA; 32],
+                ltsk: Vec::new(),
+                atv_id: Vec::new(),
+                client_id: Vec::new(),
+            },
+            // Legacy shape missing its client identifier.
+            HapCredentials {
+                ltpk: Vec::new(),
+                ltsk: vec![0xBB; 32],
+                atv_id: Vec::new(),
+                client_id: Vec::new(),
+            },
+            // HAP shape missing the accessory identifier.
+            HapCredentials {
+                ltpk: vec![0xAA; 32],
+                ltsk: vec![0xBB; 32],
+                atv_id: Vec::new(),
+                client_id: b"client".to_vec(),
+            },
+        ];
+
+        for case in cases {
+            assert!(
+                case.try_authentication_type().is_err(),
+                "{case:?} should have no authentication type"
+            );
+            assert_eq!(case.authentication_type(), AuthenticationType::Null);
+        }
+    }
+
+    /// The four shapes pyatv does accept must classify without an error.
+    #[test]
+    fn the_four_accepted_shapes_classify() {
+        assert_eq!(
+            HapCredentials::null().try_authentication_type().unwrap(),
+            AuthenticationType::Null
+        );
+        assert_eq!(
+            HapCredentials::transient()
+                .try_authentication_type()
+                .unwrap(),
+            AuthenticationType::Transient
+        );
+        assert_eq!(
+            HapCredentials::parse("0011223344556677:aabbcc")
+                .unwrap()
+                .try_authentication_type()
+                .unwrap(),
+            AuthenticationType::Legacy
+        );
+        assert_eq!(
+            HapCredentials::parse("aabb:ccdd:eeff:0011")
+                .unwrap()
+                .try_authentication_type()
+                .unwrap(),
+            AuthenticationType::Hap
+        );
+    }
+
+    /// The classifier's error message describes occupancy only; it must never echo key bytes.
+    #[test]
+    fn the_classifier_error_does_not_leak_key_material() {
+        let credentials = HapCredentials {
+            ltpk: vec![0xAA; 32],
+            ltsk: Vec::new(),
+            atv_id: Vec::new(),
+            client_id: Vec::new(),
+        };
+
+        let message = credentials
+            .try_authentication_type()
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains(&hex::encode([0xAAu8; 32])));
+        assert!(message.contains("ltsk empty"));
     }
 
     #[test]
