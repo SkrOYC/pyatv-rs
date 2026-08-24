@@ -1,0 +1,133 @@
+//! RAOP: the audio streaming half of AirPlay.
+//!
+//! See `docs/research/airplay-raop-dmap.md` for the RTP packet layouts and the retransmit/control
+//! channels, and `docs/research/rust-crates.md` §7 for the codec question.
+//!
+//! Audio properties are negotiated through the receiver's mDNS TXT records rather than being
+//! hardcoded: `sr` for sample rate, `ch` for channel count and `ss` for sample size in bits. Those
+//! keys reach here on the [`pyatv_core::BaseService::properties`] map that discovery populated.
+
+pub mod packets;
+
+use pyatv_core::BaseService;
+
+/// Audio format the receiver asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioProperties {
+    /// Sample rate in Hz, from the `sr` TXT key.
+    pub sample_rate: u32,
+    /// Channel count, from the `ch` TXT key.
+    pub channels: u8,
+    /// Bits per sample, from the `ss` TXT key.
+    pub sample_size: u8,
+}
+
+impl Default for AudioProperties {
+    /// pyatv's defaults for a receiver that advertises none of the three keys.
+    fn default() -> Self {
+        Self {
+            sample_rate: 44_100,
+            channels: 2,
+            sample_size: 16,
+        }
+    }
+}
+
+impl AudioProperties {
+    /// Read the audio properties out of a discovered service's TXT records, defaulting any key the
+    /// receiver did not advertise.
+    #[must_use]
+    pub fn from_service(service: &BaseService) -> Self {
+        // A closure cannot be generic over the parsed type, so this is a function.
+        fn read<T: std::str::FromStr>(service: &BaseService, key: &str) -> Option<T> {
+            service.properties.get(key).and_then(|raw| raw.parse().ok())
+        }
+
+        let defaults = Self::default();
+        Self {
+            sample_rate: read(service, "sr").unwrap_or(defaults.sample_rate),
+            channels: read(service, "ch").unwrap_or(defaults.channels),
+            sample_size: read(service, "ss").unwrap_or(defaults.sample_size),
+        }
+    }
+}
+
+/// Encryption schemes a receiver can advertise in its `et` TXT key.
+///
+/// pyatv parses these purely so it can recognise a stream it cannot handle. None of the FairPlay
+/// variants are implemented, by anyone: they depend on Apple's hardware-backed key material and no
+/// public implementation exists. See `docs/research/crypto-pairing.md` §5.5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionType {
+    /// No encryption.
+    None,
+    /// RSA, legacy AirPlay 1 audio. Not implemented.
+    Rsa,
+    /// FairPlay. Not implemented.
+    FairPlay,
+    /// FairPlay SAP v2.5. Not implemented.
+    FairPlaySapV25,
+}
+
+impl EncryptionType {
+    /// Whether this crate can actually stream to a receiver demanding this scheme.
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyatv_core::{BaseService, Protocol};
+
+    use super::{AudioProperties, EncryptionType};
+
+    #[test]
+    fn missing_txt_keys_fall_back_to_pyatv_defaults() {
+        let service = BaseService::new(Protocol::Raop, 7000);
+        assert_eq!(
+            AudioProperties::from_service(&service),
+            AudioProperties {
+                sample_rate: 44_100,
+                channels: 2,
+                sample_size: 16,
+            }
+        );
+    }
+
+    /// The receiver dictates the format, so advertised keys must win over the defaults.
+    #[test]
+    fn advertised_txt_keys_override_the_defaults() {
+        let mut service = BaseService::new(Protocol::Raop, 7000);
+        service
+            .properties
+            .insert("sr".to_owned(), "48000".to_owned());
+        service.properties.insert("ch".to_owned(), "1".to_owned());
+
+        let properties = AudioProperties::from_service(&service);
+        assert_eq!(properties.sample_rate, 48_000);
+        assert_eq!(properties.channels, 1);
+        // Not advertised, so still the default.
+        assert_eq!(properties.sample_size, 16);
+    }
+
+    /// An unparseable value must not panic or produce a nonsense rate.
+    #[test]
+    fn unparseable_txt_values_fall_back_rather_than_failing() {
+        let mut service = BaseService::new(Protocol::Raop, 7000);
+        service
+            .properties
+            .insert("sr".to_owned(), "not a number".to_owned());
+
+        assert_eq!(AudioProperties::from_service(&service).sample_rate, 44_100);
+    }
+
+    #[test]
+    fn only_unencrypted_streams_are_supported() {
+        assert!(EncryptionType::None.is_supported());
+        assert!(!EncryptionType::Rsa.is_supported());
+        assert!(!EncryptionType::FairPlay.is_supported());
+        assert!(!EncryptionType::FairPlaySapV25.is_supported());
+    }
+}

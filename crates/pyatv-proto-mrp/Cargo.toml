@@ -1,0 +1,25 @@
+[package]
+name = "pyatv-proto-mrp"
+description = "MediaRemote Protocol (MRP) for pyatv-rs: protobuf message layer over direct TCP or an AirPlay remote-control tunnel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+prost = "0.14.4"
+pyatv-core.workspace = true
+pyatv-pairing.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+prost-build = "0.14.4"
+protox = "0.9.1"

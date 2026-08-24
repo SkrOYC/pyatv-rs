@@ -1,0 +1,15 @@
+# This file is for contributors and CI jobs that use rustup.
+#
+# Inside the devenv shell the toolchain comes from devenv.lock via the Rust overlay, and rustup is
+# not involved at all — this file is ignored there. It exists so that someone who clones the repo
+# without Nix, or a CI job that installs Rust with rustup, still gets a toolchain with the
+# components the quality gate needs.
+#
+# The channel is deliberately "stable" rather than a pinned version: the MSRV floor lives in
+# `rust-version` in the workspace Cargo.toml and is verified by a dedicated CI job, so pinning here
+# as well would mean two sources of truth that drift apart.
+
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy", "rust-analyzer", "rust-src"]
+profile = "minimal"

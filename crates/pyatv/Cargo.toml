@@ -1,0 +1,24 @@
+[package]
+name = "pyatv"
+description = "Pure-Rust client library for Apple TV and AirPlay devices: scan, pair and connect over MRP, Companion, AirPlay, RAOP and DMAP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pyatv-core.workspace = true
+pyatv-mdns.workspace = true
+pyatv-pairing.workspace = true
+pyatv-proto-airplay.workspace = true
+pyatv-proto-companion.workspace = true
+pyatv-proto-dmap.workspace = true
+pyatv-proto-mrp.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

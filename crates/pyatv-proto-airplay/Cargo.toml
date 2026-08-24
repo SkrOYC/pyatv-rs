@@ -1,0 +1,22 @@
+[package]
+name = "pyatv-proto-airplay"
+description = "AirPlay 1/2 and RAOP audio for pyatv-rs, including the bidirectional RTSP/HTTP-over-one-socket codec."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+plist = "1.10.0"
+pyatv-core.workspace = true
+pyatv-pairing.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7.19", features = ["codec"] }
+tracing.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "pyatv-mdns"
+description = "mDNS/DNS-SD discovery for pyatv-rs: multicast browse/resolve plus a placeholder unicast host scanner."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hickory-proto = { version = "0.26.1", optional = true }
+mdns-sd = "0.21.0"
+pyatv-core.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+hickory-proto = ["dep:hickory-proto"]

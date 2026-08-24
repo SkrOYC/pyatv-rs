@@ -1,0 +1,21 @@
+[package]
+name = "pyatv-proto-companion"
+description = "Companion link protocol for pyatv-rs: 4-byte framing over OPACK payloads with HAP pairing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+pyatv-core.workspace = true
+pyatv-opack.workspace = true
+pyatv-pairing.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

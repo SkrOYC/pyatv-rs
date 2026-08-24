@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "cli/atvremote"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/SkrOYC/pyatv-rs"
+authors = ["SkrOYC"]
+
+[workspace.dependencies]
+# Internal crates (path deps declared once). The `version` alongside `path` is what cargo uses when
+# these are published — crates.io rejects bare path dependencies — and it also keeps cargo-deny's
+# wildcard ban satisfied.
+pyatv-core = { path = "crates/pyatv-core", version = "0.1.0" }
+pyatv-mdns = { path = "crates/pyatv-mdns", version = "0.1.0" }
+pyatv-pairing = { path = "crates/pyatv-pairing", version = "0.1.0" }
+pyatv-opack = { path = "crates/pyatv-opack", version = "0.1.0" }
+pyatv-proto-mrp = { path = "crates/pyatv-proto-mrp", version = "0.1.0" }
+pyatv-proto-companion = { path = "crates/pyatv-proto-companion", version = "0.1.0" }
+pyatv-proto-airplay = { path = "crates/pyatv-proto-airplay", version = "0.1.0" }
+pyatv-proto-dmap = { path = "crates/pyatv-proto-dmap", version = "0.1.0" }
+
+# External — versions mirror what `cargo add` resolved against crates.io.
+bytes = "1.12.1"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = [
+  "rt-multi-thread",
+  "net",
+  "macros",
+  "time",
+  "sync",
+  "io-util",
+] }
+tracing = "0.1.44"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

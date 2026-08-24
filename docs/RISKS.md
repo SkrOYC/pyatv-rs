@@ -1,0 +1,41 @@
+# Risk register
+
+Distilled from the seven research reports. Each risk names its severity, why it is risky, and the concrete mitigation. "Interop" risks silently produce wrong bytes with no error until they hit a real device, so they dominate this list. Re-review at the start of each roadmap phase.
+
+## High severity
+
+**H1 — HAP SRP M1 uses unpadded `H(g)`; RustCrypto `srp` hardcodes the padded form.** `Client::process_reply()` cannot be used for HAP pairing. Mitigation: call the crate's public low-level primitives and `srp::utils::compute_m1_rfc5054(..., g_no_pad = true, ...)` directly (documented in `crypto-pairing.md` §9). Back it with a known-answer test from a captured pairing before trusting it. If the low-level API proves fragile, fall back to hand-rolling SRP math against `srp` 0.6.
+
+**H2 — `srp` may still be a 0.7 release candidate.** An RC's API is not frozen. Mitigation: pin the exact validated version; track `RustCrypto/PAKEs` for the 0.7 stable release; keep 0.6 as a fallback; do not upgrade without re-running the SRP known-answer tests.
+
+**H3 — Three distinct ChaCha20 nonce layouts and per-channel HKDF salt/info strings.** A single wrong byte decrypts garbage in one direction with no parse error. Mitigation: implement each nonce construction as an explicitly parameterized type (zero-prefix width + counter width); copy the salt/info table from `crypto-pairing.md` §3 verbatim; unit-test each channel's key derivation against captured fixtures. Note the AirPlay event channel swaps read/write info strings.
+
+**H4 — OPACK and Companion have no public spec and no Rust prior art.** pyatv's `opack.py` and `atvproxy` are the only ground truth, and pyatv's own OPACK implementation is explicitly incomplete for some types (e.g. absolute-time 0x06). Mitigation: hand-write OPACK in its own crate with exhaustive round-trip property tests including open-ended containers and back-references; validate against `atvproxy` captures; treat pyatv as an incomplete spec for the flagged types and reverse-engineer them directly.
+
+**H5 — MRP-over-AirPlay tunneling is actively evolving, even within pyatv.** Modern tvOS carries MRP inside an AirPlay 2 data-stream channel; any design frozen against a pyatv snapshot may be stale. Mitigation: abstract behind the `MrpTransport` trait so the message state machine is transport-independent; re-check pyatv `master` and capture against a live tvOS 26.x device at Step 4/5; verify the 2-second RTSP FEEDBACK heartbeat and data-channel sync/ack pattern (missing either tears down the tunnel after ~30 s).
+
+## Medium severity
+
+**M1 — Legacy AirPlay device-auth quirks must be replicated byte-for-byte.** The pair-setup IV last-byte `+1` increment, the doubled-SHA1 session key, the opaque trailing blob encrypted with the signature, and the Ed25519-seed-as-SRP-ephemeral reuse all diverge from textbook crypto and have no crate support. Mitigation: implement exactly as `crypto-pairing.md` §2.2/§5.4/§6 describes; do not "fix" the oddities; validate with a legacy-device capture. Lower severity than H-items because legacy AirPlay is old and may be deprioritized.
+
+**M2 — prost/protox may not compile pyatv's proto2 extension-based `.proto` files.** Blocking unknown for the whole MRP message layer. Mitigation: spike prost/protox against the real vendored `.proto` set early in Step 4; fall back to the `rust-protobuf` crate if extension support is inadequate; keep protobuf codegen out of the Step 0 critical path.
+
+**M3 — AES-CTR and `NSKeyedArchiver` plist semantics are unverified against real captures.** `ctr::Ctr128BE<Aes128>` full-16-byte-IV-as-counter semantics and whether the `plist` crate handles keyed-archiver payloads (Companion keyboard `_tiD`) are assumptions. pyatv wrote its own `keyed_archiver.py`, hinting a custom Rust impl may be needed. Mitigation: byte-exact known-answer tests before depending on either; be prepared to hand-write a small keyed-archiver reader.
+
+**M4 — Custom AirPlay HTTP/RTSP codec is unavoidable and easy to get subtly wrong.** Reverse connections, single-socket dual roles, an event channel. Mitigation: sans-io `tokio_util::codec` with `Content-Length` buffering (`Ok(None)` on partial frames), round-trip tests, and capture-based tests; do not attempt to force reqwest/hyper.
+
+**M5 — Dependency currency and the fast-moving dalek/RustCrypto stack.** `ed25519-dalek`/`x25519-dalek` bumped to 3.0.0 in a recent wave; the crypto set must co-resolve on one RustCrypto trait generation. Mitigation: the Step 0 scaffold validates co-resolution; re-verify versions and read full rustdoc at each phase; `cargo-deny` advisories + `cargo-machete` in CI; `cargo update` guarded by resolver v3 MSRV-awareness.
+
+## Low severity / watch
+
+**L1 — pyatv itself is not fully correct against the newest tvOS.** Open upstream issues on `play_url`, RTSP heartbeat desync, and discovery flakiness, plus reduced maintainer bandwidth. Mitigation: treat pyatv as spec-of-record but validate independently against a real device; do not inherit unverified paths (pyatv has `# TODO` unverified-signature comments in its pairing flows — decide deliberately whether to be stricter).
+
+**L2 — `~/.pyatv.conf` on-disk compatibility is not free.** Reverse-engineering pyatv's `StorageModel`/`Settings` field names is required if credential-file migration is a goal. Mitigation: treat it as an explicit, separately-scoped decision (see `ARCHITECTURE.md` §8); the credential *string* format is replicated regardless.
+
+**L3 — RAOP may or may not require ALAC encoding.** pyatv's SDP template suggests raw PCM (L16); the `alac-encoder` crate is stale. Mitigation: confirm with a live capture at Step 6 before pulling in an ALAC encoder.
+
+**L4 — Provisional MSRV (1.88).** Chosen for let-chains; a dependency may demand higher. Mitigation: `cargo-msrv verify` in CI; bump deliberately with a version note (MSRV bump is a minor-version change for a library).
+
+**L5 — Point-in-time research.** All crate versions, star counts, and pyatv behavior were captured 2026-08-24. Mitigation: re-verify at the start of each phase; the reports cite their sources for exactly this reason.
+
+**L6 — Do not implement FairPlay.** No open implementation exists; it depends on Apple hardware key material; pyatv only parses its advertisement. Mitigation: explicitly out of scope. Revisit only if a future feature genuinely requires classic encrypted RAOP, which would be net-new research with no precedent.

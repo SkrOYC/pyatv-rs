@@ -1,0 +1,14 @@
+# Test runner configuration. See https://nexte.st/docs/configuration/
+
+[profile.ci]
+# Protocol tests will eventually touch real sockets and timing; one retry is not enough to
+# distinguish a flake from a failure, two is.
+retries = 2
+
+# Print a failing test's output as soon as it fails, and again in the final summary, so a CI log
+# does not have to be scrolled to find out what broke.
+failure-output = "immediate-final"
+
+# Run the whole suite even after a failure. A red build should tell you everything that is wrong in
+# one pass, not just the first thing.
+fail-fast = false

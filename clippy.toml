@@ -1,0 +1,19 @@
+# Product and protocol names that are camel-cased for branding reasons, not because they are Rust
+# items. Without this, `clippy::doc_markdown` demands backticks around every mention of "AirPlay" or
+# "HomePod" in prose, which makes the documentation harder to read rather than easier.
+# `".."` keeps clippy's own default list in addition to these.
+doc-valid-idents = [
+  "AirPlay",
+  "AirPort",
+  "AirPlay2",
+  "HomePod",
+  "HomePods",
+  "MediaRemote",
+  "RustCrypto",
+  "FairPlay",
+  "AirTunes",
+  "FairPlaySAPv25",
+  "ChaCha20",
+  "SRP6a",
+  "..",
+]

@@ -1,0 +1,31 @@
+[package]
+name = "pyatv-pairing"
+description = "Shared HAP crypto and pairing stack for pyatv-rs: TLV8, HKDF-SHA512, SRP6a, Ed25519/X25519, ChaCha20-Poly1305 session framing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aes = "0.9.2"
+aes-gcm = "0.11.1"
+bytes.workspace = true
+chacha20poly1305 = "0.11.0"
+ctr = "0.10.1"
+ed25519-dalek = "3.0.0"
+hex = "0.4.3"
+hkdf = "0.13.0"
+pyatv-core.workspace = true
+rand = "0.10.2"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+srp = "0.7.0-rc.3"
+subtle = "2.6.1"
+thiserror.workspace = true
+tracing.workspace = true
+x25519-dalek = "3.0.0"
