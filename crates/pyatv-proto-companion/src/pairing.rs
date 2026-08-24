@@ -29,7 +29,7 @@ use std::sync::Arc;
 use pyatv_core::consts::Protocol;
 use pyatv_core::interface::{BoxFuture, PairingHandler};
 use pyatv_core::models::BaseService;
-use pyatv_core::storage::{DeviceSettings, Storage};
+use pyatv_core::storage::Storage;
 use pyatv_pairing::HapCredentials;
 use tokio::sync::Mutex;
 
@@ -46,9 +46,10 @@ pub struct CompanionPairingOptions {
     /// The service being paired. Its `port` is the mDNS SRV port, never a hardcoded one.
     pub service: BaseService,
     /// Identifier the credentials are filed under in storage.
+    ///
+    /// Any of the device's per-protocol identifiers will do: storage matches a record against all
+    /// of them (`pyatv/storage/__init__.py:102-111`).
     pub device_identifier: String,
-    /// The device's advertised name, stored alongside the credentials for display.
-    pub device_name: Option<String>,
     /// The name this controller asks the device to display while pairing.
     pub setup: PairSetupOptionsCompanion,
 }
@@ -68,7 +69,6 @@ struct Session {
 pub struct CompanionPairingHandler {
     address: IpAddr,
     device_identifier: String,
-    device_name: Option<String>,
     setup: PairSetupOptionsCompanion,
     storage: Arc<dyn Storage>,
     session: Mutex<Session>,
@@ -81,7 +81,6 @@ impl CompanionPairingHandler {
         Self {
             address: options.address,
             device_identifier: options.device_identifier,
-            device_name: options.device_name,
             setup: options.setup,
             storage,
             session: Mutex::new(Session {
@@ -187,28 +186,18 @@ impl CompanionPairingHandler {
     ///
     /// Upstream sets `self.service.credentials` and
     /// `self._settings.protocols.companion.credentials` together (`pairing.py:58-67`); the second
-    /// is this. Settings for other protocols are read back and preserved rather than overwritten.
+    /// is this. Settings for other protocols are preserved rather than overwritten, and the record
+    /// is created if pairing is the first thing that has ever touched storage for this device.
     fn persist(&self, credentials: &str) -> pyatv_core::Result<()> {
-        let mut settings = self
-            .storage
-            .get_settings(&self.device_identifier)?
-            .unwrap_or_else(|| DeviceSettings {
-                identifier: self.device_identifier.clone(),
-                ..DeviceSettings::default()
-            });
-
-        if settings.name.is_none() {
-            settings.name.clone_from(&self.device_name);
-        }
-        settings
-            .protocols
-            .entry(Protocol::Companion)
-            .or_default()
-            .credentials = Some(credentials.to_owned());
-
         tracing::debug!(identifier = %self.device_identifier, "storing Companion credentials");
-        self.storage.set_settings(settings)?;
-        Ok(())
+        self.storage.store_credentials(
+            &self.device_identifier,
+            Protocol::Companion,
+            credentials,
+        )?;
+        // Nothing is written to disk until `save()`; a pairing that is not persisted is a pairing
+        // the user has to redo, so it happens here rather than being left to the caller.
+        self.storage.save()
     }
 }
 

@@ -21,13 +21,11 @@ use pyatv_pairing::hkdf_derive::transport::COMPANION;
 use pyatv_pairing::server::ReferenceAccessory;
 use pyatv_pairing::tlv8::Tlv8;
 use pyatv_proto_companion::FrameType;
+
+use super::fake_state::{DeviceState, Reply};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-
-/// The remote half of the composite session id, hardcoded upstream (`companion.py:480`). It has no
-/// protocol meaning; it is an arbitrary test constant kept so both fixtures agree.
-pub const REMOTE_SID: u64 = 5555;
 
 /// The undocumented extra TLV pyatv's reference server puts in its pair-setup M2
 /// (`server_auth.py:150`) and its client ignores.
@@ -38,23 +36,6 @@ pub const REMOTE_SID: u64 = 5555;
 /// single byte. Its meaning is still unknown, but it is genuinely on the wire, so the fixture emits
 /// it and the client is proven to tolerate an unrecognised tag rather than merely assumed to.
 const MYSTERY_TAG: u8 = 27;
-
-/// What the device observed, for a test to assert on.
-#[derive(Debug, Default)]
-pub struct DeviceState {
-    /// Whether a pair-setup completed.
-    pub has_paired: bool,
-    /// The `_systemInfo` content the client sent, if any.
-    pub system_info: Option<Value>,
-    /// The `_sid` the client proposed in `_sessionStart`.
-    pub local_sid: Option<u64>,
-    /// Every command identifier the client sent, in order.
-    pub commands: Vec<String>,
-    /// Event names the client registered interest in.
-    pub interests: Vec<String>,
-    /// Whether the client's traffic was encrypted by the time it arrived.
-    pub saw_encrypted_traffic: bool,
-}
 
 /// A running fake device. Dropping it stops the accept loop.
 #[derive(Debug)]
@@ -307,7 +288,10 @@ impl Connection {
         true
     }
 
-    /// The handful of `_i` handlers bring-up needs (`companion.py:414-521`).
+    /// Route one message to [`DeviceState`] and send whatever it asked for.
+    ///
+    /// The handlers themselves are pure; this only owns the socket. `data_received`'s dispatch
+    /// (`companion.py:296-305`) plus the `send_response`/`send_error`/`send_event` trio it calls.
     async fn handle_command(&mut self, request: &Value) {
         let identifier = request
             .get("_i")
@@ -317,41 +301,32 @@ impl Connection {
         let content = request.get("_c").cloned().unwrap_or(opack! {});
         let is_event = request.get("_t").and_then(Value::as_u64) == Some(1);
 
-        {
-            let mut state = self.state.lock().await;
-            state.commands.push(identifier.clone());
-            match identifier.as_str() {
-                "_systemInfo" => state.system_info = Some(content.clone()),
-                "_sessionStart" => state.local_sid = content.get("_sid").and_then(Value::as_u64),
-                _ => {}
+        let replies = self
+            .state
+            .lock()
+            .await
+            .handle(&identifier, &content, is_event);
+
+        for reply in replies {
+            match reply {
+                Reply::Response(content) => self.send_response(request, content).await,
+                Reply::Error(message, code) => self.send_error(request, &message, code).await,
+                Reply::Event(name, content) => self.send_event(name, &content).await,
+                Reply::Nothing => {}
             }
         }
+    }
 
-        if is_event {
-            if identifier == "_interest"
-                && let Some(events) = content.get("_regEvents").and_then(Value::as_array)
-            {
-                let mut state = self.state.lock().await;
-                for event in events.iter().filter_map(Value::as_str) {
-                    state.interests.push(event.to_owned());
-                }
-            }
-            // Events are never answered.
-            return;
-        }
-
-        let response = match identifier.as_str() {
-            "_systemInfo" | "_touchStart" | "_tiStart" => Ok(opack! {}),
-            "_sessionStart" => Ok(opack! { "_sid" => REMOTE_SID }),
-            "TVRCSessionStart" => Ok(content),
-            // `send_handler_not_supported` (`companion.py:346-348`).
-            _ => Err(("No request handler", 58822u64)),
+    /// `send_event` (`companion.py:320-329`). Upstream stamps an arbitrary `_x` on outbound events
+    /// and the client ignores it; the same constant is used here so the wire shape matches.
+    async fn send_event(&mut self, identifier: &str, content: &Value) {
+        let value = opack! {
+            "_i" => identifier,
+            "_x" => 1234u64,
+            "_t" => 1u64,
+            "_c" => content.clone(),
         };
-
-        match response {
-            Ok(content) => self.send_response(request, content).await,
-            Err((message, code)) => self.send_error(request, message, code).await,
-        }
+        self.send(FrameType::EOpack, &value).await;
     }
 
     /// `send_response` (`companion.py:309-318`).

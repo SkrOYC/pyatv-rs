@@ -1,223 +1,175 @@
 //! Persistent settings and credentials.
 //!
-//! Equivalent to `pyatv/storage/`. Since pyatv v0.14.0 a successful pairing writes its credentials
-//! straight into storage, so callers never handle credential strings by hand; this port keeps that
-//! contract. The on-disk shape is a JSON document holding one [`DeviceSettings`] per device
-//! identifier, so a file written here stays readable by pyatv's own `FileStorage` and vice versa.
+//! Ports `pyatv/storage/`, and deliberately ports it byte-for-byte: the document written here is
+//! the same `~/.pyatv.conf` pyatv writes, so a user who has already paired with pyatv keeps their
+//! credentials, and one who pairs here can go back. The shape is defined in [`settings`], the
+//! shared logic in [`core`](self::core), and the two backends in [`file`] and [`memory`].
 //!
-//! The trait is deliberately synchronous. pyatv's storage API is `async` only because Python's
-//! ecosystem forces `aiofiles` on anyone who touches a file from an event loop; a credential store
-//! is read once at connect time and written once at pair time, so blocking `std::fs` inside a
-//! `spawn_blocking` at the call site is simpler than making the whole trait return futures.
+//! ```text
+//! StorageModel { version: 1, devices: [Settings] }
+//!   Settings { info: InfoSettings, protocols: ProtocolSettings }
+//!     ProtocolSettings { airplay, companion, dmap, mrp, raop }
+//! ```
+//!
+//! Since pyatv v0.14.0 a successful pairing writes its credentials straight into storage, so
+//! callers never handle credential strings by hand; this port keeps that contract.
+//!
+//! # Two deliberate differences from upstream
+//!
+//! **The trait is synchronous.** pyatv's storage API is `async` only because Python's ecosystem
+//! forces `run_in_executor` on anyone who touches a file from an event loop; a credential store is
+//! read once at connect time and written once at pair time, so blocking `std::fs` — inside a
+//! `spawn_blocking` at the call site, if the caller cares — is simpler than making every method
+//! return a future and forcing an `async_trait`-shaped allocation on implementors.
+//!
+//! **`get_settings` returns a clone.** Upstream returns a live reference into the store and lets
+//! callers mutate it in place (`pyatv/storage/__init__.py:86-90`). A `&self` method behind a lock
+//! cannot lend that reference out, so a modified record goes back through
+//! [`Storage::set_settings`], and the common case — a pairing handler filing one credential
+//! string — has [`Storage::store_credentials`] to do both halves.
+//!
+//! # Lifecycle
+//!
+//! Nothing is read or written implicitly. Call [`Storage::load`] once at start up and
+//! [`Storage::save`] once at exit, which is exactly what `atvremote` does
+//! (`pyatv/scripts/atvremote.py:715-736`). In between, every operation is in memory, and `save`
+//! is a no-op when nothing changed.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+pub mod core;
+pub mod file;
+pub mod json;
+pub mod memory;
+pub mod protocols;
+pub mod settings;
 
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::consts::Protocol;
-use crate::error::Error;
+use crate::models::BaseConfig;
 
-/// Per-protocol settings and credentials for one device.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProtocolSettings {
-    /// Credentials in pyatv's colon-separated lowercase-hex format.
-    pub credentials: Option<String>,
-    /// Password for services that demand one.
-    pub password: Option<String>,
-}
+pub use file::FileStorage;
+pub use memory::MemoryStorage;
+pub use protocols::{
+    AirPlaySettings, CompanionSettings, DmapSettings, MrpSettings, ProtocolSettings, RaopSettings,
+};
+pub use settings::{InfoSettings, MrpTunnel, Settings};
 
-/// Everything persisted about a single device.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceSettings {
-    /// Stable device identifier this record is keyed by.
-    pub identifier: String,
-    /// Last known human-readable name, for display only.
-    pub name: Option<String>,
-    /// Settings per protocol.
-    pub protocols: HashMap<Protocol, ProtocolSettings>,
-}
+/// Schema version this build reads and writes.
+///
+/// `MODEL_VERSION` (`pyatv/storage/__init__.py:22`). A document with any other version is refused
+/// rather than guessed at.
+pub const MODEL_VERSION: u32 = 1;
 
-/// The whole persisted document.
+/// The document a backend persists.
+///
+/// Ports `StorageModel` (`pyatv/storage/__init__.py:36-40`). Both fields are required on load:
+/// upstream's model declares them without defaults, so a file missing either is invalid.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageModel {
-    /// Schema version, so a future format change can migrate rather than fail.
+    /// Schema version, checked against [`MODEL_VERSION`] on load.
     pub version: u32,
     /// One record per known device.
-    pub devices: Vec<DeviceSettings>,
+    pub devices: Vec<Settings>,
 }
 
 /// Reads and writes device settings.
-pub trait Storage: Send + Sync + std::fmt::Debug {
-    /// Load the settings for one device, or `None` if nothing is stored for it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Storage`] if the backing store could not be read or parsed.
-    fn get_settings(&self, identifier: &str) -> Result<Option<DeviceSettings>>;
-
-    /// Insert or replace the settings for one device and persist immediately.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Storage`] if the backing store could not be written.
-    fn set_settings(&self, settings: DeviceSettings) -> Result<()>;
-
-    /// Every device the store knows about.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Storage`] if the backing store could not be read or parsed.
-    fn all_settings(&self) -> Result<Vec<DeviceSettings>>;
-}
-
-/// A [`Storage`] that keeps nothing beyond the current process.
 ///
-/// The default when a caller does not supply one, matching pyatv's `MemoryStorage`.
-#[derive(Debug, Default)]
-pub struct MemoryStorage {
-    devices: std::sync::Mutex<HashMap<String, DeviceSettings>>,
-}
-
-impl MemoryStorage {
-    /// An empty in-memory store.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, DeviceSettings>>> {
-        self.devices
-            .lock()
-            .map_err(|_| Error::Storage("in-memory storage mutex was poisoned".to_owned()))
-    }
-}
-
-impl Storage for MemoryStorage {
-    fn get_settings(&self, identifier: &str) -> Result<Option<DeviceSettings>> {
-        Ok(self.lock()?.get(identifier).cloned())
-    }
-
-    fn set_settings(&self, settings: DeviceSettings) -> Result<()> {
-        self.lock()?.insert(settings.identifier.clone(), settings);
-        Ok(())
-    }
-
-    fn all_settings(&self) -> Result<Vec<DeviceSettings>> {
-        Ok(self.lock()?.values().cloned().collect())
-    }
-}
-
-/// Current on-disk schema version written by [`FileStorage`].
-pub const STORAGE_VERSION: u32 = 1;
-
-/// A [`Storage`] backed by a JSON file, equivalent to pyatv's `FileStorage`.
-#[derive(Debug)]
-pub struct FileStorage {
-    path: PathBuf,
-}
-
-impl FileStorage {
-    /// Use `path` as the backing file. The file is created on first write; a missing file reads as
-    /// an empty store.
-    #[must_use]
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-
-    /// The conventional per-user location, `$HOME/.pyatv.conf`, matching pyatv's default so the two
-    /// implementations can share a credential file.
+/// Ports the `Storage` abstract base class (`pyatv/interface.py:1470-1511`) plus the two
+/// identifier-keyed helpers this port needs in place of upstream's live references, described in
+/// the module docs.
+pub trait Storage: Send + Sync + std::fmt::Debug {
+    /// Read the backing store into memory.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Storage`] if no home directory could be determined.
-    pub fn default_path() -> Result<PathBuf> {
-        // TODO(step-1): fall back to the platform config directory on Windows, where pyatv uses
-        // `%USERPROFILE%`. Reading `HOME` alone is correct on Linux and macOS only.
-        std::env::var_os("HOME")
-            .map(|home| Path::new(&home).join(".pyatv.conf"))
-            .ok_or_else(|| Error::Storage("HOME is not set".to_owned()))
-    }
+    /// Returns [`crate::Error::Storage`] if the document could not be parsed or its version is not
+    /// [`MODEL_VERSION`], or [`crate::Error::Io`] if it could not be read.
+    fn load(&self) -> Result<()>;
 
-    fn read(&self) -> Result<StorageModel> {
-        match std::fs::read(&self.path) {
-            Ok(raw) => serde_json::from_slice(&raw)
-                .map_err(|error| Error::Storage(format!("could not parse settings file: {error}"))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(StorageModel {
-                version: STORAGE_VERSION,
-                devices: Vec::new(),
-            }),
-            Err(error) => Err(Error::Io(error)),
-        }
-    }
+    /// Write the in-memory settings back, if anything changed since the last save.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Io`] if the document could not be written.
+    fn save(&self) -> Result<()>;
 
-    fn write(&self, model: &StorageModel) -> Result<()> {
-        let raw = serde_json::to_vec_pretty(model)
-            .map_err(|error| Error::Storage(format!("could not serialise settings: {error}")))?;
+    /// Settings for every known device.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Storage`] if the store could not be read.
+    fn settings(&self) -> Result<Vec<Settings>>;
 
-        // TODO(step-1): write to a sibling temporary file and rename over the target so a crash
-        // mid-write cannot lose a user's credentials.
-        std::fs::write(&self.path, raw).map_err(Error::Io)
-    }
-}
+    /// Settings for one device, created on the spot if this is the first time it is seen.
+    ///
+    /// A config matches a record when any one of its per-protocol identifiers matches any
+    /// identifier the record holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::DeviceIdMissing`] if the config has no identifier — which is the
+    /// case for a device that has not been discovered, since identifiers come from mDNS.
+    fn get_settings(&self, config: &BaseConfig) -> Result<Settings>;
 
-impl Storage for FileStorage {
-    fn get_settings(&self, identifier: &str) -> Result<Option<DeviceSettings>> {
-        Ok(self
-            .read()?
-            .devices
-            .into_iter()
-            .find(|device| device.identifier == identifier))
-    }
+    /// The record filed under `identifier`, matched against every protocol's identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Storage`] if the store could not be read.
+    fn find_settings(&self, identifier: &str) -> Result<Option<Settings>>;
 
-    fn set_settings(&self, settings: DeviceSettings) -> Result<()> {
-        let mut model = self.read()?;
-        model.version = STORAGE_VERSION;
-        match model
-            .devices
-            .iter_mut()
-            .find(|device| device.identifier == settings.identifier)
-        {
-            Some(existing) => *existing = settings,
-            None => model.devices.push(settings),
-        }
-        self.write(&model)
-    }
+    /// File a record back, replacing whichever record shares an identifier with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Storage`] if the store could not be written.
+    fn set_settings(&self, settings: Settings) -> Result<()>;
 
-    fn all_settings(&self) -> Result<Vec<DeviceSettings>> {
-        Ok(self.read()?.devices)
-    }
-}
+    /// Copy credentials, passwords and identifiers out of a config and into storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::DeviceIdMissing`] if the config has no identifier.
+    fn update_settings(&self, config: &BaseConfig) -> Result<()>;
 
-#[cfg(test)]
-mod tests {
-    use super::{DeviceSettings, MemoryStorage, ProtocolSettings, Storage};
-    use crate::consts::Protocol;
+    /// Forget a device, reporting whether there was anything to forget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Storage`] if the store could not be written.
+    fn remove_settings(&self, settings: &Settings) -> Result<bool>;
 
-    #[test]
-    fn memory_storage_round_trips_credentials() {
-        let storage = MemoryStorage::new();
-        let mut settings = DeviceSettings {
-            identifier: "AA:BB:CC:DD:EE:FF".to_owned(),
-            name: Some("Living Room".to_owned()),
-            ..DeviceSettings::default()
-        };
-        settings.protocols.insert(
-            Protocol::Mrp,
-            ProtocolSettings {
-                credentials: Some("aabb:ccdd:eeff:0011".to_owned()),
-                password: None,
-            },
-        );
+    /// Store one protocol's credentials for the device known by `identifier`.
+    ///
+    /// What a pairing handler calls on success. Upstream instead assigns to the live `Settings`
+    /// object it was constructed with (`pyatv/protocols/companion/pairing.py:66`,
+    /// `pyatv/protocols/airplay/pairing.py:80-84`); this is the same effect through a `&self`
+    /// API. If the device is not yet known — pairing can be the first thing that ever touches
+    /// storage — a record is created with `identifier` filed under `protocol`.
+    ///
+    /// Like every other method here it does not persist on its own; call [`Storage::save`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Storage`] if the store could not be read or written.
+    fn store_credentials(
+        &self,
+        identifier: &str,
+        protocol: Protocol,
+        credentials: &str,
+    ) -> Result<()> {
+        let mut settings = self.find_settings(identifier)?.unwrap_or_else(|| {
+            let mut settings = Settings::default();
+            settings
+                .protocols
+                .set_identifier(protocol, Some(identifier.to_owned()));
+            settings
+        });
 
-        storage.set_settings(settings.clone()).unwrap();
-
-        assert_eq!(
-            storage.get_settings("AA:BB:CC:DD:EE:FF").unwrap(),
-            Some(settings)
-        );
-        assert_eq!(storage.get_settings("unknown").unwrap(), None);
-        assert_eq!(storage.all_settings().unwrap().len(), 1);
+        settings
+            .protocols
+            .set_credentials(protocol, Some(credentials.to_owned()));
+        self.set_settings(settings)
     }
 }

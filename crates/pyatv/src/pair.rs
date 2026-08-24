@@ -28,8 +28,9 @@ use pyatv_proto_companion::{CompanionPairingHandler, CompanionPairingOptions};
 /// # Errors
 ///
 /// Returns [`Error::NoService`] if the device does not advertise the requested protocol,
-/// [`Error::NotSupported`] if the device has no stable identifier to file credentials under, or
-/// [`Error::UnsupportedProtocol`] if pairing is not implemented for the protocol yet.
+/// [`Error::DeviceIdMissing`] if the device has no stable identifier to file credentials under,
+/// [`Error::Storage`] if the settings could not be read, or [`Error::UnsupportedProtocol`] if
+/// pairing is not implemented for the protocol yet.
 ///
 /// # Examples
 ///
@@ -56,10 +57,16 @@ pub async fn pair(
 
     let device_identifier = config
         .identifier()
-        .ok_or_else(|| {
-            Error::NotSupported("device has no identifier to store credentials under".to_owned())
-        })?
+        .ok_or_else(|| Error::DeviceIdMissing(config.name.clone()))?
         .to_owned();
+
+    // `pyatv/__init__.py:181` looks the settings up before the exchange starts and hands the
+    // resulting object to the handler. Here the handler reaches storage through the identifier
+    // instead (see `pyatv_core::storage`), so the record itself is not needed — but the lookup
+    // still has to happen, because it is what files a never-before-seen device under *all* of its
+    // per-protocol identifiers. Without it the credentials would land on a record carrying only
+    // the one identifier pairing happened to use.
+    let _settings = storage.get_settings(config)?;
 
     match protocol {
         Protocol::AirPlay | Protocol::Raop => {
@@ -79,7 +86,6 @@ pub async fn pair(
                     service: service.clone(),
                     airplay_version,
                     device_identifier,
-                    device_name: Some(config.name.clone()),
                 },
                 storage,
             )))
@@ -96,7 +102,6 @@ pub async fn pair(
                     address: config.address,
                     service: service.clone(),
                     device_identifier,
-                    device_name: Some(config.name.clone()),
                     // The name the device shows on screen while asking for the PIN. Upstream
                     // defaults it to `"pyatv"` and lets a caller override it through
                     // `pyatv.pair(..., name=...)` (`pyatv/protocols/companion/pairing.py:24`);

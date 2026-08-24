@@ -21,7 +21,8 @@ use pyatv_pairing::{AuthenticationType, HapCredentials};
 use pyatv_proto_companion::pairing::{CompanionPairingHandler, CompanionPairingOptions, verify};
 use pyatv_proto_companion::session::{SystemInfo, begin_session};
 
-use support::fake_companion::{FakeCompanionDevice, REMOTE_SID};
+use support::fake_companion::FakeCompanionDevice;
+use support::fake_state::REMOTE_SID;
 
 /// The identifier a paired device is filed under in storage.
 const DEVICE_IDENTIFIER: &str = "AA:BB:CC:DD:EE:FF";
@@ -38,7 +39,6 @@ fn handler(device: &FakeCompanionDevice, storage: Arc<dyn Storage>) -> Companion
             address: device.address().ip(),
             service,
             device_identifier: DEVICE_IDENTIFIER.to_owned(),
-            device_name: Some("Fake Companion ATV".to_owned()),
             setup: pyatv_proto_companion::auth::PairSetupOptionsCompanion::default(),
         },
         storage,
@@ -87,14 +87,11 @@ async fn correct_pin_pairs_and_stores_credentials() {
 
     // And storage holds the same string, under this device's identifier and the Companion slot.
     let stored = storage
-        .get_settings(DEVICE_IDENTIFIER)
+        .find_settings(DEVICE_IDENTIFIER)
         .expect("storage must be readable")
         .expect("a settings record must have been written");
-    assert_eq!(stored.name.as_deref(), Some("Fake Companion ATV"));
     assert_eq!(
-        stored.protocols[&Protocol::Companion]
-            .credentials
-            .as_deref(),
+        stored.protocols.credentials(Protocol::Companion),
         Some(credentials.as_str())
     );
 
@@ -218,7 +215,7 @@ async fn wrong_pin_fails_and_stores_nothing() {
     assert!(handler.service().credentials.is_none());
     assert!(
         storage
-            .get_settings(DEVICE_IDENTIFIER)
+            .find_settings(DEVICE_IDENTIFIER)
             .expect("storage must be readable")
             .is_none(),
         "a failed pairing must not write credentials"

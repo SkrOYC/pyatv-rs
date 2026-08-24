@@ -85,6 +85,14 @@ pub enum Error {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// A device configuration carries no identifier, so it cannot be filed in storage.
+    ///
+    /// `DeviceIdMissingError` (`pyatv/exceptions.py`), raised by
+    /// [`crate::storage::Storage::get_settings`]. Identifiers come from mDNS, so this means the
+    /// device was hand-built rather than discovered.
+    #[error("no identifier for device {0}")]
+    DeviceIdMissing(String),
+
     /// Underlying I/O failure.
     #[error("i/o error")]
     Io(#[from] std::io::Error),

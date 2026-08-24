@@ -125,6 +125,34 @@ pub trait PairingHandler: Send + Sync + std::fmt::Debug {
     fn close(&self) -> BoxFuture<'_, Result<()>>;
 }
 
+/// One protocol connection's teardown hook, filed into the facade at setup time.
+///
+/// Ports the `close` callable in upstream's `SetupData` (`pyatv/core/__init__.py`), which
+/// `FacadeAppleTV.close()` collects from every connected protocol and awaits
+/// (`pyatv/core/facade.py:785-802`). A separate trait rather than a boxed closure so the handle
+/// stays `Debug`, which `missing_debug_implementations` requires of everything public here.
+pub trait ProtocolHandle: Send + Sync + std::fmt::Debug {
+    /// Tear this protocol's connection down. Must be safe to call more than once.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the protocol's own teardown reports; the facade logs and continues rather
+    /// than letting one protocol's failure abort the rest.
+    fn close(&self) -> BoxFuture<'_, Result<()>>;
+}
+
+/// Notified when a connection the caller did not close goes away.
+///
+/// Ports `pyatv.interface.DeviceListener` (`pyatv/interface.py:302-318`). Upstream holds listeners
+/// weakly through `StateProducer`; here the caller owns the `Arc` and the facade holds a
+/// [`std::sync::Weak`], so forgetting to unregister cannot keep a listener alive forever.
+pub trait DeviceListener: Send + Sync + std::fmt::Debug {
+    /// The connection dropped without the caller asking for it.
+    fn connection_lost(&self, reason: &str);
+    /// The connection was closed on request.
+    fn connection_closed(&self);
+}
+
 /// Helper for protocol crates: the error every unimplemented capability should return.
 #[must_use]
 pub fn not_supported(what: &str) -> Error {

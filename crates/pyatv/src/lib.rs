@@ -25,7 +25,10 @@ pub use pyatv_core::interface::{
     PushUpdater, RemoteControl, Stream, TouchGestures, UserAccounts,
 };
 pub use pyatv_core::models::Playing;
-pub use pyatv_core::storage::{DeviceSettings, FileStorage, MemoryStorage, Storage};
+pub use pyatv_core::storage::{
+    AirPlaySettings, CompanionSettings, DmapSettings, FileStorage, InfoSettings, MemoryStorage,
+    MrpSettings, MrpTunnel, ProtocolSettings, RaopSettings, Settings, Storage, StorageModel,
+};
 /// The curated public API, re-exported so callers need only depend on this crate.
 pub use pyatv_core::{
     App, ArtworkInfo, BaseConfig, BaseService, DeviceInfo, DeviceModel, DeviceState, Error,

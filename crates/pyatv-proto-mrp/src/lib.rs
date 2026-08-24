@@ -9,9 +9,12 @@
 //!
 //! ## Protobuf codegen
 //!
-//! pyatv carries 77 `.proto` files. They are not vendored yet, so there is no `build.rs`: `prost-build` and `protox` are declared as build dependencies and wired up in a later step. `docs/research/rust-crates.md` §3 selects `protox` over invoking `protoc` so the build stays pure Rust, while noting that protox does not claim full parity with every protoc extension and must be validated against the real corpus once it lands.
+//! pyatv's 77 `.proto` files are vendored verbatim under `proto/` (see `proto/README.md`) and compiled at build time by `protox` — a pure-Rust protobuf compiler, so the crate builds offline with no `protoc` binary — feeding `prost-build`. The generated messages and enums live in [`protobuf`], keeping pyatv's names.
+//!
+//! The one thing `prost` cannot do is proto2 extensions, which is exactly how MRP nests every concrete message inside the `ProtocolMessage` envelope. [`protobuf::extensions`] supplies that layer: a generated typed handle per extension, reading and writing the field directly on the serialised envelope. `docs/research/mrp-protobuf-spike.md` records the two toolchains that were measured and why this shape was chosen.
 
 pub mod error;
+pub mod protobuf;
 pub mod transport;
 pub mod variant;
 
@@ -20,8 +23,3 @@ pub use transport::{MrpTransport, TunnelTransport, direct::DirectTransport};
 
 /// Convenience alias for fallible MRP operations.
 pub type Result<T, E = Error> = core::result::Result<T, E>;
-
-// TODO(step-1): vendor pyatv's `pyatv/protocols/mrp/protobuf/*.proto` (77 files) under `proto/`,
-// add a `build.rs` that calls `protox::compile` and feeds `prost_build::compile_fds`, and expose
-// the generated types from a `protobuf` module here. See docs/research/rust-crates.md §3 and
-// docs/research/mrp-companion.md §1.3 for the message catalogue.

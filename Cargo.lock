@@ -1045,6 +1045,7 @@ name = "pyatv-core"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "getrandom 0.4.3",
  "serde",
  "serde_json",
  "thiserror",
@@ -1120,6 +1121,7 @@ name = "pyatv-proto-companion"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "plist",
  "pyatv-core",
  "pyatv-opack",
  "pyatv-pairing",
@@ -1145,11 +1147,15 @@ name = "pyatv-proto-mrp"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "heck",
+ "hex",
  "prost",
  "prost-build",
+ "prost-types",
  "protox",
  "pyatv-core",
  "pyatv-pairing",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

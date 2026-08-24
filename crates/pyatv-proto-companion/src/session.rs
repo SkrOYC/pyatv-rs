@@ -115,10 +115,24 @@ fn hex_identifier() -> String {
 }
 
 /// What bring-up established.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Session {
+    /// The `_tiStart` response content.
+    ///
+    /// Upstream dispatches it to the `"_tiStart"` event listeners rather than returning it
+    /// (`api.py:401-404`), which is how `CompanionKeyboard` learns its initial focus state from a
+    /// command response — its own comment concedes "`_tiStart` is actually a command that we
+    /// forward the response of" (`__init__.py:500-501`). Returning it is the same information
+    /// without the pretend event.
+    pub text_input: Value,
     /// The composite 64-bit session identifier `_sessionStop` must later quote back.
     pub sid: u64,
+    /// When `_touchStart` ran, which every later `_hidT` event reports `_ns` relative to.
+    ///
+    /// `self._base_timestamp = time.time_ns()` inside `_touch_start` (`api.py:464-466`): the
+    /// baseline is per touch session, not per process, so it is carried out of bring-up rather
+    /// than kept in a static.
+    pub touch_base: std::time::Instant,
 }
 
 /// Run the full bring-up chain on an encrypted connection.
@@ -143,6 +157,8 @@ pub async fn begin_session(protocol: &mut CompanionProtocol, info: &SystemInfo) 
         .await?;
 
     tracing::debug!("starting the Companion touch session");
+    // Taken before the command goes out, matching `_touch_start`'s own ordering (`api.py:464-466`).
+    let touch_base = std::time::Instant::now();
     protocol
         .send_command(
             "_touchStart",
@@ -167,7 +183,7 @@ pub async fn begin_session(protocol: &mut CompanionProtocol, info: &SystemInfo) 
     }
 
     tracing::debug!("starting the Companion text-input session");
-    protocol.send_command("_tiStart", opack! {}).await?;
+    let text_input = protocol.send_command("_tiStart", opack! {}).await?.content;
 
     // `subscribe_event` is an Event, not a Request: the device never answers it (`api.py:267-271`).
     protocol
@@ -177,7 +193,11 @@ pub async fn begin_session(protocol: &mut CompanionProtocol, info: &SystemInfo) 
         )
         .await?;
 
-    Ok(Session { sid })
+    Ok(Session {
+        text_input,
+        sid,
+        touch_base,
+    })
 }
 
 /// `_sessionStart`, and the 64-bit composite identifier it produces.

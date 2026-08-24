@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 bytes.workspace = true
+plist = { version = "1.10.0", default-features = false }
 pyatv-core.workspace = true
 pyatv-opack.workspace = true
 pyatv-pairing.workspace = true

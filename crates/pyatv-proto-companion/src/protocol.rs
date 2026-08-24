@@ -298,61 +298,94 @@ impl CompanionProtocol {
         }
 
         loop {
-            let frame = self.connection.recv_frame().await?;
-
-            // pyatv decodes every auth and OPACK frame and logs-and-drops anything that fails
-            // (`protocol.py:188-207`); a malformed frame must not kill a live connection.
-            let value = if frame.frame_type.is_auth() || frame.frame_type.is_opack() {
-                match pyatv_opack::unpack(&frame.payload) {
-                    Ok((value, _)) => value,
-                    Err(error) => {
-                        tracing::warn!(
-                            frame_type = ?frame.frame_type,
-                            %error,
-                            "dropping a Companion frame whose OPACK body did not decode"
-                        );
-                        continue;
-                    }
-                }
-            } else {
-                tracing::debug!(frame_type = ?frame.frame_type, "ignoring an unhandled frame type");
-                continue;
-            };
-
-            if frame.frame_type.is_auth() {
-                match awaiting {
-                    Awaiting::Auth(wanted) if wanted == frame.frame_type => return Ok(value),
-                    _ => tracing::warn!(
-                        frame_type = ?frame.frame_type,
-                        "no receiver for this auth frame"
-                    ),
-                }
-                continue;
-            }
-
-            let envelope = match Envelope::from_value(&value) {
-                Ok(envelope) => envelope,
-                Err(error) => {
-                    tracing::debug!(%error, "dropping an OPACK frame that is not a message");
-                    continue;
-                }
-            };
-
-            match envelope.message_type {
-                Some(MessageType::Event) => self.dispatch_event(envelope),
-                Some(MessageType::Response) => {
-                    if let Some(value) = self.dispatch_response(awaiting, &envelope, value) {
-                        return Ok(value);
-                    }
-                }
-                Some(MessageType::Request) | None => {
-                    tracing::warn!(
-                        message_type = ?envelope.message_type,
-                        "ignoring an OPACK frame with an unsupported message type"
-                    );
-                }
+            if let Some(value) = self.read_and_dispatch(Some(awaiting)).await? {
+                return Ok(value);
             }
         }
+    }
+
+    /// Read exactly one frame and dispatch it, without waiting for anything in particular.
+    ///
+    /// This is what lets a caller keep the socket drained while no exchange is in flight, so
+    /// device-pushed events (`_iMC`, `SystemStatus`, `_tiStarted`) arrive as they happen rather
+    /// than only when the next command is sent. pyatv gets this for free from `asyncio.Protocol`'s
+    /// always-running `data_received` callback (`connection.py:141-168`); this port has an owning
+    /// caller instead, so it needs an explicit idle read.
+    ///
+    /// # Cancellation
+    ///
+    /// Safe to drop mid-await, and therefore safe as a `tokio::select!` branch. The only await
+    /// point is [`CompanionConnection::recv_frame`], which is itself cancel-safe; everything after
+    /// it runs synchronously inside the same poll, so a frame can never be read and then lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] when the device hangs up, plus any framing or decryption failure.
+    pub async fn poll_once(&mut self) -> Result<()> {
+        self.read_and_dispatch(None).await.map(|_| ())
+    }
+
+    /// Read one frame, hand it to whoever it belongs to, and report whether it was the awaited one.
+    async fn read_and_dispatch(&mut self, awaiting: Option<Awaiting>) -> Result<Option<Value>> {
+        let frame = self.connection.recv_frame().await?;
+
+        // pyatv decodes every auth and OPACK frame and logs-and-drops anything that fails
+        // (`protocol.py:188-207`); a malformed frame must not kill a live connection.
+        let value = if frame.frame_type.is_auth() || frame.frame_type.is_opack() {
+            match pyatv_opack::unpack(&frame.payload) {
+                Ok((value, _)) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        frame_type = ?frame.frame_type,
+                        %error,
+                        "dropping a Companion frame whose OPACK body did not decode"
+                    );
+                    return Ok(None);
+                }
+            }
+        } else {
+            tracing::debug!(frame_type = ?frame.frame_type, "ignoring an unhandled frame type");
+            return Ok(None);
+        };
+
+        if frame.frame_type.is_auth() {
+            match awaiting {
+                Some(Awaiting::Auth(wanted)) if wanted == frame.frame_type => {
+                    return Ok(Some(value));
+                }
+                _ => tracing::warn!(
+                    frame_type = ?frame.frame_type,
+                    "no receiver for this auth frame"
+                ),
+            }
+            return Ok(None);
+        }
+
+        let envelope = match Envelope::from_value(&value) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                tracing::debug!(%error, "dropping an OPACK frame that is not a message");
+                return Ok(None);
+            }
+        };
+
+        match envelope.message_type {
+            Some(MessageType::Event) => self.dispatch_event(envelope),
+            Some(MessageType::Response) => {
+                if let Some(awaiting) = awaiting {
+                    return Ok(self.dispatch_response(awaiting, &envelope, value));
+                }
+                self.stash_response(&envelope, value);
+            }
+            Some(MessageType::Request) | None => {
+                tracing::warn!(
+                    message_type = ?envelope.message_type,
+                    "ignoring an OPACK frame with an unsupported message type"
+                );
+            }
+        }
+
+        Ok(None)
     }
 
     /// Hand an event to the caller's stream.
@@ -405,6 +438,16 @@ impl CompanionProtocol {
         );
         self.stash.insert(xid, value);
         None
+    }
+
+    /// Keep a response nobody is waiting for, for the idle-read path.
+    fn stash_response(&mut self, envelope: &Envelope, value: Value) {
+        let Some(xid) = envelope.xid else {
+            tracing::warn!("dropping a response with no XID");
+            return;
+        };
+        tracing::debug!(xid, "stashing a response that arrived while idle");
+        self.stash.insert(xid, value);
     }
 
     /// Close the connection and drop anything still queued (`stop`, `protocol.py:109-112`).

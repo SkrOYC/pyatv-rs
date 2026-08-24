@@ -17,7 +17,7 @@ use pyatv_core::airplay::AirPlayMajorVersion;
 use pyatv_core::consts::Protocol;
 use pyatv_core::interface::{BoxFuture, PairingHandler};
 use pyatv_core::models::BaseService;
-use pyatv_core::storage::{DeviceSettings, Storage};
+use pyatv_core::storage::Storage;
 use pyatv_pairing::AuthenticationType;
 use tokio::sync::Mutex;
 
@@ -35,9 +35,10 @@ pub struct AirPlayPairingOptions {
     /// Which exchange to run, from [`pyatv_core::airplay::get_protocol_version`].
     pub airplay_version: AirPlayMajorVersion,
     /// Identifier the credentials are filed under in storage.
+    ///
+    /// Any of the device's per-protocol identifiers will do: storage matches a record against all
+    /// of them (`pyatv/storage/__init__.py:102-111`).
     pub device_identifier: String,
-    /// The device's advertised name, stored alongside the credentials for display.
-    pub device_name: Option<String>,
 }
 
 /// Mutable state, behind one lock because the trait methods all take `&self`.
@@ -56,7 +57,6 @@ pub struct AirPlayPairingHandler {
     address: IpAddr,
     airplay_version: AirPlayMajorVersion,
     device_identifier: String,
-    device_name: Option<String>,
     storage: Arc<dyn Storage>,
     session: Mutex<Session>,
 }
@@ -69,7 +69,6 @@ impl AirPlayPairingHandler {
             address: options.address,
             airplay_version: options.airplay_version,
             device_identifier: options.device_identifier,
-            device_name: options.device_name,
             storage,
             session: Mutex::new(Session {
                 http: None,
@@ -137,31 +136,22 @@ impl AirPlayPairingHandler {
 
     /// Write the credentials into storage under this device's identifier.
     ///
-    /// Mirrors `pyatv/protocols/airplay/pairing.py:82-85`, which files them under the AirPlay slot
-    /// or the RAOP slot depending on which protocol the shared handler was invoked for, and
-    /// `pyatv/__init__.py:160` where the settings object came from storage in the first place.
-    /// Existing settings for other protocols are read back and preserved rather than overwritten.
+    /// Mirrors `pyatv/protocols/airplay/pairing.py:80-84`, which files them under the AirPlay slot
+    /// or the RAOP slot depending on which protocol the shared handler was invoked for. Settings
+    /// for the other protocols are preserved rather than overwritten, and the record is created if
+    /// pairing is the first thing that has ever touched storage for this device.
     fn persist(&self, protocol: Protocol, credentials: &str) -> pyatv_core::Result<()> {
-        let mut settings = self
-            .storage
-            .get_settings(&self.device_identifier)?
-            .unwrap_or_else(|| DeviceSettings {
-                identifier: self.device_identifier.clone(),
-                ..DeviceSettings::default()
-            });
-
-        if settings.name.is_none() {
-            settings.name.clone_from(&self.device_name);
-        }
-        settings.protocols.entry(protocol).or_default().credentials = Some(credentials.to_owned());
-
         tracing::debug!(
             identifier = %self.device_identifier,
             ?protocol,
             "storing credentials"
         );
-        self.storage.set_settings(settings)?;
-        Ok(())
+        self.storage
+            .store_credentials(&self.device_identifier, protocol, credentials)?;
+        // Nothing is written to disk until `save()`; a pairing that is not persisted is a pairing
+        // the user has to redo, so it happens here rather than being left to the caller. Upstream
+        // leaves it to `atvremote`'s exit path (`pyatv/scripts/atvremote.py:736`) instead.
+        self.storage.save()
     }
 }
 

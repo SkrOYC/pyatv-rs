@@ -242,6 +242,32 @@ impl DeviceInfo {
         self
     }
 
+    /// Fold another protocol's findings in, keeping every field this one already knows.
+    ///
+    /// Ports `dict_merge(devinfo, setup_data.device_info())` (`pyatv/core/facade.py:772`, and
+    /// `pyatv/support/collections.py::dict_merge`), which only inserts keys the target does not
+    /// already have. `pyatv::connect` sets protocols up in priority order, so "first writer wins"
+    /// is what makes the highest-priority protocol's answer the one that survives.
+    pub fn merge_from(&mut self, other: &Self) {
+        if self.operating_system == OperatingSystem::Unknown {
+            self.operating_system = other.operating_system;
+        }
+        if self.model == DeviceModel::Unknown {
+            self.model = other.model;
+        }
+
+        macro_rules! fill {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if self.$field.is_none() {
+                        self.$field.clone_from(&other.$field);
+                    }
+                )+
+            };
+        }
+        fill!(version, build_number, raw_model, mac, output_device_id);
+    }
+
     /// Operating system running on the device.
     ///
     /// Ports `pyatv/interface.py:983-1004`. When the device did not state its OS, it is guessed

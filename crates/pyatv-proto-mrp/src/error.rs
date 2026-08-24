@@ -12,6 +12,18 @@ pub enum Error {
     #[error("could not decode protobuf message: {0}")]
     Decode(String),
 
+    /// The bytes of a `ProtocolMessage` are not a well-formed protobuf message.
+    ///
+    /// Raised by the extension extractor, which walks the top-level fields itself because `prost`
+    /// discards everything it was not generated for. See `crate::protobuf::extensions`.
+    #[error("malformed protobuf field at offset {offset}: {reason}")]
+    WireFormat {
+        /// Byte offset of the offending field key within the message.
+        offset: usize,
+        /// What was wrong with it.
+        reason: &'static str,
+    },
+
     /// The device sent a message type this client does not handle.
     #[error("unhandled MRP message type {0}")]
     UnhandledMessage(i32),

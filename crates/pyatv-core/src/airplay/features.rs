@@ -186,15 +186,22 @@ pub enum AirPlayMajorVersion {
 /// The user's `AirPlay` version preference.
 ///
 /// Ports `pyatv/settings.py:49-59` (`AirPlayVersion`). It lives here rather than in a settings
-/// module because [`get_protocol_version`] is the only thing that reads it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// module because [`get_protocol_version`] reads it, but it is also
+/// [`crate::storage::RaopSettings::protocol_version`] — hence the serde spellings, which are
+/// upstream's enum *values* (`"auto"`, `"1"`, `"2"`) rather than its member names.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum AirPlayVersion {
     /// Decide from the advertised feature bits.
     #[default]
     Auto,
     /// Force `AirPlay` 1.
+    #[serde(rename = "1")]
     V1,
     /// Force `AirPlay` 2.
+    #[serde(rename = "2")]
     V2,
 }
 

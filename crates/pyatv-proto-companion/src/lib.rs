@@ -20,13 +20,17 @@
 //! - There is no 1024-byte chunking cap; a frame is however large its OPACK body serialises to, subject to the bound in [`codec::MAX_FRAME_PAYLOAD`] that this port adds and pyatv does not have.
 //! - A zero-length payload is never sealed, even mid-session.
 
+pub mod api;
 pub mod auth;
 pub mod codec;
 pub mod connection;
 pub mod error;
+pub mod facade;
 pub mod frame;
+pub mod keyed_archiver;
 pub mod message;
 pub mod pairing;
+pub mod plist_payloads;
 pub mod protocol;
 pub mod session;
 

@@ -152,6 +152,8 @@ pub enum FeatureName {
     StreamFile,
 
     // Keyboard.
+    /// Whether a text field currently has focus.
+    TextFocusState,
     /// Read the focused text field's contents.
     TextGet,
     /// Replace the focused text field's contents.
@@ -174,6 +176,171 @@ pub enum FeatureName {
     AccountList,
     /// Switch the active user account.
     SwitchAccount,
+
+    // PushUpdater.
+    /// Receive push-based now-playing updates.
+    PushUpdates,
+}
+
+impl FeatureName {
+    /// Every variant, in declaration order.
+    ///
+    /// Upstream iterates the enum itself — `for name in FeatureName` in
+    /// `Features.all_features` (`pyatv/interface.py:1088-1095`) — which Rust cannot do for a
+    /// plain enum without a derive. The list is hand-maintained; the test below asserts its
+    /// length against [`FeatureName::COUNT`] so adding a variant without extending it fails to
+    /// compile-and-test rather than silently dropping the feature from `atvremote features`.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Up,
+        Self::Down,
+        Self::Left,
+        Self::Right,
+        Self::Select,
+        Self::Menu,
+        Self::Home,
+        Self::HomeHold,
+        Self::TopMenu,
+        Self::Guide,
+        Self::ControlCenter,
+        Self::Screensaver,
+        Self::Play,
+        Self::PlayPause,
+        Self::Pause,
+        Self::Stop,
+        Self::Next,
+        Self::Previous,
+        Self::SkipForward,
+        Self::SkipBackward,
+        Self::SetPosition,
+        Self::SetShuffle,
+        Self::SetRepeat,
+        Self::ChannelUp,
+        Self::ChannelDown,
+        Self::Title,
+        Self::Artist,
+        Self::Album,
+        Self::Genre,
+        Self::TotalTime,
+        Self::Position,
+        Self::Shuffle,
+        Self::Repeat,
+        Self::SeriesName,
+        Self::SeasonNumber,
+        Self::EpisodeNumber,
+        Self::ContentIdentifier,
+        Self::ItunesStoreIdentifier,
+        Self::MediaType,
+        Self::DeviceState,
+        Self::Artwork,
+        Self::App,
+        Self::PowerState,
+        Self::TurnOn,
+        Self::TurnOff,
+        Self::AppList,
+        Self::LaunchApp,
+        Self::Volume,
+        Self::SetVolume,
+        Self::VolumeUp,
+        Self::VolumeDown,
+        Self::OutputDevices,
+        Self::PlayUrl,
+        Self::StreamFile,
+        Self::TextFocusState,
+        Self::TextGet,
+        Self::TextSet,
+        Self::TextAppend,
+        Self::TextClear,
+        Self::Swipe,
+        Self::Click,
+        Self::TouchAction,
+        Self::AccountList,
+        Self::SwitchAccount,
+        Self::PushUpdates,
+    ];
+
+    /// Number of variants in [`FeatureName::ALL`].
+    pub const COUNT: usize = 65;
+
+    /// The variant's name, as `atvremote features` prints it.
+    ///
+    /// Matches Python's `FeatureName.<x>.name`, which is what upstream's `features` command
+    /// formats with (`pyatv/scripts/atvremote.py:453`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "Up",
+            Self::Down => "Down",
+            Self::Left => "Left",
+            Self::Right => "Right",
+            Self::Select => "Select",
+            Self::Menu => "Menu",
+            Self::Home => "Home",
+            Self::HomeHold => "HomeHold",
+            Self::TopMenu => "TopMenu",
+            Self::Guide => "Guide",
+            Self::ControlCenter => "ControlCenter",
+            Self::Screensaver => "Screensaver",
+            Self::Play => "Play",
+            Self::PlayPause => "PlayPause",
+            Self::Pause => "Pause",
+            Self::Stop => "Stop",
+            Self::Next => "Next",
+            Self::Previous => "Previous",
+            Self::SkipForward => "SkipForward",
+            Self::SkipBackward => "SkipBackward",
+            Self::SetPosition => "SetPosition",
+            Self::SetShuffle => "SetShuffle",
+            Self::SetRepeat => "SetRepeat",
+            Self::ChannelUp => "ChannelUp",
+            Self::ChannelDown => "ChannelDown",
+            Self::Title => "Title",
+            Self::Artist => "Artist",
+            Self::Album => "Album",
+            Self::Genre => "Genre",
+            Self::TotalTime => "TotalTime",
+            Self::Position => "Position",
+            Self::Shuffle => "Shuffle",
+            Self::Repeat => "Repeat",
+            Self::SeriesName => "SeriesName",
+            Self::SeasonNumber => "SeasonNumber",
+            Self::EpisodeNumber => "EpisodeNumber",
+            Self::ContentIdentifier => "ContentIdentifier",
+            Self::ItunesStoreIdentifier => "ItunesStoreIdentifier",
+            Self::MediaType => "MediaType",
+            Self::DeviceState => "DeviceState",
+            Self::Artwork => "Artwork",
+            Self::App => "App",
+            Self::PowerState => "PowerState",
+            Self::TurnOn => "TurnOn",
+            Self::TurnOff => "TurnOff",
+            Self::AppList => "AppList",
+            Self::LaunchApp => "LaunchApp",
+            Self::Volume => "Volume",
+            Self::SetVolume => "SetVolume",
+            Self::VolumeUp => "VolumeUp",
+            Self::VolumeDown => "VolumeDown",
+            Self::OutputDevices => "OutputDevices",
+            Self::PlayUrl => "PlayUrl",
+            Self::StreamFile => "StreamFile",
+            Self::TextFocusState => "TextFocusState",
+            Self::TextGet => "TextGet",
+            Self::TextSet => "TextSet",
+            Self::TextAppend => "TextAppend",
+            Self::TextClear => "TextClear",
+            Self::Swipe => "Swipe",
+            Self::Click => "Click",
+            Self::TouchAction => "Action",
+            Self::AccountList => "AccountList",
+            Self::SwitchAccount => "SwitchAccount",
+            Self::PushUpdates => "PushUpdates",
+        }
+    }
+}
+
+impl std::fmt::Display for FeatureName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// The reported availability of one feature, plus an optional hint about why.
@@ -202,5 +369,55 @@ impl FeatureInfo {
             state: FeatureState::Unsupported,
             reason: None,
         }
+    }
+
+    /// A feature that is implemented but not usable in the device's current state.
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self {
+            state: FeatureState::Unavailable,
+            reason: None,
+        }
+    }
+}
+
+impl FeatureState {
+    /// The state's name, as `atvremote features` prints it.
+    ///
+    /// Matches Python's `FeatureState.<x>.name` (`pyatv/scripts/atvremote.py:453`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Unsupported => "Unsupported",
+            Self::Unavailable => "Unavailable",
+            Self::Available => "Available",
+        }
+    }
+}
+
+impl std::fmt::Display for FeatureState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FeatureName;
+    use std::collections::BTreeSet;
+
+    /// `ALL` is hand-maintained; a duplicate or a missing variant would silently distort
+    /// `atvremote features`.
+    #[test]
+    fn all_feature_names_are_unique_and_complete() {
+        let unique: BTreeSet<FeatureName> = FeatureName::ALL.into_iter().collect();
+        assert_eq!(unique.len(), FeatureName::COUNT);
+    }
+
+    #[test]
+    fn feature_names_render_with_upstreams_spelling() {
+        assert_eq!(FeatureName::TouchAction.to_string(), "Action");
+        assert_eq!(FeatureName::PlayPause.to_string(), "PlayPause");
     }
 }

@@ -28,6 +28,15 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub storage_filename: Option<PathBuf>,
 
+    /// Companion credentials, overriding whatever the settings file holds.
+    ///
+    /// Mirrors upstream's per-protocol `--<protocol>-credentials` group
+    /// (`pyatv/scripts/atvremote.py:649-654`), which lets a caller connect without a settings
+    /// file at all. Only the Companion one exists here so far, because Companion is the only
+    /// protocol `connect` wires up.
+    #[arg(long, global = true, value_name = "CREDENTIALS")]
+    pub companion_credentials: Option<String>,
+
     /// Print more detail. Repeat for more.
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -78,7 +87,13 @@ impl From<ProtocolArg> for pyatv::Protocol {
 }
 
 /// Top-level subcommands.
+///
+/// Named in `snake_case` rather than clap's default `kebab-case` because upstream's command names
+/// are its interface method names verbatim (`retrieve_commands`, `pyatv/scripts/atvremote.py:890`)
+/// — `app_list`, `device_info`, `power_state`. Someone moving between the two tools types the same
+/// thing.
 #[derive(Debug, Subcommand)]
+#[command(rename_all = "snake_case")]
 pub enum Command {
     /// Find devices on the local network.
     Scan,
@@ -140,4 +155,7 @@ pub enum Command {
         /// New volume as a percentage. Omit to read the current value.
         level: Option<f32>,
     },
+
+    /// Print the device's power state.
+    PowerState,
 }

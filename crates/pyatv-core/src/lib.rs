@@ -26,5 +26,6 @@ pub use consts::{
 pub use device_info::{DeviceInfo, DeviceInfoValue};
 pub use error::{Error, Result};
 pub use features::{FeatureInfo, FeatureName, FeatureState};
+pub use interface::{DeviceListener, ProtocolHandle};
 pub use models::{App, ArtworkInfo, BaseConfig, BaseService, UserAccount};
 pub use relayer::Relayer;

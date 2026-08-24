@@ -254,6 +254,27 @@ impl BaseConfig {
         self.services.iter().filter(|it| it.enabled)
     }
 
+    /// Apply persisted settings, so each service carries its stored credentials and password.
+    ///
+    /// Ports `pyatv/interface.py:1428-1440` (`BaseConfig.apply`) together with the
+    /// [`BaseService::apply`] it delegates to: a setting that is unset never clears a value the
+    /// config already has, so credentials passed on the command line survive a settings file that
+    /// has none. Protocols the device does not advertise are skipped.
+    ///
+    /// This is what `scan()` and `connect()` call after reading storage
+    /// (`pyatv/__init__.py:96-97,120-121`), and it is the reason a paired device needs no
+    /// credential arguments on later runs.
+    pub fn apply(&mut self, settings: &crate::storage::Settings) {
+        for protocol in Protocol::ALL {
+            let credentials = settings.protocols.credentials(protocol).map(str::to_owned);
+            let password = settings.protocols.password(protocol).map(str::to_owned);
+
+            if let Some(service) = self.get_service_mut(protocol) {
+                service.apply(credentials.as_deref(), password.as_deref());
+            }
+        }
+    }
+
     /// Set credentials on a protocol's service, reporting whether the protocol was present.
     ///
     /// Ports `pyatv/interface.py:1417-1423` (`BaseConfig.set_credentials`).
@@ -561,5 +582,56 @@ mod tests {
         .join("\n");
 
         assert_eq!(config().to_string(), expected);
+    }
+
+    #[test]
+    fn apply_puts_each_protocols_settings_on_its_own_service() {
+        let mut config = config();
+        config.add_service(service(Protocol::Companion, 49153, Some("companion-id")));
+        config.add_service(service(Protocol::Raop, 7000, Some("raop-id")));
+
+        let mut settings = crate::storage::Settings::default();
+        settings
+            .protocols
+            .set_credentials(Protocol::Companion, Some("companion-creds".to_owned()));
+        settings
+            .protocols
+            .set_credentials(Protocol::Raop, Some("raop-creds".to_owned()));
+        settings
+            .protocols
+            .set_password(Protocol::Raop, Some("hunter2".to_owned()));
+        // A protocol the device does not advertise must not invent a service.
+        settings
+            .protocols
+            .set_credentials(Protocol::Mrp, Some("mrp-creds".to_owned()));
+
+        config.apply(&settings);
+
+        let companion = config.get_service(Protocol::Companion).expect("service");
+        assert_eq!(companion.credentials.as_deref(), Some("companion-creds"));
+        assert_eq!(companion.password, None);
+
+        let raop = config.get_service(Protocol::Raop).expect("service");
+        assert_eq!(raop.credentials.as_deref(), Some("raop-creds"));
+        assert_eq!(raop.password.as_deref(), Some("hunter2"));
+
+        assert!(config.get_service(Protocol::Mrp).is_none());
+    }
+
+    #[test]
+    fn apply_never_clears_a_value_the_config_already_has() {
+        let mut config = config();
+        let mut companion = service(Protocol::Companion, 49153, Some("companion-id"));
+        companion.credentials = Some("from-the-command-line".to_owned());
+        config.add_service(companion);
+
+        config.apply(&crate::storage::Settings::default());
+
+        assert_eq!(
+            config
+                .get_service(Protocol::Companion)
+                .and_then(|it| it.credentials.as_deref()),
+            Some("from-the-command-line")
+        );
     }
 }

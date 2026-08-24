@@ -5,33 +5,66 @@
 //! [`FacadeAppleTV::add_protocol`] files each handle into the matching
 //! [`crate::relayer::Relayer`], and the assembled facade is what `pyatv::connect` hands back.
 //!
-//! See `docs/research/pyatv-architecture.md` §3 for the upstream `SetupData` contract and the
-//! per-capability priority ordering reproduced in [`FacadeAppleTV::new`].
+//! See `docs/research/pyatv-architecture.md` §3 for the upstream `SetupData` contract and §6 for
+//! the per-capability priority ordering reproduced in [`FacadeAppleTV::new`].
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+pub mod features;
+
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::Result;
 use crate::consts::Protocol;
-use crate::features::{FeatureInfo, FeatureName};
+use crate::features::FeatureName;
 use crate::interface::{
-    AppleTV, Apps, Audio, BoxFuture, Features, Keyboard, Metadata, Power, PushUpdater,
-    RemoteControl, Stream, TouchGestures, UserAccounts,
+    AppleTV, Apps, Audio, BoxFuture, DeviceListener, Features, Keyboard, Metadata, Power,
+    ProtocolHandle, PushUpdater, RemoteControl, Stream, TouchGestures, UserAccounts,
 };
 use crate::models::{BaseService, DeviceInfo};
 use crate::relayer::Relayer;
+
+pub use features::FacadeFeatures;
+
+/// The order every capability but [`Power`] resolves in.
+///
+/// `DEFAULT_PRIORITIES` verbatim (`pyatv/core/facade.py:37-43`). Upstream uses this one list for
+/// remote control, metadata, push updates, streaming, apps, audio, keyboard, gestures and
+/// accounts alike; only [`FacadeAppleTV`]'s power relayer overrides it.
+pub const DEFAULT_PRIORITIES: [Protocol; 5] = [
+    Protocol::Mrp,
+    Protocol::Dmap,
+    Protocol::Companion,
+    Protocol::AirPlay,
+    Protocol::Raop,
+];
+
+/// Power resolution order, preferring Companion.
+///
+/// `FacadePower.OVERRIDE_PRIORITIES` (`pyatv/core/facade.py:311-318`), whose own comment reads
+/// "Generally favor Companion as it implements power better than MRP".
+pub const POWER_PRIORITIES: [Protocol; 5] = [
+    Protocol::Companion,
+    Protocol::Mrp,
+    Protocol::Dmap,
+    Protocol::AirPlay,
+    Protocol::Raop,
+];
 
 /// What one protocol contributes to the facade once it has connected.
 ///
 /// Every capability handle is optional: DMAP has no [`Apps`], RAOP has no [`RemoteControl`], and so
 /// on. `features` is the set the protocol declares it *could* serve; live availability is resolved
-/// through [`Features::get_feature`] at call time.
+/// by asking `features_impl` at call time.
 #[derive(Debug, Default)]
 pub struct SetupData {
     /// Which protocol produced this data.
     pub protocol: Option<Protocol>,
     /// Features this protocol declares support for.
     pub features: BTreeSet<FeatureName>,
+    /// The protocol's own live feature reporting, consulted for anything in `features`.
+    pub features_impl: Option<Arc<dyn Features>>,
+    /// Teardown hook, awaited by [`AppleTV::close`].
+    pub handle: Option<Arc<dyn ProtocolHandle>>,
     /// Navigation and transport control, if implemented.
     pub remote_control: Option<Arc<dyn RemoteControl>>,
     /// Now-playing metadata, if implemented.
@@ -69,32 +102,35 @@ pub struct FacadeAppleTV {
     keyboard: Relayer<dyn Keyboard>,
     touch_gestures: Relayer<dyn TouchGestures>,
     user_accounts: Relayer<dyn UserAccounts>,
-    feature_owners: HashMap<FeatureName, Protocol>,
+    features: Arc<FacadeFeatures>,
+    handles: Vec<(Protocol, Arc<dyn ProtocolHandle>)>,
+    listeners: Mutex<Vec<Weak<dyn DeviceListener>>>,
     device_info: DeviceInfo,
     service: BaseService,
 }
 
 impl FacadeAppleTV {
     /// Build an empty facade for `service`, with pyatv's per-capability priority ordering.
-    ///
-    /// The orderings below come from `pyatv/core/facade.py`: MRP leads for anything interactive,
-    /// RAOP leads for audio because it owns the stream, and `AirPlay` leads for video streaming.
     #[must_use]
     pub fn new(service: BaseService) -> Self {
-        use Protocol::{AirPlay, Companion, Dmap, Mrp, Raop};
+        fn default<T: ?Sized>() -> Relayer<T> {
+            Relayer::new(DEFAULT_PRIORITIES.to_vec())
+        }
 
         Self {
-            remote_control: Relayer::new(vec![Mrp, Dmap, Companion]),
-            metadata: Relayer::new(vec![Mrp, Dmap, Raop]),
-            push_updater: Relayer::new(vec![Mrp, Dmap]),
-            stream: Relayer::new(vec![AirPlay, Raop]),
-            power: Relayer::new(vec![Companion, Mrp]),
-            apps: Relayer::new(vec![Companion]),
-            audio: Relayer::new(vec![Raop, Companion, Mrp]),
-            keyboard: Relayer::new(vec![Companion]),
-            touch_gestures: Relayer::new(vec![Companion, Mrp]),
-            user_accounts: Relayer::new(vec![Companion]),
-            feature_owners: HashMap::new(),
+            remote_control: default(),
+            metadata: default(),
+            push_updater: default(),
+            stream: default(),
+            power: Relayer::new(POWER_PRIORITIES.to_vec()),
+            apps: default(),
+            audio: default(),
+            keyboard: default(),
+            touch_gestures: default(),
+            user_accounts: default(),
+            features: Arc::new(FacadeFeatures::default()),
+            handles: Vec::new(),
+            listeners: Mutex::new(Vec::new()),
             device_info: DeviceInfo::default(),
             service,
         }
@@ -103,7 +139,8 @@ impl FacadeAppleTV {
     /// File one connected protocol's capability handles into the relayers.
     ///
     /// Called once per protocol by `pyatv::connect` after that protocol's own `connect()` reported
-    /// success. Protocols with nothing to contribute are skipped.
+    /// success, mirroring the body of `FacadeAppleTV.connect`'s setup loop
+    /// (`pyatv/core/facade.py:753-774`). Protocols with nothing to contribute are skipped.
     pub fn add_protocol(&mut self, data: SetupData) {
         let Some(protocol) = data.protocol else {
             return;
@@ -117,6 +154,8 @@ impl FacadeAppleTV {
             };
         }
 
+        let has_push_updater = data.push_updater.is_some();
+
         register!(remote_control);
         register!(metadata);
         register!(push_updater);
@@ -128,14 +167,37 @@ impl FacadeAppleTV {
         register!(touch_gestures);
         register!(user_accounts);
 
-        for feature in data.features {
-            self.feature_owners.entry(feature).or_insert(protocol);
+        // `Arc::get_mut` cannot fail here: `features()` is the only thing that clones the `Arc`,
+        // and it takes `&self` while this takes `&mut self`, so no clone can be outstanding.
+        if let Some(facade_features) = Arc::get_mut(&mut self.features) {
+            if let Some(features) = data.features_impl {
+                // `add_mapping` (`facade.py:274-284`): a feature is owned by the highest-priority
+                // protocol that declared it, and later registrations only win if they outrank the
+                // incumbent.
+                facade_features.add_mapping(protocol, &data.features, &features);
+            }
+            if has_push_updater {
+                facade_features.set_push_updates(true);
+            }
         }
 
-        // TODO(step-1): merge `data.device_info` field-by-field instead of last-writer-wins.
-        // pyatv unions every protocol's `DevInfoExtractor` output, preferring the most specific
-        // source per field (see docs/research/pyatv-architecture.md §3).
-        self.device_info = data.device_info;
+        if let Some(handle) = data.handle {
+            self.handles.push((protocol, handle));
+        }
+
+        // `dict_merge(devinfo, setup_data.device_info())` (`facade.py:772`): a key already set by
+        // a higher-priority protocol is never overwritten, since protocols are added in priority
+        // order by `pyatv::connect`.
+        self.device_info.merge_from(&data.device_info);
+    }
+
+    /// Register a listener notified when a connection drops.
+    ///
+    /// Held weakly, so a caller that drops its listener does not leak it.
+    pub fn add_listener(&self, listener: &Arc<dyn DeviceListener>) {
+        if let Ok(mut listeners) = self.listeners.lock() {
+            listeners.push(Arc::downgrade(listener));
+        }
     }
 
     /// Every protocol that contributed at least one capability.
@@ -152,7 +214,39 @@ impl FacadeAppleTV {
         protocols.extend(self.keyboard.protocols());
         protocols.extend(self.touch_gestures.protocols());
         protocols.extend(self.user_accounts.protocols());
+        protocols.extend(self.handles.iter().map(|(protocol, _)| *protocol));
         protocols
+    }
+
+    /// Whether any protocol registered anything at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty() && self.connected_protocols().is_empty()
+    }
+
+    /// Replace the merged device facts, for callers that know more than the protocols did.
+    pub fn set_device_info(&mut self, device_info: DeviceInfo) {
+        self.device_info = device_info;
+    }
+}
+
+impl DeviceListener for FacadeAppleTV {
+    /// Fan a protocol's connection loss out to every registered listener.
+    fn connection_lost(&self, reason: &str) {
+        tracing::debug!(reason, "a protocol connection was lost");
+        if let Ok(listeners) = self.listeners.lock() {
+            for listener in listeners.iter().filter_map(Weak::upgrade) {
+                listener.connection_lost(reason);
+            }
+        }
+    }
+
+    fn connection_closed(&self) {
+        if let Ok(listeners) = self.listeners.lock() {
+            for listener in listeners.iter().filter_map(Weak::upgrade) {
+                listener.connection_closed();
+            }
+        }
     }
 }
 
@@ -198,9 +292,7 @@ impl AppleTV for FacadeAppleTV {
     }
 
     fn features(&self) -> Arc<dyn Features> {
-        // TODO(step-1): return a `FacadeFeatures` that asks the owning protocol for live
-        // availability instead of reporting every declared feature as statically available.
-        todo!("FacadeAppleTV::features")
+        Arc::clone(&self.features) as Arc<dyn Features>
     }
 
     fn device_info(&self) -> &DeviceInfo {
@@ -211,51 +303,28 @@ impl AppleTV for FacadeAppleTV {
         &self.service
     }
 
+    /// Close every protocol in turn.
+    ///
+    /// Upstream collects a task per protocol and lets the caller await them all
+    /// (`facade.py:785-802`). Here they are awaited sequentially and a failure is logged rather
+    /// than returned, because one protocol refusing to shut down cleanly must not leave the others
+    /// connected. The first error is still reported so a caller can notice.
     fn close(&self) -> BoxFuture<'_, Result<()>> {
-        // TODO(step-1): fan out to every registered protocol's `close()` and join the results.
-        Box::pin(async { Ok(()) })
-    }
-}
+        Box::pin(async move {
+            if let Some(push_updater) = self.push_updater.main_instance() {
+                push_updater.stop();
+            }
 
-/// Static feature reporting driven purely by what each protocol declared at setup time.
-///
-/// A placeholder for pyatv's `FacadeFeatures`, which additionally consults the owning protocol at
-/// call time to distinguish [`crate::features::FeatureState::Available`] from
-/// [`crate::features::FeatureState::Unavailable`].
-#[derive(Debug, Default)]
-pub struct StaticFeatures {
-    declared: BTreeSet<FeatureName>,
-}
+            let mut first_error = None;
+            for (protocol, handle) in &self.handles {
+                if let Err(error) = handle.close().await {
+                    tracing::debug!(?protocol, %error, "a protocol did not close cleanly");
+                    first_error.get_or_insert(error);
+                }
+            }
 
-impl StaticFeatures {
-    /// Report `declared` as available and everything else as unsupported.
-    #[must_use]
-    pub fn new(declared: BTreeSet<FeatureName>) -> Self {
-        Self { declared }
-    }
-}
-
-impl Features for StaticFeatures {
-    fn get_feature(&self, feature: FeatureName) -> FeatureInfo {
-        if self.declared.contains(&feature) {
-            FeatureInfo::available()
-        } else {
-            FeatureInfo::unsupported()
-        }
-    }
-
-    fn all_features(&self, include_unsupported: bool) -> Vec<(FeatureName, FeatureInfo)> {
-        let declared = self
-            .declared
-            .iter()
-            .map(|feature| (*feature, FeatureInfo::available()));
-
-        if include_unsupported {
-            // TODO(step-1): enumerate every `FeatureName` variant once the enum stops growing;
-            // this needs either a `strum`-style derive or a hand-maintained `ALL` constant.
-            declared.collect()
-        } else {
-            declared.collect()
-        }
+            self.connection_closed();
+            first_error.map_or(Ok(()), Err)
+        })
     }
 }

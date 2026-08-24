@@ -39,7 +39,6 @@ fn handler(device: &FakeAirPlayDevice, storage: Arc<dyn Storage>) -> AirPlayPair
             // Every modern receiver is AirPlay 2, which is what selects HAP pair-setup.
             airplay_version: pyatv_core::airplay::AirPlayMajorVersion::V2,
             device_identifier: DEVICE_IDENTIFIER.to_owned(),
-            device_name: Some("Fake AirPlay ATV".to_owned()),
         },
         storage,
     )
@@ -80,12 +79,11 @@ async fn correct_pin_pairs_and_stores_credentials() {
 
     // And storage holds the same string, under this device's identifier and the AirPlay slot.
     let stored = storage
-        .get_settings(DEVICE_IDENTIFIER)
+        .find_settings(DEVICE_IDENTIFIER)
         .expect("storage must be readable")
         .expect("a settings record must have been written");
-    assert_eq!(stored.name.as_deref(), Some("Fake AirPlay ATV"));
     assert_eq!(
-        stored.protocols[&Protocol::AirPlay].credentials.as_deref(),
+        stored.protocols.credentials(Protocol::AirPlay),
         Some(credentials.as_str())
     );
 
@@ -159,7 +157,7 @@ async fn wrong_pin_fails_and_stores_nothing() {
     assert!(handler.service().credentials.is_none());
     assert!(
         storage
-            .get_settings(DEVICE_IDENTIFIER)
+            .find_settings(DEVICE_IDENTIFIER)
             .expect("storage must be readable")
             .is_none(),
         "a failed pairing must not write credentials"
