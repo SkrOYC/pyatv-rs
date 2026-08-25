@@ -224,7 +224,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        DEFAULT_KNOCK_TIMEOUT, EHOSTDOWN, KNOCK_PORTS, is_host_unreachable, knock, knocker,
+        DEFAULT_KNOCK_TIMEOUT, EHOSTDOWN, Error, KNOCK_PORTS, is_host_unreachable, knock, knocker,
     };
 
     const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -333,12 +333,23 @@ mod tests {
     }
 
     /// `test_knock_times_out`: a link-local address never answers, and that is not an error.
+    ///
+    /// Linux lets the SYN time out, which is the silence this test is about. macOS (as on the CI
+    /// runners) has no route for `169.254/16` without a link-local interface and fails the
+    /// connect immediately with `EHOSTUNREACH`, which is the *other* documented outcome — the
+    /// host-level abort covered by `only_host_level_failures_abort`. Either is acceptable here;
+    /// anything else (a refused connection surfacing, a panic) is not.
     #[tokio::test]
     async fn a_timed_out_knock_is_not_an_error() {
         let link_local = IpAddr::V4(Ipv4Addr::new(169, 254, 0, 1));
-        knock(link_local, &[1], Duration::from_millis(300))
-            .await
-            .expect("an unanswered knock is swallowed");
+        match knock(link_local, &[1], Duration::from_millis(300)).await {
+            Ok(()) => {}
+            Err(Error::Io(error)) => assert!(
+                is_host_unreachable(&error),
+                "only a host-level failure may surface, got {error}"
+            ),
+            Err(other) => panic!("unexpected error kind: {other}"),
+        }
     }
 
     /// `EHOSTUNREACH` and `EHOSTDOWN` abort; a refused connection does not.

@@ -1,0 +1,6 @@
+# Byte-exact fixtures (pyatv settings files, KAT JSON, captured bodies) are compared verbatim by
+# tests, so never let a Windows checkout rewrite line endings.
+* text=auto eol=lf
+*.png binary
+*.wav binary
+*.mp3 binary

@@ -289,6 +289,15 @@ async fn expect_silence(client: &UdpSocket, why: &str) {
 /// replies. One test binds it once and walks the phases in order; each phase's precondition is the
 /// previous phase's postcondition, which is also why the §6 rate limit only has to be waited out
 /// once.
+///
+/// Ignored on macOS: `multicast_pair` builds the querier with `mcast_socket`, which joins
+/// `224.0.0.251` on the loopback interface, and Darwin refuses `IP_ADD_MEMBERSHIP` on `lo0`
+/// (`EADDRNOTAVAIL`), so the fixture cannot be set up there. The decisions this test walks are
+/// also covered by the socket-free tests above; only the on-the-wire framing is Linux-only.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Darwin cannot join a multicast group on the loopback interface"
+)]
 #[tokio::test]
 async fn the_multicast_path_answers_over_a_socket() {
     let (responder, client, server) = multicast_pair()

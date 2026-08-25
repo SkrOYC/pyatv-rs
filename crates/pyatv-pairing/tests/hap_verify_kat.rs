@@ -10,7 +10,7 @@ use pyatv_pairing::{
     TransientPairSetup,
     hkdf_derive::{data_stream_salt, expand, pairing as salts, transport},
     srp_hap::{
-        PAIR_VERIFY_M2_NONCE, PAIR_VERIFY_M3_NONCE, open, seal, sign, verify_signature,
+        PAIR_VERIFY_M2_NONCE, PAIR_VERIFY_M3_NONCE, seal, sign, verify_signature,
         x25519_public_key, x25519_shared_secret,
     },
     tlv8::{Tlv8, TlvValue},
@@ -110,6 +110,10 @@ fn the_pair_verify_signed_payloads_are_mirrored() {
 #[cfg(feature = "test-server")]
 #[test]
 fn the_pair_verify_state_machine_reproduces_pyatvs_m3_and_transport_keys() {
+    // Only this feature-gated test opens M3, so the import lives here rather than at the top:
+    // `cargo hack --feature-powerset` checks the file without `test-server` too.
+    use pyatv_pairing::srp_hap::open;
+
     use pyatv_pairing::{HapCredentials, PairVerify};
 
     let kat = Kat::load();
