@@ -6,7 +6,7 @@
 //! [`pyatv_pairing::server::ReferenceAccessory`] with pyatv's fixed key material; this file adds
 //! only the Companion framing and the handful of `_i` handlers bring-up needs.
 //!
-//! Framing is re-derived here rather than reusing [`pyatv_proto_companion::codec`], exactly as
+//! Framing is re-derived here rather than reusing [`crate::codec`], exactly as
 //! upstream's fake device re-derives it rather than importing `connection.py`: a fixture that
 //! shares an implementation with the code under test cannot catch a bug in it. The arithmetic
 //! below is transcribed from `companion.py:256-306` directly.
@@ -14,13 +14,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::FrameType;
 use bytes::BytesMut;
 use pyatv_opack::{Value, opack};
 use pyatv_pairing::chacha::{AUTH_TAG_LENGTH, Chacha20Cipher};
 use pyatv_pairing::hkdf_derive::transport::COMPANION;
 use pyatv_pairing::server::ReferenceAccessory;
 use pyatv_pairing::tlv8::Tlv8;
-use pyatv_proto_companion::FrameType;
 
 use super::fake_state::{DeviceState, Reply};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

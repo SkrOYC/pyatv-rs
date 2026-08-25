@@ -38,6 +38,8 @@ pub mod playing;
 pub mod protobuf;
 pub mod protocol;
 pub mod state;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod transport;
 pub mod variant;
 

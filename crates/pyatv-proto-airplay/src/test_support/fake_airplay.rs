@@ -44,6 +44,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
+use super::fake_bridge::serve_data_bridge;
 use super::fake_channels::{bind_loopback, serve_data, serve_event};
 
 /// Content type every property-list body carries.
@@ -61,6 +62,11 @@ pub struct FakeOptions {
     pub timing_port: Option<u16>,
     /// A raw request to push at the controller once it dials the event port.
     pub event_probe: Option<Vec<u8>>,
+    /// Where to forward the data channel, instead of echoing it back.
+    ///
+    /// Point this at a hermetic MRP device's TCP address and the receiver becomes a real tunnel
+    /// rather than a mirror; see [`super::fake_bridge`].
+    pub data_bridge: Option<SocketAddr>,
 }
 
 impl Default for FakeOptions {
@@ -70,6 +76,7 @@ impl Default for FakeOptions {
             skip_record: None,
             timing_port: None,
             event_probe: None,
+            data_bridge: None,
         }
     }
 }
@@ -226,6 +233,7 @@ async fn serve(
 }
 
 /// One parsed request.
+#[derive(Debug)]
 pub struct FakeRequest {
     pub method: String,
     pub path: String,
@@ -391,7 +399,14 @@ async fn setup(
 
         let (listener, port) = bind_loopback().await;
         let state = Arc::clone(state);
-        tokio::spawn(async move { serve_data(listener, keys, state).await });
+        match options.data_bridge {
+            Some(device) => {
+                tokio::spawn(async move { serve_data_bridge(listener, keys, state, device).await });
+            }
+            None => {
+                tokio::spawn(async move { serve_data(listener, keys, state).await });
+            }
+        }
 
         let mut stream = plist::Dictionary::new();
         stream.insert("dataPort".to_owned(), u64::from(port).into());

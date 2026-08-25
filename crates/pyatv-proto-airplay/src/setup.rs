@@ -189,9 +189,12 @@ pub fn is_tunnel_supported(service: &BaseService, credentials: &HapCredentials) 
 /// Bring up a remote-control tunnel and hand back the channel MRP rides on.
 ///
 /// `_create_mrp_tunnel_data`'s `_connect_rc` (`__init__.py:268-285`) up to but not including
-/// `mrp_connect()`: connect, pair-verify, both `SETUP`s, both side channels, keepalive started.
-/// What the umbrella does next is attach an `MrpTransport` to the returned channel and run MRP's
-/// own bring-up over it.
+/// `session.start_keep_alive(...)` and `mrp_connect()`: connect, pair-verify, both `SETUP`s, both
+/// side channels. What the caller does next is
+/// [`Ap2Session::start_keep_alive`](crate::ap2::Ap2Session::start_keep_alive) — which is left here
+/// rather than done inside, because the `DeviceListener` a lost keepalive has to report to belongs
+/// to whoever is assembling the facade — and then attach an `MrpTransport` to the returned channel
+/// and run MRP's own bring-up over it.
 ///
 /// The session must be kept alive for as long as the channel is used — dropping it stops the
 /// `/feedback` keepalive, and a receiver drops the tunnel roughly thirty seconds later.

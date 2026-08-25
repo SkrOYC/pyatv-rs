@@ -5,7 +5,7 @@
 //! have produced — which is what makes reusing it for pair-verify a meaningful test rather than a
 //! round trip through this crate's own encoder.
 
-mod support;
+use pyatv_proto_mrp::test_support as support;
 
 use std::sync::Arc;
 

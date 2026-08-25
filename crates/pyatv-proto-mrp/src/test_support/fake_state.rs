@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::MrpMessage;
+use crate::protobuf::{Command, content_item_metadata, playback_state};
 use pyatv_core::consts::{InputAction, RepeatState, ShuffleState};
-use pyatv_proto_mrp::MrpMessage;
-use pyatv_proto_mrp::protobuf::{Command, content_item_metadata, playback_state};
 use tokio::sync::broadcast;
 
 use super::fake_messages as build;
@@ -324,7 +324,7 @@ impl FakeDeviceState {
 
     /// `FakeMrpState.volume_control` (`mrp.py:287-307`), both halves.
     pub fn volume_control(&self, available: bool, absolute: bool, relative: bool) {
-        use pyatv_proto_mrp::protobuf::volume_capabilities::Enum;
+        use crate::protobuf::volume_capabilities::Enum;
 
         let capabilities = match (absolute, relative) {
             (true, true) => Some(Enum::Both),

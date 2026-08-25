@@ -22,6 +22,7 @@ use pyatv_core::{BaseConfig, Error, Protocol, Result};
 use pyatv_proto_airplay::{AirPlayPairingHandler, AirPlayPairingOptions};
 use pyatv_proto_companion::auth::PairSetupOptionsCompanion;
 use pyatv_proto_companion::{CompanionPairingHandler, CompanionPairingOptions};
+use pyatv_proto_mrp::{MrpPairingHandler, MrpPairingOptions};
 
 /// Begin pairing with one protocol on a device.
 ///
@@ -61,12 +62,12 @@ pub async fn pair(
         .to_owned();
 
     // `pyatv/__init__.py:181` looks the settings up before the exchange starts and hands the
-    // resulting object to the handler. Here the handler reaches storage through the identifier
-    // instead (see `pyatv_core::storage`), so the record itself is not needed — but the lookup
-    // still has to happen, because it is what files a never-before-seen device under *all* of its
-    // per-protocol identifiers. Without it the credentials would land on a record carrying only
-    // the one identifier pairing happened to use.
-    let _settings = storage.get_settings(config)?;
+    // resulting object to the handler. Here most handlers reach storage through the identifier
+    // instead (see `pyatv_core::storage`), so the record is only read for its `info` — but the
+    // lookup still has to happen either way, because it is what files a never-before-seen device
+    // under *all* of its per-protocol identifiers. Without it the credentials would land on a
+    // record carrying only the one identifier pairing happened to use.
+    let settings = storage.get_settings(config)?;
 
     match protocol {
         Protocol::AirPlay | Protocol::Raop => {
@@ -112,9 +113,26 @@ pub async fn pair(
                 storage,
             )))
         }
-        // TODO(step-1): dispatch the remaining protocols:
-        //   Mrp  -> pyatv_proto_mrp, CryptoPairingMessage envelope
-        //   Dmap -> pyatv_proto_dmap::pairing, inverted client-as-server flow
-        Protocol::Mrp | Protocol::Dmap => Err(Error::UnsupportedProtocol(protocol)),
+        Protocol::Mrp => {
+            // `MrpPairingHandler` (`pyatv/protocols/mrp/pairing.py:18-86`) drives pair-setup over
+            // `CryptoPairingMessage`, which only reaches a device speaking MRP on its own socket.
+            // A tvOS 15+ Apple TV has none, and its tunnel is unlocked by pairing AirPlay or
+            // Companion instead — so this arm serves older hardware, HomePods and the hermetic
+            // tests, not the current test device.
+            tracing::debug!(port = service.port, "creating MRP pairing handler");
+
+            Ok(Box::new(MrpPairingHandler::new(
+                MrpPairingOptions {
+                    address: config.address,
+                    service: service.clone(),
+                    device_identifier,
+                    info: settings.info.clone(),
+                },
+                storage,
+            )))
+        }
+        // TODO(step-5): dispatch DMAP, whose inverted client-as-server flow is
+        // `pyatv_proto_dmap::pairing`.
+        Protocol::Dmap => Err(Error::UnsupportedProtocol(protocol)),
     }
 }

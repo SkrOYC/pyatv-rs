@@ -6,7 +6,7 @@
 //! bring-up and the functional tests need.
 //!
 //! The framing is transcribed from `mrp.py:407-459` rather than reused from
-//! [`pyatv_proto_mrp::transport::direct`], for the same reason upstream's fake re-derives it: a
+//! [`crate::transport::direct`], for the same reason upstream's fake re-derives it: a
 //! fixture that shares an implementation with the code under test cannot catch a bug in it.
 
 use std::net::SocketAddr;

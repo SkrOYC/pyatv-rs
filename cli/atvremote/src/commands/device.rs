@@ -8,10 +8,11 @@
 //! Output formatting is [`super::output`]. It is not in the library on purpose: `pyatv` returns
 //! typed values and only the CLI should decide how they look on a terminal.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use pyatv::{AppleTV, BaseConfig, Protocol};
+use pyatv::{AppleTV, BaseConfig, FeatureName, FeatureState, PlaybackListener, Protocol};
 
 use crate::cli::{Cli, Command};
 use crate::commands::output;
@@ -41,25 +42,40 @@ where
     outcome
 }
 
-/// Apply `--companion-credentials` over whatever storage supplied.
+/// Apply the `--<protocol>-credentials` flags over whatever storage supplied.
 ///
 /// `_set_credentials` (`atvremote.py:753-776`): a command-line value wins over the stored one, and
 /// an explicitly empty string *unsets* the stored credentials rather than being treated as absent.
 fn apply_credential_overrides(cli: &Cli, config: &mut BaseConfig) {
-    let Some(credentials) = cli.companion_credentials.as_deref() else {
-        return;
-    };
+    for (protocol, flag, value) in [
+        (
+            Protocol::Companion,
+            "--companion-credentials",
+            cli.companion_credentials.as_deref(),
+        ),
+        (
+            Protocol::AirPlay,
+            "--airplay-credentials",
+            cli.airplay_credentials.as_deref(),
+        ),
+    ] {
+        let Some(credentials) = value else { continue };
 
-    let Some(service) = config.get_service_mut(Protocol::Companion) else {
-        tracing::debug!("ignoring --companion-credentials: the device has no Companion service");
-        return;
-    };
+        let Some(service) = config.get_service_mut(protocol) else {
+            tracing::debug!(
+                flag,
+                ?protocol,
+                "ignoring an override for an absent service"
+            );
+            continue;
+        };
 
-    service.credentials = if credentials.is_empty() {
-        None
-    } else {
-        Some(credentials.to_owned())
-    };
+        service.credentials = if credentials.is_empty() {
+            None
+        } else {
+            Some(credentials.to_owned())
+        };
+    }
 }
 
 /// Dispatch one connection-requiring subcommand.
@@ -80,8 +96,17 @@ pub async fn run(cli: &Cli) -> Result<()> {
         Command::PowerState => power_state(cli).await,
         Command::Volume { level } => volume(cli, *level).await,
         Command::Playing => playing(cli).await,
-        Command::PlayUrl { .. } | Command::StreamFile { .. } | Command::PushUpdates => {
-            bail!("this subcommand needs AirPlay, RAOP or MRP, which this build cannot connect yet")
+        Command::PushUpdates { timeout } => push_updates(cli, *timeout).await,
+        Command::Artwork {
+            output,
+            width,
+            height,
+        } => artwork(cli, output, *width, *height).await,
+        Command::PlayUrl { .. } | Command::StreamFile { .. } => {
+            bail!(
+                "this subcommand needs AirPlay video or RAOP audio, which this build cannot \
+                   stream yet"
+            )
         }
         Command::Scan | Command::Pair { .. } => {
             unreachable!("dispatched before a connection is needed")
@@ -202,16 +227,94 @@ async fn volume(cli: &Cli, level: Option<f32>) -> Result<()> {
     .await
 }
 
-/// Now-playing metadata.
-///
-/// No protocol this build connects reports metadata, so this reports the same
-/// [`pyatv::Error::NotSupported`] the facade would rather than pretending.
+/// Now-playing metadata, printed as `Playing.__str__` renders it
+/// (`pyatv/interface.py:540-589`, ported as that type's `Display`).
 async fn playing(cli: &Cli) -> Result<()> {
     with_device(cli, async |atv| {
         let metadata = atv
             .metadata()
             .ok_or_else(|| output::unsupported("playing", "MRP, DMAP or RAOP"))?;
-        println!("{:#?}", metadata.playing().await?);
+        println!("{}", metadata.playing().await?);
+        Ok(())
+    })
+    .await
+}
+
+/// Follow now-playing updates until Ctrl-C, or until `timeout` seconds have passed.
+///
+/// `PushUpdatesCommand.push_updates` (`atvremote.py:421-433`) plus `PushListener`
+/// (`atvremote.py:504-513`): the availability check comes first and refuses with a message rather
+/// than an error, each update prints the same block `playing` does followed by a twenty-dash rule,
+/// and an error prints a line and lets the updater carry on.
+async fn push_updates(cli: &Cli, timeout: Option<u64>) -> Result<()> {
+    with_device(cli, async |atv| {
+        // `atv.features.in_state(Available, PushUpdates)` (`atvremote.py:423-428`).
+        if atv.features().get_feature(FeatureName::PushUpdates).state != FeatureState::Available {
+            println!("Push updates are not supported (no protocol supports it)");
+            return Ok(());
+        }
+
+        let updater = atv
+            .push_updater()
+            .ok_or_else(|| output::unsupported("push_updates", "MRP or DMAP"))?;
+
+        // Held for as long as updates are wanted: the updater keeps only a weak reference, so
+        // dropping this is what unsubscribes.
+        let listener: Arc<dyn PlaybackListener> = Arc::new(output::PrintingListener);
+        updater.add_listener(Arc::clone(&listener));
+
+        match timeout {
+            Some(seconds) => println!("Following updates for {seconds}s"),
+            None => println!("Press Ctrl-C to stop"),
+        }
+        updater.start(0).await?;
+
+        match timeout {
+            Some(seconds) => {
+                let deadline = tokio::time::sleep(std::time::Duration::from_secs(seconds));
+                tokio::select! {
+                    () = deadline => {}
+                    result = tokio::signal::ctrl_c() => result?,
+                }
+            }
+            None => tokio::signal::ctrl_c().await?,
+        }
+
+        updater.stop();
+        Ok(())
+    })
+    .await
+}
+
+/// Save the current artwork.
+///
+/// `artwork_save` (`atvremote.py:410-418`), except that the file name is taken whole rather than
+/// having `.png` appended: the bytes a device sends are not always PNG, and silently mislabelling
+/// them helps nobody. The "no artwork" message is upstream's, verbatim.
+async fn artwork(
+    cli: &Cli,
+    output_path: &Path,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<()> {
+    with_device(cli, async |atv| {
+        let metadata = atv
+            .metadata()
+            .ok_or_else(|| output::unsupported("artwork", "MRP, DMAP or RAOP"))?;
+
+        let Some(artwork) = metadata.artwork(width, height).await? else {
+            println!("No artwork is currently available.");
+            return Ok(());
+        };
+
+        std::fs::write(output_path, &artwork.bytes)
+            .with_context(|| format!("could not write {}", output_path.display()))?;
+        println!(
+            "Wrote {} bytes of {} to {}",
+            artwork.bytes.len(),
+            artwork.mimetype,
+            output_path.display()
+        );
         Ok(())
     })
     .await

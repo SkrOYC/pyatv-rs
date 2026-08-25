@@ -11,14 +11,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::auth::MrpPairSetupProcedure;
+use crate::transport::DirectTransport;
+use crate::{MrpProtocol, MrpProtocolOptions, MrpSetupOptions, setup};
 use pyatv_core::facade::SetupData;
 use pyatv_core::interface::PowerListener;
 use pyatv_core::models::Playing;
 use pyatv_core::{BaseService, FeatureName, FeatureState, Protocol};
 use pyatv_pairing::server::PIN_CODE;
-use pyatv_proto_mrp::auth::MrpPairSetupProcedure;
-use pyatv_proto_mrp::transport::DirectTransport;
-use pyatv_proto_mrp::{MrpProtocol, MrpProtocolOptions, MrpSetupOptions, setup};
 
 use super::fake_mrp::FakeMrpDevice;
 use super::fake_state::{DEVICE_UID, FakeDeviceState};

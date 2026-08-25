@@ -32,10 +32,26 @@ pub struct Cli {
     ///
     /// Mirrors upstream's per-protocol `--<protocol>-credentials` group
     /// (`pyatv/scripts/atvremote.py:649-654`), which lets a caller connect without a settings
-    /// file at all. Only the Companion one exists here so far, because Companion is the only
-    /// protocol `connect` wires up.
+    /// file at all.
     #[arg(long, global = true, value_name = "CREDENTIALS")]
     pub companion_credentials: Option<String>,
+
+    /// `AirPlay` credentials, overriding whatever the settings file holds.
+    //
+    // The other half of upstream's credential group. These are also what unlocks the MRP tunnel on
+    // tvOS 15 and later — though a Companion pairing does just as well, because the receiver's
+    // `/pair-verify` accepts any HAP pairing registered on the device (see
+    // `pyatv_proto_airplay::tunnel_credentials`).
+    //
+    // `help` is spelled out rather than taken from the doc comment because clap prints the comment
+    // verbatim, backticks and all, and clippy's `doc_markdown` insists on them around `AirPlay`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "CREDENTIALS",
+        help = "AirPlay credentials, overriding whatever the settings file holds"
+    )]
+    pub airplay_credentials: Option<String>,
 
     /// Print more detail. Repeat for more.
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
@@ -148,7 +164,30 @@ pub enum Command {
     },
 
     /// Follow now-playing updates until interrupted.
-    PushUpdates,
+    ///
+    /// Upstream blocks on `sys.stdin.readline()` and stops on ENTER
+    /// (`pyatv/scripts/atvremote.py:421-433`). Ctrl-C does the same job here without needing a
+    /// terminal, and `--timeout` is an addition so the command can be scripted.
+    PushUpdates {
+        /// Stop after this many seconds instead of waiting for Ctrl-C.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+    },
+
+    /// Save the current artwork to a file.
+    Artwork {
+        /// Where to write the image.
+        #[arg(long, short, value_name = "FILE")]
+        output: PathBuf,
+
+        /// Requested width in pixels. Omit for the device's own choice.
+        #[arg(long)]
+        width: Option<u32>,
+
+        /// Requested height in pixels. Omit for the device's own choice.
+        #[arg(long)]
+        height: Option<u32>,
+    },
 
     /// Get or set the volume.
     Volume {

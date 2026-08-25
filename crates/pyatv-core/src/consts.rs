@@ -243,6 +243,82 @@ impl std::fmt::Display for Protocol {
     }
 }
 
+impl MediaType {
+    /// `media_type_str` (`pyatv/convert.py:26-33`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Video => "Video",
+            Self::Music => "Music",
+            Self::Tv => "TV",
+        }
+    }
+}
+
+impl std::fmt::Display for MediaType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl DeviceState {
+    /// `device_state_str` (`pyatv/convert.py:13-23`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Loading => "Loading",
+            Self::Stopped => "Stopped",
+            Self::Paused => "Paused",
+            Self::Playing => "Playing",
+            Self::Seeking => "Seeking",
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl RepeatState {
+    /// `repeat_str` (`pyatv/convert.py:36-42`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Track => "Track",
+            Self::All => "All",
+        }
+    }
+}
+
+impl std::fmt::Display for RepeatState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ShuffleState {
+    /// `shuffle_str` (`pyatv/convert.py:45-51`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Albums => "Albums",
+            Self::Songs => "Songs",
+        }
+    }
+}
+
+impl std::fmt::Display for ShuffleState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl DeviceModel {
     /// The model's display name, exactly as `pyatv/convert.py:65-81` (`model_str`) renders it.
     ///

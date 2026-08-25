@@ -25,6 +25,8 @@ pub mod pairing;
 pub mod raop;
 pub mod rtsp;
 pub mod setup;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 pub use ap2::{
     Ap2Session, DataStreamChannel, EventChannel, EventChannelSetup, InfoSettings, SeqnoPolicy,
@@ -36,7 +38,9 @@ pub use error::Error;
 pub use http::HttpConnection;
 pub use pairing::{AirPlayPairingHandler, AirPlayPairingOptions};
 pub use rtsp::RtspSession;
-pub use setup::{remote_control_tunnel, tunnel_credentials};
+pub use setup::{
+    AirPlaySetupOptions, is_tunnel_supported, remote_control_tunnel, setup, tunnel_credentials,
+};
 
 /// Convenience alias for fallible AirPlay operations.
 pub type Result<T, E = Error> = core::result::Result<T, E>;

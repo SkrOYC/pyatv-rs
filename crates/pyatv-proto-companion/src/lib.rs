@@ -44,6 +44,8 @@ pub mod pairing;
 pub mod plist_payloads;
 pub mod protocol;
 pub mod session;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 pub use codec::{Frame, FrameCodec};
 pub use connection::CompanionConnection;

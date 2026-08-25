@@ -1,6 +1,6 @@
 //! An in-memory [`ByteChannel`], standing in for an AirPlay 2 data-stream channel.
 //!
-//! [`pyatv_proto_mrp::TunnelTransport`] is generic over [`ByteChannel`] precisely so the tunnel can
+//! [`crate::TunnelTransport`] is generic over [`ByteChannel`] precisely so the tunnel can
 //! be exercised without an AirPlay stack: this crate must not depend on `pyatv-proto-airplay`, and
 //! the umbrella is what will adapt the real `DataStreamChannel` to this trait.
 //!
@@ -11,9 +11,9 @@
 
 use std::sync::Arc;
 
+use crate::{ByteChannel, Error, Result};
 use bytes::Bytes;
 use pyatv_core::interface::BoxFuture;
-use pyatv_proto_mrp::{ByteChannel, Error, Result};
 use tokio::sync::{Mutex, mpsc, watch};
 
 /// One end of an in-memory duplex byte channel.

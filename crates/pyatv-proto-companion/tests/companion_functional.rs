@@ -7,7 +7,7 @@
 //! The device is [`support::fake_state::DeviceState`] behind the framing in
 //! `support::fake_companion`, which is this crate's port of pyatv's own `FakeCompanionService`.
 
-mod support;
+use pyatv_proto_companion::test_support as support;
 
 use std::sync::Arc;
 use std::time::Duration;

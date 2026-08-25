@@ -4,7 +4,7 @@
 //! bags on top of `PlayingState`; here each one takes the arguments its pyatv counterpart requires
 //! positionally and an extra [`PlayingState`] delta where upstream would take `**kwargs`.
 
-use pyatv_proto_mrp::protobuf::playback_state;
+use crate::protobuf::playback_state;
 
 use super::fake_messages as build;
 use super::fake_state::{APP_NAME, FakeDeviceState, PLAYER_IDENTIFIER, PlayingState};

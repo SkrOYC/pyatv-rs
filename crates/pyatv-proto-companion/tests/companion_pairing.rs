@@ -7,7 +7,7 @@
 //! The device is [`pyatv_pairing::server::ReferenceAccessory`] behind the Companion framing in
 //! `support::fake_companion`, so every run is deterministic in everything but the ephemeral keys.
 
-mod support;
+use pyatv_proto_companion::test_support as support;
 
 use std::sync::Arc;
 

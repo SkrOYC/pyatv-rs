@@ -22,9 +22,17 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[features]
+# The hermetic Companion device in `test_support`, published as part of the library so the umbrella
+# crate's integration tests can stand the same device up behind a real `connect()`.
+test-support = ["pyatv-pairing/test-server"]
+
 [dev-dependencies]
 bytes.workspace = true
 hex = "0.4.3"
+# Self dev-dependency: the only way to turn a feature on for this crate's *own* test binaries, so
+# `cargo test -p pyatv-proto-companion` keeps working without `--all-features`.
+pyatv-proto-companion = { path = ".", features = ["test-support"] }
 pyatv-core.workspace = true
 pyatv-pairing = { workspace = true, features = ["test-server"] }
 serde_json = "1.0.151"

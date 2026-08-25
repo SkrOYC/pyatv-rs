@@ -5,19 +5,19 @@
 //! from the same pair-verify shared secret.
 //!
 //! The framing here is deliberately hand-rolled rather than reusing the crate's own encoder. Only
-//! [`pyatv_proto_airplay::ap2::data_stream::DataHeader`] is shared, because it is the thing under
+//! [`crate::ap2::data_stream::DataHeader`] is shared, because it is the thing under
 //! test; the property-list envelope and the varint length prefix are built independently, so a test
 //! that passes is not just the implementation agreeing with itself.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use pyatv_pairing::pairing::SessionKeys;
-use pyatv_pairing::session::HapSession;
-use pyatv_proto_airplay::ap2::data_stream::{
+use crate::ap2::data_stream::{
     COMMAND_COMM, COMMAND_NONE, DataHeader, HEADER_LEN, MESSAGE_TYPE_REPLY, MESSAGE_TYPE_SYNC,
     PADDING,
 };
+use pyatv_pairing::pairing::SessionKeys;
+use pyatv_pairing::session::HapSession;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -26,7 +26,7 @@ use super::fake_airplay::FakeState;
 /// Accept one controller connection on the event port and answer as a receiver would.
 ///
 /// If `probe` is set it is sent verbatim once the controller connects, which is how the reply path
-/// of [`pyatv_proto_airplay::ap2::EventChannel`] gets exercised. Whatever the controller answers is
+/// of [`crate::ap2::EventChannel`] gets exercised. Whatever the controller answers is
 /// recorded on the shared state.
 pub async fn serve_event(
     listener: TcpListener,
@@ -141,7 +141,7 @@ pub async fn serve_data(listener: TcpListener, keys: SessionKeys, state: Arc<Fak
 }
 
 /// Take one complete data frame off the front of `buffer`.
-fn take_frame(buffer: &mut Vec<u8>) -> Option<(DataHeader, Vec<u8>)> {
+pub(super) fn take_frame(buffer: &mut Vec<u8>) -> Option<(DataHeader, Vec<u8>)> {
     if buffer.len() < HEADER_LEN {
         return None;
     }
@@ -156,7 +156,12 @@ fn take_frame(buffer: &mut Vec<u8>) -> Option<(DataHeader, Vec<u8>)> {
 }
 
 /// Build a frame header plus payload, independently of the crate's encoder.
-fn encode_frame(message_type: [u8; 12], command: [u8; 4], seqno: u64, payload: &[u8]) -> Vec<u8> {
+pub(super) fn encode_frame(
+    message_type: [u8; 12],
+    command: [u8; 4],
+    seqno: u64,
+    payload: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.extend_from_slice(
         &DataHeader {
@@ -173,9 +178,18 @@ fn encode_frame(message_type: [u8; 12], command: [u8; 4], seqno: u64, payload: &
 }
 
 /// `{"params": {"data": <varint-prefixed message>}}`, built here rather than borrowed.
-fn wrap_envelope(message: &[u8]) -> Vec<u8> {
+pub(super) fn wrap_envelope(message: &[u8]) -> Vec<u8> {
     let mut data = write_variant(message.len() as u64);
     data.extend_from_slice(message);
+    wrap_payload(&data)
+}
+
+/// `{"params": {"data": <blob>}}` with the blob taken verbatim.
+///
+/// The bridge in [`super::fake_bridge`] forwards whole `data` fields rather than individual
+/// messages, so it needs the envelope without the length prefixing [`wrap_envelope`] applies.
+pub(super) fn wrap_payload(data: &[u8]) -> Vec<u8> {
+    let data = data.to_vec();
 
     let mut params = plist::Dictionary::new();
     params.insert("data".to_owned(), plist::Value::Data(data));
@@ -187,23 +201,27 @@ fn wrap_envelope(message: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Pull the raw `params.data` blob back out of an envelope.
+pub(super) fn envelope_data(payload: &[u8]) -> Option<Vec<u8>> {
+    let value = plist::from_bytes::<plist::Value>(payload).ok()?;
+
+    value
+        .as_dictionary()?
+        .get("params")?
+        .as_dictionary()?
+        .get("data")?
+        .as_data()
+        .map(<[u8]>::to_vec)
+}
+
 /// Pull every message back out of an envelope, applying the same `0x08` heuristic upstream does.
-fn unwrap_envelope(payload: &[u8]) -> Vec<Vec<u8>> {
-    let Ok(value) = plist::from_bytes::<plist::Value>(payload) else {
-        return Vec::new();
-    };
-    let Some(data) = value
-        .as_dictionary()
-        .and_then(|it| it.get("params"))
-        .and_then(plist::Value::as_dictionary)
-        .and_then(|it| it.get("data"))
-        .and_then(plist::Value::as_data)
-    else {
+pub(super) fn unwrap_envelope(payload: &[u8]) -> Vec<Vec<u8>> {
+    let Some(data) = envelope_data(payload) else {
         return Vec::new();
     };
 
     let mut messages = Vec::new();
-    let mut rest = data;
+    let mut rest = &data[..];
     while !rest.is_empty() {
         if rest[0] == 0x08 {
             messages.push(rest.to_vec());
@@ -222,7 +240,7 @@ fn unwrap_envelope(payload: &[u8]) -> Vec<Vec<u8>> {
     messages
 }
 
-fn write_variant(mut value: u64) -> Vec<u8> {
+pub(super) fn write_variant(mut value: u64) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
         let group = u8::try_from(value & 0x7F).expect("masked to seven bits");
@@ -235,7 +253,7 @@ fn write_variant(mut value: u64) -> Vec<u8> {
     }
 }
 
-fn read_variant(input: &[u8]) -> Option<(u64, usize)> {
+pub(super) fn read_variant(input: &[u8]) -> Option<(u64, usize)> {
     let mut result = 0u64;
     for (index, byte) in input.iter().take(10).enumerate() {
         result |= u64::from(byte & 0x7F) << (7 * index);

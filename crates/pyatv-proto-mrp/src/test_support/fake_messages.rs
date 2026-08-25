@@ -5,13 +5,12 @@
 //! through `FakeMrpState` (`mrp.py:243-348`).
 //!
 //! These are the *device* side of the wire, so they are written against the generated protobuf
-//! types directly rather than through [`pyatv_proto_mrp::messages`], which only knows how to build
+//! types directly rather than through [`crate::messages`], which only knows how to build
 //! what a controller sends.
 
-use pyatv_core::consts::{RepeatState, ShuffleState};
-use pyatv_proto_mrp::MrpMessage;
-use pyatv_proto_mrp::messages::envelope;
-use pyatv_proto_mrp::protobuf::{
+use crate::MrpMessage;
+use crate::messages::envelope;
+use crate::protobuf::{
     Command, CommandInfo, ContentItem, ContentItemMetadata, DeviceInfoMessage, KeyboardMessage,
     NowPlayingClient, NowPlayingPlayer, PlaybackQueue, PlayerPath, SendCommandResultMessage,
     SetDefaultSupportedCommandsMessage, SetNowPlayingClientMessage, SetStateMessage,
@@ -20,6 +19,7 @@ use pyatv_proto_mrp::protobuf::{
     VolumeDidChangeMessage, content_item_metadata, extensions, playback_state, protocol_message,
     repeat_mode, shuffle_mode, volume_capabilities,
 };
+use pyatv_core::consts::{RepeatState, ShuffleState};
 
 use super::fake_state::{
     DEFAULT_PLAYER_ID, DEFAULT_PLAYER_NAME, DEVICE_MODEL, DEVICE_NAME, DEVICE_UID, PlayingState,
@@ -59,7 +59,7 @@ pub fn bare(message_type: Type, identifier: Option<&str>) -> MrpMessage {
 }
 
 /// Build a message of `message_type` carrying `inner`, optionally correlated to a request.
-fn with<M: pyatv_proto_mrp::protobuf::Message + Default>(
+fn with<M: crate::protobuf::Message + Default>(
     message_type: Type,
     extension: &extensions::MessageExtension<M>,
     inner: &M,

@@ -6,7 +6,7 @@
 //! this graph has one wrapper object contributing it (`docs/research/companion-port-spec.md` §5).
 //! Flattening it would make the fixture answer a path the real device does not.
 //!
-//! Written by hand here rather than reusing `pyatv_proto_companion::plist_payloads`, for the same
+//! Written by hand here rather than reusing `crate::plist_payloads`, for the same
 //! reason the fake device re-derives the frame header: a fixture that shares an implementation with
 //! the code under test cannot catch a bug in it. These are the *device's* payloads; those are the
 //! client's, and they are different shapes.

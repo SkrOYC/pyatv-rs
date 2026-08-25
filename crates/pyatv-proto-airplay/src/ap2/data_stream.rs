@@ -19,6 +19,15 @@
 //!           TCP
 //! ```
 //!
+//! Two seams are exposed, one per layer of that stack.
+//! [`DataStreamChannel::send_payload`]/[`DataStreamChannel::recv_payload`] work on the whole
+//! `params.data` blob and do no length prefixing at all; that is the seam
+//! `pyatv_proto_mrp::transport::ByteChannel` is cut at, because the varint framing inside the blob
+//! is MRP's own and the tunnel transport already owns it.
+//! [`DataStreamChannel::send`]/[`DataStreamChannel::recv`] sit one layer up and deal in individual
+//! messages, which is what pyatv's `send_protobuf`/`handle_protobuf` pair does
+//! (`channels.py:266-280`). Using both at once on one channel would prefix twice; pick a layer.
+//!
 //! # Encryption
 //!
 //! Exactly one layer: the HAP block framing on this socket, keyed by
@@ -33,6 +42,7 @@ pub mod frame;
 pub mod payload;
 mod setup;
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -113,11 +123,23 @@ pub fn data_stream_key_spec(seed: u64) -> (String, &'static str, &'static str) {
 ///
 /// `Send + Sync`, so the umbrella crate can hand one to an `MrpTransport` adapter and drive it from
 /// wherever it likes. Dropping it stops the read loop and closes the socket.
+///
+/// # Closing while a reader is parked
+///
+/// [`DataStreamChannel::close`] takes **no lock that [`DataStreamChannel::recv_payload`] can be
+/// parked on**, and is not `async`. That is a load-bearing property rather than an accident: the
+/// MRP protocol actor keeps a task sitting in `recv` for the whole life of a session and calls
+/// `close` from a *different* task, so a `close` that had to acquire the inbound lock would
+/// deadlock against its own reader. Aborting the frame loop drops the inbound sender, which is what
+/// wakes the parked reader with an end-of-stream.
 #[derive(Debug)]
 pub struct DataStreamChannel {
     address: SocketAddr,
     outbound: mpsc::Sender<Vec<u8>>,
     inbound: Mutex<mpsc::Receiver<Bytes>>,
+    /// Messages split out of a payload that carried more than one, waiting for the next
+    /// message-level [`DataStreamChannel::recv`].
+    pending: Mutex<VecDeque<Bytes>>,
     seqno: AtomicU64,
     policy: SeqnoPolicy,
     task: JoinHandle<()>,
@@ -153,6 +175,7 @@ impl DataStreamChannel {
             address,
             outbound,
             inbound: Mutex::new(inbound),
+            pending: Mutex::new(VecDeque::new()),
             // `randrange(0x100000000, 0x1FFFFFFFF)` (`channels.py:235`): a 33-bit value above
             // 2^32, so it can never be mistaken for a small counter.
             seqno: AtomicU64::new(rand::random_range(0x1_0000_0000..0x1_FFFF_FFFF)),
@@ -173,6 +196,38 @@ impl DataStreamChannel {
         self.seqno.load(Ordering::Relaxed)
     }
 
+    /// Send one already-framed `params.data` blob.
+    ///
+    /// The lower of this channel's two seams: whatever the caller hands over becomes the `data`
+    /// field verbatim, with no length prefixing. A caller that owns MRP's varint framing — the
+    /// umbrella crate's `ByteChannel` adapter does — wants this one, because
+    /// [`DataStreamChannel::send`] would prefix a second time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Plist`] if the envelope cannot be serialised, and [`Error::Io`] if the
+    /// channel has been closed.
+    pub async fn send_payload(&self, data: &[u8]) -> Result<()> {
+        let envelope = payload::encode_envelope(data.to_vec())?;
+        let frame = frame::encode_sync(self.next_seqno(), &envelope);
+
+        self.outbound.send(frame).await.map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!("data channel to {} is closed", self.address),
+            ))
+        })
+    }
+
+    /// Await the next `params.data` blob the receiver sent.
+    ///
+    /// `None` means the channel has closed and nothing further can arrive — an end-of-stream, not
+    /// a failure. See the type's own docs for why this is safe to park on across a
+    /// [`DataStreamChannel::close`] from another task.
+    pub async fn recv_payload(&self) -> Option<Bytes> {
+        self.inbound.lock().await.recv().await
+    }
+
     /// Send one serialised MRP message.
     ///
     /// `send_protobuf` (`channels.py:266-280`) with the protobuf serialisation already done by the
@@ -184,32 +239,40 @@ impl DataStreamChannel {
     /// Returns [`Error::Plist`] if the envelope cannot be serialised, and [`Error::Io`] if the
     /// channel has been closed.
     pub async fn send(&self, message: &[u8]) -> Result<()> {
-        let envelope = payload::encode_envelope(payload::encode_messages(&[message]))?;
-        let frame = frame::encode_sync(self.next_seqno(), &envelope);
-
-        self.outbound.send(frame).await.map_err(|_| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                format!("data channel to {} is closed", self.address),
-            ))
-        })
+        self.send_payload(&payload::encode_messages(&[message]))
+            .await
     }
 
     /// Await the next MRP message the receiver sent.
     ///
+    /// One payload can carry several messages (`channels.py:198-226`); the surplus is buffered and
+    /// handed out by subsequent calls.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] once the channel has closed and no further message can arrive.
+    /// Returns [`Error::Malformed`] if a payload cannot be split into messages, and [`Error::Io`]
+    /// once the channel has closed and no further message can arrive.
     pub async fn recv(&self) -> Result<Bytes> {
-        self.inbound.lock().await.recv().await.ok_or_else(|| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("data channel to {} is closed", self.address),
-            ))
-        })
+        loop {
+            if let Some(message) = self.pending.lock().await.pop_front() {
+                return Ok(message);
+            }
+
+            let Some(data) = self.recv_payload().await else {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("data channel to {} is closed", self.address),
+                )));
+            };
+
+            let mut pending = self.pending.lock().await;
+            pending.extend(payload::decode_messages(&data)?);
+        }
     }
 
     /// Stop the frame loop and close the socket.
+    ///
+    /// Synchronous and lock-free by design; see the type's own docs.
     pub fn close(&self) {
         tracing::debug!(address = %self.address, "closing AirPlay data-stream channel");
         self.task.abort();
@@ -321,11 +384,15 @@ fn ascii_tag(tag: &[u8]) -> String {
     }
 }
 
-/// Unwrap one frame's payload and hand each message inside it to the consumer.
+/// Unwrap one frame's `params.data` blob and hand it to the consumer.
 ///
 /// A payload that is not the expected envelope is logged and dropped, matching upstream's
 /// early return (`channels.py:257-261`) — a receiver sending something else on this channel is not
 /// a reason to tear the tunnel down.
+///
+/// Splitting the blob into individual messages happens at the layer above, in
+/// [`DataStreamChannel::recv`] or in the tunnel transport, so that a caller working at the payload
+/// seam sees exactly the bytes the receiver put in the field.
 async fn dispatch(message: &DataStreamMessage, inbound: &mpsc::Sender<Bytes>, address: SocketAddr) {
     let Some(data) = payload::decode_envelope(&message.payload) else {
         tracing::debug!(
@@ -336,19 +403,8 @@ async fn dispatch(message: &DataStreamMessage, inbound: &mpsc::Sender<Bytes>, ad
         return;
     };
 
-    let messages = match payload::decode_messages(&data) {
-        Ok(messages) => messages,
-        Err(error) => {
-            tracing::warn!(%address, %error, "could not split a data frame's messages");
-            return;
-        }
-    };
-
-    for message in messages {
-        if inbound.send(message).await.is_err() {
-            tracing::debug!(%address, "nothing is reading the data channel");
-            return;
-        }
+    if inbound.send(Bytes::from(data)).await.is_err() {
+        tracing::debug!(%address, "nothing is reading the data channel");
     }
 }
 
@@ -386,5 +442,47 @@ mod tests {
     #[test]
     fn the_default_seqno_policy_is_fixed() {
         assert_eq!(SeqnoPolicy::default(), SeqnoPolicy::Fixed);
+    }
+
+    /// The contract the MRP protocol actor depends on: a reader parked in `recv_payload` holds the
+    /// inbound lock, and `close` must still complete and wake it. A `close` that took that lock
+    /// would deadlock against its own reader, which is exactly the shape of bug this asserts away.
+    #[tokio::test]
+    async fn closing_wakes_a_reader_parked_in_recv() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a loopback port must succeed in tests");
+        let address = listener
+            .local_addr()
+            .expect("a bound listener must have an address");
+        // Accept and then sit idle, so the channel's reader has nothing to deliver and parks.
+        let accept = tokio::spawn(async move { listener.accept().await.map(|(stream, _)| stream) });
+
+        let keys = pyatv_pairing::pairing::SessionKeys {
+            shared_secret: Vec::new(),
+            output_key: [7u8; 32],
+            input_key: [9u8; 32],
+        };
+        let channel = std::sync::Arc::new(
+            super::DataStreamChannel::connect(address, &keys, SeqnoPolicy::Fixed)
+                .await
+                .expect("dialling a listening loopback port must succeed"),
+        );
+        let _peer = accept.await.expect("the accept task must not panic");
+
+        let reader = tokio::spawn({
+            let channel = std::sync::Arc::clone(&channel);
+            async move { channel.recv_payload().await }
+        });
+        // Give the reader time to take the lock and park inside it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        channel.close();
+
+        let parked = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("close must wake a parked reader")
+            .expect("the reader task must not panic");
+        assert_eq!(parked, None, "a closed channel reads as end-of-stream");
     }
 }

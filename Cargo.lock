@@ -1063,6 +1063,7 @@ dependencies = [
 name = "pyatv"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "pyatv-core",
  "pyatv-mdns",
  "pyatv-pairing",
@@ -1145,6 +1146,7 @@ dependencies = [
  "plist",
  "pyatv-core",
  "pyatv-pairing",
+ "pyatv-proto-airplay",
  "rand 0.10.2",
  "serde_json",
  "thiserror",
@@ -1164,6 +1166,7 @@ dependencies = [
  "pyatv-core",
  "pyatv-opack",
  "pyatv-pairing",
+ "pyatv-proto-companion",
  "rand 0.10.2",
  "serde_json",
  "thiserror",
@@ -1195,6 +1198,7 @@ dependencies = [
  "protox",
  "pyatv-core",
  "pyatv-pairing",
+ "pyatv-proto-mrp",
  "serde_json",
  "thiserror",
  "tokio",

@@ -5,7 +5,7 @@
 //! `mrp_functional.rs`. Everything runs over a real loopback socket through the real pair-verify,
 //! the real ChaCha20 framing and the real protobuf extension layer.
 
-mod support;
+use pyatv_proto_mrp::test_support as support;
 
 use std::sync::{Arc, Mutex};
 

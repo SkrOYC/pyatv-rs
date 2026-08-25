@@ -5,7 +5,7 @@
 //! socket through the real pair-verify, the real ChaCha20 framing and the real protobuf extension
 //! layer, so a failure here means the bytes are wrong rather than that a mock disagreed.
 
-mod support;
+use pyatv_proto_mrp::test_support as support;
 
 use std::sync::{Arc, Mutex};
 

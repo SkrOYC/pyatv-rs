@@ -7,7 +7,7 @@
 //! key derivations, the read/write swap, the HAP framing and the `DataHeader` framing are all
 //! exercised together rather than mocked apart.
 
-mod support;
+use pyatv_proto_airplay::test_support as support;
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;

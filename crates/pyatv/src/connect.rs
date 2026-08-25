@@ -11,17 +11,29 @@
 //! with working `AirPlay` but unpaired Companion should still give you video streaming. The whole
 //! call only fails when nothing connected at all.
 //!
+//! # One protocol can contribute more than one registration
+//!
+//! `setup()` is a generator upstream, and `AirPlay`'s yields twice: once for `AirPlay` itself and
+//! once, tagged `Protocol::MRP`, for the remote-control tunnel it hosts
+//! (`pyatv/protocols/airplay/__init__.py:303-387`). That is why [`setup_protocol`] returns a
+//! `Vec<SetupData>` rather than one.
+//!
 //! # What is wired up today
 //!
-//! Companion. MRP, `AirPlay`, RAOP and DMAP are recognised and skipped with a debug log until their
-//! own `setup()` lands; see `docs/ROADMAP.md`.
+//! Companion, `AirPlay` and MRP — the latter over its own socket when the device still advertises
+//! `_mediaremotetv._tcp`, and otherwise through the `AirPlay` tunnel, which is the only way in on
+//! tvOS 15 and later. RAOP and DMAP are recognised and skipped with a debug log until their own
+//! `setup()` lands; see `docs/ROADMAP.md`.
+
+mod mrp;
 
 use std::sync::Arc;
 
-use pyatv_core::facade::{DEFAULT_PRIORITIES, FacadeAppleTV, ListenerHub};
+use pyatv_core::facade::{DEFAULT_PRIORITIES, FacadeAppleTV, ListenerHub, SetupData};
 use pyatv_core::interface::{AppleTV, DeviceListener, PowerListener};
 use pyatv_core::storage::{Settings, Storage};
 use pyatv_core::{BaseConfig, BaseService, Error, Protocol, Result};
+use pyatv_proto_airplay::{AirPlaySetupOptions, setup as airplay_setup};
 use pyatv_proto_companion::facade::{CompanionSetupOptions, setup as companion_setup};
 
 /// Connect to a device over every enabled protocol.
@@ -92,12 +104,17 @@ pub async fn connect(
     let mut failures = Vec::new();
 
     for service in enabled_services(&config, protocol) {
-        match setup_protocol(&config, service, &settings, &listeners).await {
-            Ok(Some(data)) => {
-                tracing::debug!(protocol = ?service.protocol, "connected to protocol");
-                facade.add_protocol(data);
+        match setup_protocol(&config, service, &settings, &listeners, &facade).await {
+            Ok(registrations) => {
+                for data in registrations {
+                    tracing::debug!(
+                        service = ?service.protocol,
+                        registered = ?data.protocol,
+                        "connected to protocol"
+                    );
+                    facade.add_protocol(data);
+                }
             }
-            Ok(None) => {}
             Err(error) => {
                 tracing::debug!(protocol = ?service.protocol, %error, "protocol failed to connect");
                 failures.push(format!("{:?}: {error}", service.protocol));
@@ -148,15 +165,16 @@ fn enabled_services(config: &BaseConfig, protocol: Option<Protocol>) -> Vec<&Bas
 
 /// Run one protocol's `setup()`, or report that this build cannot speak it yet.
 ///
-/// `Ok(None)` means "this protocol declined to register", which for Companion is the
-/// no-credentials guard clause (`pyatv/protocols/companion/__init__.py:665-668`) and is not a
-/// failure.
+/// An empty result means "this service declined to register", which for Companion is the
+/// no-credentials guard clause (`pyatv/protocols/companion/__init__.py:665-668`) and for the
+/// `AirPlay` tunnel is the gate in [`mrp::tunnel`]. Neither is a failure.
 async fn setup_protocol(
     config: &BaseConfig,
     service: &BaseService,
     settings: &Settings,
     listeners: &Arc<ListenerHub>,
-) -> Result<Option<pyatv_core::facade::SetupData>> {
+    facade: &FacadeAppleTV,
+) -> Result<Vec<SetupData>> {
     match service.protocol {
         Protocol::Companion => {
             let options = CompanionSetupOptions {
@@ -166,13 +184,37 @@ async fn setup_protocol(
                 listener: Some(Arc::clone(listeners) as Arc<dyn DeviceListener>),
                 power_listener: Some(Arc::clone(listeners) as Arc<dyn PowerListener>),
             };
-            companion_setup(options).await.map_err(Into::into)
+            Ok(companion_setup(options)
+                .await
+                .map_err(pyatv_core::Error::from)?
+                .into_iter()
+                .collect())
         }
-        // TODO(step-2): wire the remaining protocols' setup() as each lands. Skipping keeps a
-        // device with one working protocol usable instead of failing the whole connect.
+        Protocol::Mrp => mrp::direct(config, service, settings, listeners).await,
+        Protocol::AirPlay => {
+            // `airplay.setup()` yields its own registration unconditionally and with nothing to
+            // connect (`__init__.py:322-336`), so it cannot fail and is added before the tunnel is
+            // even attempted — a device whose tunnel is refused still streams video.
+            let mut registrations = vec![airplay_setup(&AirPlaySetupOptions {
+                service: service.clone(),
+            })];
+
+            if facade.connected_protocols().contains(&Protocol::Mrp) {
+                // Upstream would set the tunnel up anyway and let the second registration replace
+                // the first in every relayer. Skipping keeps the working direct connection instead
+                // of silently swapping it for a second one that has to be torn down separately.
+                tracing::debug!("MRP is already connected directly, not tunnelling it too");
+            } else if let Some(tunnel) = mrp::tunnel(config, service, settings, listeners).await? {
+                registrations.push(tunnel);
+            }
+
+            Ok(registrations)
+        }
+        // TODO(step-5): wire RAOP and DMAP setup() as each lands. Skipping keeps a device with one
+        // working protocol usable instead of failing the whole connect.
         other => {
             tracing::debug!(protocol = ?other, "skipping a protocol this build cannot connect yet");
-            Ok(None)
+            Ok(Vec::new())
         }
     }
 }

@@ -144,6 +144,24 @@ impl MrpState {
     pub(super) fn handle_device_info(&self, message: &MrpMessage) -> Result<()> {
         let inner = message.inner(&extensions::DEVICE_INFO_MESSAGE)?;
 
+        // The identity every downstream reader depends on — the power state, the output-device
+        // group, the build number the facade reports — all comes out of this one message, and on a
+        // tunnelled connection it is the *only* place any of it appears. Logging the fields once
+        // per update is what makes a wrong power state or a missing group diagnosable from a log
+        // rather than from a packet capture.
+        tracing::debug!(
+            name = ?inner.name,
+            model = ?inner.model_id,
+            build = ?inner.system_build_version,
+            device_uid = ?inner.device_uid,
+            cluster_id = ?inner.cluster_id,
+            logical_device_count = ?inner.logical_device_count,
+            is_group_leader = ?inner.is_group_leader,
+            is_proxy_group_player = ?inner.is_proxy_group_player,
+            grouped_devices = inner.grouped_devices.len(),
+            "MRP device information"
+        );
+
         if let Ok(mut slot) = self.device_info.lock() {
             *slot = Some(inner.clone());
         }

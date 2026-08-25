@@ -8,7 +8,7 @@
 //! The accessory is [`pyatv_pairing::server::ReferenceAccessory`] with pyatv's fixed key material,
 //! so every one of these runs is deterministic in everything except the two ephemeral keypairs.
 
-mod support;
+use pyatv_proto_airplay::test_support as support;
 
 use std::sync::Arc;
 

@@ -4,20 +4,20 @@
 //! `MrpServerAuth` mixin it inherits (`pyatv/protocols/mrp/server_auth.py`).
 //!
 //! The framing is transcribed from `mrp.py:407-459` rather than reused from
-//! [`pyatv_proto_mrp::transport::direct`], for the same reason upstream's fake re-derives it: a
+//! [`crate::transport::direct`], for the same reason upstream's fake re-derives it: a
 //! fixture that shares an implementation with the code under test cannot catch a bug in it.
 
 use std::sync::Arc;
 
+use crate::MrpMessage;
+use crate::protobuf::{Command, extensions, protocol_message, send_error};
+use crate::variant;
 use bytes::{Bytes, BytesMut};
 use pyatv_core::consts::InputAction;
 use pyatv_pairing::chacha::Chacha20Cipher;
 use pyatv_pairing::hkdf_derive::transport::MRP;
 use pyatv_pairing::server::ReferenceAccessory;
 use pyatv_pairing::{Tlv8, TlvValue};
-use pyatv_proto_mrp::MrpMessage;
-use pyatv_proto_mrp::protobuf::{Command, extensions, protocol_message, send_error};
-use pyatv_proto_mrp::variant;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, broadcast};
@@ -58,6 +58,7 @@ const COMMAND_LOOKUP: &[(Command, &str)] = &[
 ];
 
 /// One accepted connection.
+#[derive(Debug)]
 pub struct Connection {
     stream: TcpStream,
     buffer: BytesMut,
@@ -258,7 +259,7 @@ impl Connection {
         };
         drop(accessory);
 
-        let reply = pyatv_proto_mrp::messages::crypto_pairing(&response, false)
+        let reply = crate::messages::crypto_pairing(&response, false)
             .expect("the fixture's CRYPTO_PAIRING_MESSAGE must serialise");
         self.send(&reply).await;
 

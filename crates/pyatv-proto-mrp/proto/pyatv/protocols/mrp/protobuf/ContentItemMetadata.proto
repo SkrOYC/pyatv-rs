@@ -16,7 +16,14 @@ message AudioRouteType {
 }
 
 message AudioRoute {
-  optional AudioRouteType type = 1;
+  // DIVERGENCE from pyatv 0.18.0, which declares this `optional AudioRouteType type = 1;` — the
+  // wrapper *message* rather than the enum nested inside it. tvOS 27.0 sends a varint here, so the
+  // upstream declaration cannot decode: every `SET_STATE_MESSAGE` whose content item carries an
+  // audio route fails with "invalid wire type: Varint (expected LengthDelimited)". Verified live on
+  // 2026-08-25; see `proto/README.md` and the roadmap notes. Every sibling field in this corpus
+  // spells the same pattern correctly (`SongTraits.Enum`, `AlbumTraits.Enum`, …), so this reads as
+  // a typo upstream rather than a deliberate shape.
+  optional AudioRouteType.Enum type = 1;
   optional string name = 2;
   optional bool supportsSpatialization = 3; 
 }

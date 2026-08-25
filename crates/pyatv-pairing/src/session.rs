@@ -17,7 +17,7 @@
 //! ```
 
 use crate::{
-    Error, Result,
+    Result,
     chacha::{Chacha20Cipher, NonceLayout},
 };
 
@@ -91,19 +91,26 @@ impl HapSession {
     ///
     /// A trailing partial frame is retained for the next call, so this can be fed raw socket reads.
     ///
-    /// A length prefix larger than [`FRAME_LENGTH`] is rejected outright rather than buffered.
-    /// Nothing this codec produces can exceed it — [`HapSession::encrypt`] chunks at exactly that
-    /// size — so a bigger prefix is either a desynchronised stream or a peer trying to make the
-    /// controller hold up to 64 KiB per frame while it feeds one byte at a time. pyatv has no such
-    /// check (`pyatv/auth/hap_session.py:36-51` trusts the prefix), which is survivable there only
-    /// because the same desync would fail the tag a moment later — after the memory was already
-    /// committed.
+    /// The inbound length prefix is trusted up to its own `u16` ceiling, exactly as pyatv trusts it
+    /// (`pyatv/auth/hap_session.py:36-51`).
+    ///
+    /// **[`FRAME_LENGTH`] bounds what this side *sends*, not what it accepts.** An earlier version
+    /// of this port rejected any inbound prefix above 1024 on the reasoning that nothing conformant
+    /// could produce one. A live run against an Apple TV 4K (gen 3) on tvOS 27.0 on 2026-08-25
+    /// disproved that: the remote-control data channel delivered a single block claiming **8931**
+    /// plaintext bytes, whose Poly1305 tag verified and whose contents decoded as a well-formed
+    /// 8899-byte `sync`/`cmnd` data frame carrying a `SET_STATE_MESSAGE`. Real firmware does not
+    /// chunk at the HAP "cap" on that channel, so enforcing it tore the tunnel down on the first
+    /// now-playing update every time.
+    ///
+    /// Nothing is lost by trusting it. The prefix is two bytes, so a frame is bounded at 64 KiB by
+    /// the format itself — a bound the buffer would hit anyway — and a desynchronised stream still
+    /// fails the tag on the very next block.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::MalformedResponse`] for an over-long length prefix, and
-    /// [`crate::Error::Aead`] if a frame's tag does not verify. The session is not recoverable
-    /// after either: pyatv advances the inbound counter before decrypting
+    /// Returns [`crate::Error::Aead`] if a frame's tag does not verify. The session is not
+    /// recoverable afterwards: pyatv advances the inbound counter before decrypting
     /// (`pyatv/support/chacha20.py:68-70`), so the stream is permanently out of step with the peer.
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         self.buffer.extend_from_slice(ciphertext);
@@ -116,11 +123,6 @@ impl HapSession {
                 break;
             };
             let plaintext_length = usize::from(u16::from_le_bytes([length[0], length[1]]));
-            if plaintext_length > FRAME_LENGTH {
-                return Err(Error::MalformedResponse(format!(
-                    "frame claims {plaintext_length} plaintext bytes, over the {FRAME_LENGTH}-byte HAP cap"
-                )));
-            }
             let block_length = plaintext_length + AUTH_TAG_LENGTH;
             let Some(block) = rest.get(LENGTH_PREFIX_LEN..LENGTH_PREFIX_LEN + block_length) else {
                 break;
@@ -296,24 +298,42 @@ mod tests {
         assert!(remote.decrypt(&framed).is_err());
     }
 
-    /// A prefix over the frame cap is refused immediately, without buffering the bytes it promises.
-    /// `FRAME_LENGTH` itself must still be accepted — that is the largest frame the encoder emits.
+    /// An inbound frame larger than [`FRAME_LENGTH`] must decrypt, because real firmware sends
+    /// them.
+    ///
+    /// This is the regression test for the live failure recorded in [`HapSession::decrypt`]'s
+    /// docs: an Apple TV 4K (gen 3) on tvOS 27.0 delivers `SET_STATE_MESSAGE`s on the
+    /// remote-control data channel in a *single* HAP block of nearly nine kilobytes. Rejecting it
+    /// tore the tunnel down on the first now-playing update.
+    ///
+    /// The peer is built by hand rather than through [`HapSession::encrypt`], which chunks at the
+    /// cap and so cannot produce the frame under test.
     #[test]
-    fn an_over_long_length_prefix_is_rejected_without_buffering() {
-        use crate::Error;
+    fn an_inbound_frame_over_the_send_cap_still_decrypts() {
+        use crate::chacha::{Chacha20Cipher, NonceLayout};
+
+        let plaintext = vec![0x5Au8; 8931];
+        let length = u16::try_from(plaintext.len())
+            .expect("under the u16 ceiling")
+            .to_le_bytes();
+
+        // The sender's roles are the mirror of the receiver's.
+        let mut sender = Chacha20Cipher::new(&IN_KEY, &OUT_KEY, NonceLayout::PaddedCounter);
+        let sealed = sender.encrypt(&plaintext, Some(&length)).expect("seal");
+
+        let mut framed = length.to_vec();
+        framed.extend_from_slice(&sealed);
 
         let mut session = HapSession::new(&OUT_KEY, &IN_KEY);
-        // 1025 bytes of plaintext claimed, one byte over the cap, with no payload behind it.
-        let prefix = u16::try_from(FRAME_LENGTH + 1).unwrap().to_le_bytes();
+        assert_eq!(session.decrypt(&framed).expect("decrypt"), plaintext);
+    }
 
-        assert!(matches!(
-            session.decrypt(&prefix),
-            Err(Error::MalformedResponse(_))
-        ));
-
-        // A maximum-size frame is still ordinary traffic.
+    /// A frame of exactly [`FRAME_LENGTH`] is the largest the encoder emits, and still round-trips.
+    #[test]
+    fn a_maximum_size_outbound_frame_round_trips() {
         let (mut local, mut remote) = peer();
         let framed = local.encrypt(&vec![0x5Au8; FRAME_LENGTH]).expect("encrypt");
+
         assert_eq!(&framed[..2], &[0x00, 0x04]);
         assert_eq!(
             remote.decrypt(&framed).expect("decrypt").len(),

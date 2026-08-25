@@ -413,7 +413,7 @@ impl DeviceState {
             return;
         };
 
-        let Ok(read) = pyatv_proto_companion::keyed_archiver::read_archive_properties(
+        let Ok(read) = crate::keyed_archiver::read_archive_properties(
             archive,
             &[
                 &["textOperations", "targetSessionUUID", "NS.uuidbytes"],
@@ -424,16 +424,15 @@ impl DeviceState {
             return;
         };
 
-        let uuid = pyatv_proto_companion::keyed_archiver::as_data(read[0].as_ref());
+        let uuid = crate::keyed_archiver::as_data(read[0].as_ref());
         if uuid != self.rti_session_uuid.as_deref() {
             return;
         }
 
-        if pyatv_proto_companion::keyed_archiver::as_string(read[1].as_ref()) == Some("") {
+        if crate::keyed_archiver::as_string(read[1].as_ref()) == Some("") {
             self.rti_text = Some(String::new());
         }
-        if let Some(insertion) = pyatv_proto_companion::keyed_archiver::as_string(read[2].as_ref())
-        {
+        if let Some(insertion) = crate::keyed_archiver::as_string(read[2].as_ref()) {
             self.rti_text
                 .get_or_insert_with(String::new)
                 .push_str(insertion);

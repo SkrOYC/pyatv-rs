@@ -175,6 +175,15 @@ impl Actor {
     }
 
     async fn handle_request(&mut self, request: Request) {
+        if let Request::Send { message, .. } | Request::Exchange { message, .. } = &request {
+            tracing::trace!(
+                message_type = message.message_type(),
+                kind = ?message.message_type_enum(),
+                bytes = message.bytes().len(),
+                "sending an MRP message"
+            );
+        }
+
         match request {
             Request::Send { message, reply } => {
                 let _ = reply.send(self.transport.send(&message).await);
@@ -211,6 +220,17 @@ impl Actor {
     /// for is dispatched to the type-based listeners instead.
     fn dispatch(&mut self, message: MrpMessage) {
         let key = message.correlation_key();
+        // At `trace`, because on a live tunnel this fires for every push the device makes — which
+        // is also exactly when it is worth having: it is the only view of what a real device sends
+        // unprompted, and diagnosing an unrecognised message type without it means guessing.
+        tracing::trace!(
+            message_type = message.message_type(),
+            kind = ?message.message_type_enum(),
+            bytes = message.bytes().len(),
+            correlated = self.outstanding.contains_key(&key),
+            "received an MRP message"
+        );
+
         if let Some(reply) = self.outstanding.remove(&key) {
             let _ = reply.send(Ok(message));
             return;

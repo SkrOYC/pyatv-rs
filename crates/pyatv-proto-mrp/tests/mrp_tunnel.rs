@@ -10,7 +10,7 @@
 //! [`ByteChannel`], which carries the decoded `data` blob and nothing else. The umbrella crate
 //! implements it over the real data-stream channel.
 
-mod support;
+use pyatv_proto_mrp::test_support as support;
 
 use std::sync::Arc;
 use std::time::Duration;

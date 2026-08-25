@@ -5,7 +5,10 @@
 //! formatting is reproduced explicitly rather than left to Rust's defaults, which differ.
 
 use anyhow::Result;
-use pyatv::{App, FeatureInfo, FeatureName, InputAction, PowerState, RemoteControl};
+use pyatv::{
+    App, FeatureInfo, FeatureName, InputAction, PlaybackListener, Playing, PowerState,
+    RemoteControl,
+};
 
 /// What `_pretty_print` shows for a `None`: Python's own spelling.
 pub fn optional(value: Option<&str>) -> &str {
@@ -61,14 +64,38 @@ pub fn print_features(features: &[(FeatureName, FeatureInfo)]) {
     println!("Unsupported: Not supported by this device (or by pyatv)");
 }
 
+/// Prints every push update the way upstream's `PushListener` does.
+///
+/// `atvremote.py:504-513`: the same block `playing` prints, then twenty dashes as a rule, and an
+/// error is a single line that does not stop the stream — the updater recovers on its own.
+#[derive(Debug)]
+pub struct PrintingListener;
+
+impl PlaybackListener for PrintingListener {
+    fn playstatus_update(&self, playing: &Playing) {
+        println!("{playing}");
+        println!("{}", "-".repeat(20));
+    }
+
+    fn playstatus_error(&self, error: &pyatv::Error) {
+        println!("An error occurred (restarting): {error}");
+    }
+}
+
 /// The error a subcommand reports when no connected protocol serves it.
 ///
 /// Upstream has no equivalent: its facade hands back an object for every capability and raises
 /// `NotSupportedError` on first use. Here the capability is absent from the type, so the message
 /// has to say which protocol would have supplied it.
+///
+/// Deliberately a [`pyatv::Error::NotSupported`] rather than a bare `anyhow!`, so that `main`'s
+/// reporter recognises it and prints one plain line instead of a backtrace — this is the failure a
+/// user meets whenever a device is not paired for the protocol they need, and it is not a crash.
 #[must_use]
 pub fn unsupported(what: &str, protocols: &str) -> anyhow::Error {
-    anyhow::anyhow!("{what} is not supported by any connected protocol (needs {protocols})")
+    anyhow::Error::new(pyatv::Error::NotSupported(format!(
+        "{what} is not supported by any connected protocol (needs {protocols})"
+    )))
 }
 
 /// Map a button name onto a [`RemoteControl`] method.

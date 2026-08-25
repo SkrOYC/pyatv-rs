@@ -55,6 +55,27 @@ pub struct InfoSettings {
     pub os_version: String,
 }
 
+impl From<&pyatv_core::storage::InfoSettings> for InfoSettings {
+    /// Take the controller identity out of persisted settings.
+    ///
+    /// Upstream has one `InfoSettings` and passes `core.settings.info` straight into `AP2Session`
+    /// (`pyatv/protocols/airplay/__init__.py:235-237`). This crate keeps its own copy of the type
+    /// so that nothing about AirPlay's `SETUP` body depends on the storage schema, and this is the
+    /// bridge. `rp_id` has no place in a remote-control `SETUP` body — the eleven keys are closed,
+    /// see [`remote_control_setup_body`] — so it is dropped rather than carried.
+    fn from(settings: &pyatv_core::storage::InfoSettings) -> Self {
+        Self {
+            name: settings.name.clone(),
+            mac: settings.mac.clone(),
+            device_id: settings.device_id.clone(),
+            model: settings.model.clone(),
+            os_name: settings.os_name.clone(),
+            os_build: settings.os_build.clone(),
+            os_version: settings.os_version.clone(),
+        }
+    }
+}
+
 impl Default for InfoSettings {
     /// pyatv's defaults verbatim (`pyatv/settings.py:36-42`).
     fn default() -> Self {
