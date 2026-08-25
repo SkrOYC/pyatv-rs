@@ -17,7 +17,7 @@
 //! | Key | Upstream | Here |
 //! | --- | --- | --- |
 //! | `datetime` | local time with the local UTC offset (`atvscript.py:194`) | UTC, i.e. always `+00:00`. Reading the local offset needs a tz database and is unsound to do from a threaded process in the crates that offer it; the instant is identical, only the rendering differs. |
-//! | `stacktrace` | `traceback.format_exception(...)` | the `anyhow` error chain, since Rust errors carry no traceback. Omitted when the chain has a single link. |
+//! | `stacktrace` | `traceback.format_exception(...)` | the `anyhow` error chain, outermost first, one cause per line — Rust errors carry no traceback. Always present alongside `exception`, as upstream's is; an error with no deeper cause renders as its own message. |
 //! | `hash` | falls back to `sha256(title+artist+album+total_time)` when unset (`pyatv/interface.py:601-612`) | `null` when unset; the fallback is not implemented in `pyatv-core` (see `models/playing.rs`). |
 //!
 //! Commands `atvscript` does not have — `features`, `device_info`, `app_list` and the rest — get a
@@ -80,17 +80,21 @@ impl Envelope {
         self
     }
 
-    /// Attach an unexpected failure as `exception`, plus `stacktrace` when there is a cause chain.
+    /// Attach an unexpected failure as `exception` and `stacktrace`.
+    ///
+    /// Both keys, always: `output` sets them together under one `if exception:`
+    /// (`atvscript.py:198-204`), so a consumer that reads `stacktrace` whenever `exception` is
+    /// present finds it there. Rust errors carry no traceback, so the value is the `anyhow` cause
+    /// chain — and when the error has no deeper cause there is still one frame to show, its own
+    /// message, which is what `traceback.format_exception` renders for a bare `raise` too.
     #[must_use]
     pub fn exception(mut self, error: &anyhow::Error) -> Self {
         self.fields
             .insert("exception".to_owned(), Value::String(error.to_string()));
 
-        let chain: Vec<String> = error.chain().skip(1).map(ToString::to_string).collect();
-        if !chain.is_empty() {
-            self.fields
-                .insert("stacktrace".to_owned(), Value::String(chain.join("\n")));
-        }
+        let chain: Vec<String> = error.chain().map(ToString::to_string).collect();
+        self.fields
+            .insert("stacktrace".to_owned(), Value::String(chain.join("\n")));
         self
     }
 
@@ -166,20 +170,26 @@ mod tests {
         assert_eq!(value["error"], "device_not_found");
     }
 
+    /// `atvscript.py:198-204` sets `exception` and `stacktrace` under one `if`, so they arrive
+    /// together or not at all. A consumer keying off `exception` must never find `stacktrace`
+    /// missing just because the error had no deeper cause.
     #[test]
-    fn an_exception_chain_becomes_a_stacktrace() {
+    fn an_exception_always_carries_a_stacktrace() {
         let bare = anyhow::anyhow!("it broke");
         let value = parse(Envelope::failure().exception(&bare));
         assert_eq!(value["exception"], "it broke");
-        assert!(
-            value.get("stacktrace").is_none(),
-            "a single-link chain has no trace to show"
+        assert_eq!(
+            value["stacktrace"], "it broke",
+            "the one frame there is, rather than nothing at all"
         );
 
         let chained = bare.context("while connecting");
         let value = parse(Envelope::failure().exception(&chained));
         assert_eq!(value["exception"], "while connecting");
-        assert_eq!(value["stacktrace"], "it broke");
+        assert_eq!(
+            value["stacktrace"], "while connecting\nit broke",
+            "the whole chain, outermost first"
+        );
     }
 
     #[test]

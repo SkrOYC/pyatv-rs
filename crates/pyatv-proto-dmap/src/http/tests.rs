@@ -5,7 +5,7 @@ use std::io::Write;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use super::{HttpClient, HttpRequest, Method};
+use super::{HttpClient, HttpRequest, Method, response};
 
 /// Serve `reply` to one connection and hand back the request bytes that arrived.
 async fn serve_once(reply: Vec<u8>) -> (HttpClient, tokio::task::JoinHandle<Vec<u8>>) {
@@ -404,4 +404,105 @@ async fn a_chunked_body_split_mid_chunk_across_reads_is_reassembled() {
         .await
         .expect("succeeds");
     assert_eq!(response.body, b"Wikipedia");
+}
+
+// ---- Chunked framing caps ----
+
+/// Serve a chunked response head, then `prologue`, then `piece` over and over in small writes, until
+/// the client gives up or `limit` bytes of `piece` have gone out.
+///
+/// Small writes on purpose: the client reassembles this one `read_more` at a time, exactly as it
+/// does off a real socket, so what ends the loop is a cap and nothing else. `limit` is a backstop
+/// that keeps a regression to a failed assertion rather than a hung test run — with the cap removed
+/// the client reads until the server stops and then reports a *closed connection*, which is a
+/// different error and fails the assertion on the message. Keep it a small multiple of the cap under
+/// test: an uncapped decoder re-scans the whole incomplete region on every read, so a generous
+/// backstop turns a regression into a quadratic crawl rather than a quick failure.
+async fn serve_endless_chunked(prologue: Vec<u8>, piece: Vec<u8>, limit: usize) -> HttpClient {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("loopback bind");
+    let address = listener.local_addr().expect("bound");
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("one connection");
+        let mut discard = [0u8; 4096];
+        let _ = stream.read(&mut discard).await;
+
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        if stream.write_all(head).await.is_err() || stream.write_all(&prologue).await.is_err() {
+            return;
+        }
+
+        let mut sent = 0usize;
+        while sent < limit {
+            // A write failing means the client hung up, which is the outcome under test.
+            if stream.write_all(&piece).await.is_err() {
+                return;
+            }
+            sent += piece.len();
+        }
+        let _ = stream.shutdown().await;
+    });
+
+    HttpClient::new(address)
+}
+
+/// A chunk-size line that never gets its `CRLF` is an unbounded read: `MAX_BODY_LEN` bounds *decoded
+/// chunk data*, and this input produces none of it, so nothing else stops the read buffer growing.
+#[tokio::test]
+async fn a_chunk_size_line_that_never_ends_does_not_grow_the_read_buffer_forever() {
+    // Hex digits, so the line stays a plausible chunk size right up until it is refused.
+    let client = serve_endless_chunked(
+        Vec::new(),
+        b"aaaaaaaaaaaaaaaa".to_vec(),
+        16 * response::MAX_CHUNK_LINE_LEN,
+    )
+    .await;
+
+    let error = client
+        .send(&get("whatever", &[]))
+        .await
+        .expect_err("an unterminated chunk size line must be refused");
+    assert!(error.to_string().contains("exceeds"), "{error}");
+    assert!(error.to_string().contains("chunk size line"), "{error}");
+}
+
+/// The same hole one step further on: the terminating `0\r\n` chunk arrives and is then followed by
+/// trailer lines forever, so the blank line that would end the trailer section never comes.
+#[tokio::test]
+async fn a_trailer_section_that_never_ends_does_not_grow_the_read_buffer_forever() {
+    // No two consecutive CRLFs ever appear after the terminator.
+    let client = serve_endless_chunked(
+        b"4\r\nWiki\r\n0\r\n".to_vec(),
+        b"X-Pad: aaaaaaaaaaaaaaaaaaaaaaaa\r\n".to_vec(),
+        16 * response::MAX_TRAILER_LEN,
+    )
+    .await;
+
+    let error = client
+        .send(&get("whatever", &[]))
+        .await
+        .expect_err("an endless trailer section must be refused");
+    assert!(error.to_string().contains("exceeds"), "{error}");
+    assert!(error.to_string().contains("trailer"), "{error}");
+}
+
+/// Framing alone, spread over well-formed chunks, is enough to outrun `MAX_BODY_LEN`: one-byte
+/// chunks cost six raw bytes each, so eight mebibytes of decoded body would need forty-eight of
+/// buffer. `MAX_CHUNKED_RAW_LEN` is what bounds that, and it is checked here on a body whose decoded
+/// size never comes close to its own cap.
+#[tokio::test]
+async fn chunk_framing_alone_cannot_outgrow_the_raw_cap() {
+    // Written a block at a time rather than a chunk at a time: nine mebibytes in six-byte writes
+    // would be a million syscalls, and what this test is about is the total, not the split.
+    let block = b"1\r\nx\r\n".repeat(8 * 1024);
+    let client = serve_endless_chunked(Vec::new(), block, 2 * super::MAX_CHUNKED_RAW_LEN).await;
+
+    let error = client
+        .send(&get("whatever", &[]))
+        .await
+        .expect_err("a chunked body over the raw cap must be refused");
+    assert!(error.to_string().contains("exceeds"), "{error}");
+    assert!(error.to_string().contains("chunked response"), "{error}");
 }

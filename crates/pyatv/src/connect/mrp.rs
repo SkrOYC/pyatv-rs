@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use pyatv_core::airplay::{AirPlayMajorVersion, AirPlayVersion, get_protocol_version};
 use pyatv_core::facade::{ListenerHub, SetupData, StateDispatcher};
-use pyatv_core::interface::{BoxFuture, DeviceListener, PowerListener, ProtocolHandle};
+use pyatv_core::interface::{BoxFuture, DeviceListener, ProtocolHandle};
 use pyatv_core::storage::{MrpTunnel, Settings};
 use pyatv_core::{BaseConfig, BaseService, Protocol, Result};
 use pyatv_proto_airplay::ap2::InfoSettings as Ap2InfoSettings;
@@ -216,7 +216,10 @@ fn options(
     // "device_id", so that is what is reported.
     options.identifier = config.identifier().map(str::to_owned);
     options.listener = Some(Arc::clone(listeners) as Arc<dyn DeviceListener>);
-    options.power_listener = Some(Arc::clone(listeners) as Arc<dyn PowerListener>);
+    // Tagged rather than the bare hub: the hub drops a power update from any protocol that is not
+    // the power relayer's main one, which is how upstream's "subscribe only the main instance"
+    // (`facade.py:777-781`) is reproduced without rewiring on takeover.
+    options.power_listener = Some(listeners.power_listener(Protocol::Mrp));
     // `MrpAudio.state_dispatcher` (`mrp/__init__.py:750-754`): volume and output-device changes
     // arrive here and the hub turns them into `AudioListener` callbacks.
     options.state_dispatcher = Some(Arc::clone(listeners) as Arc<dyn StateDispatcher>);

@@ -160,6 +160,15 @@ impl FacadeAppleTV {
         takeover.insert(Interface::TouchGestures, &touch_gestures);
         takeover.insert(Interface::UserAccounts, &user_accounts);
 
+        // The hub filters keyboard and power updates on the relayer's *current* main protocol, so
+        // it is given the relayers rather than an answer: `message_filter=lambda message:
+        // message.protocol == self.main_protocol` (`facade.py:557`) and `power.listener =
+        // self._interfaces[Power]` (`facade.py:777-781`) are both re-evaluated upstream, and a
+        // takeover moves the main protocol under both of them.
+        let listeners = Arc::new(ListenerHub::default());
+        listeners.set_keyboard_relayer(&keyboard);
+        listeners.set_power_relayer(&power);
+
         let facades = Facades {
             remote_control: Arc::new(FacadeRemoteControl::new(Arc::clone(&remote_control))),
             metadata: Arc::new(FacadeMetadata::new(Arc::clone(&metadata))),
@@ -191,7 +200,7 @@ impl FacadeAppleTV {
             facades,
             takeover: Arc::new(takeover),
             handles: Vec::new(),
-            listeners: Arc::new(ListenerHub::default()),
+            listeners,
             device_info: DeviceInfo::default(),
             service,
         }
@@ -250,11 +259,6 @@ impl FacadeAppleTV {
         if has_push_updater {
             self.features.set_push_updates(true);
         }
-
-        // `FacadeKeyboard`'s dispatcher filter is on the keyboard relayer's main protocol
-        // (`facade.py:554-558`), which only the facade can know.
-        self.listeners
-            .set_keyboard_protocol(self.keyboard.main_protocol());
 
         if let Some(handle) = data.handle {
             self.handles.push((protocol, handle));

@@ -28,6 +28,13 @@ pub const MULTICAST_TTL: u32 = 10;
 /// interface address it is bound to that address, has `IP_MULTICAST_IF` pointed at it, and joins
 /// the group on it.
 ///
+/// # A per-interface bind cannot receive multicast on Linux
+///
+/// The `Some(interface)` form is for **transmitting**, and for receiving the *unicast* replies a
+/// `QU` question attracts — which is all the scanner asks of it. It will not see datagrams sent to
+/// the group; see [`mcast_responder_socket`] for why, and use that instead when the socket has to
+/// receive group traffic.
+///
 /// Options, in pyatv's order: `SO_REUSEADDR`, `IP_MULTICAST_TTL` = [`MULTICAST_TTL`],
 /// `IP_MULTICAST_LOOP` on, and `SO_REUSEPORT` where the platform has it. `SO_REUSEPORT` is what
 /// lets this coexist with a system responder such as avahi-daemon or mDNSResponder already holding
@@ -52,6 +59,61 @@ pub const MULTICAST_TTL: u32 = 10;
 /// rejected, or if the bind fails — most often because another process holds the port and the
 /// platform has no `SO_REUSEPORT`.
 pub fn mcast_socket(interface: Option<Ipv4Addr>, port: u16) -> io::Result<UdpSocket> {
+    build_socket(interface, interface.unwrap_or(Ipv4Addr::UNSPECIFIED), port)
+}
+
+/// Build a multicast socket that **receives** group traffic while still transmitting from one
+/// interface: `IP_MULTICAST_IF` and `IP_ADD_MEMBERSHIP` on `interface`, but bound to the wildcard.
+///
+/// This is [`mcast_socket`] minus its one fatal property for a responder — the per-interface bind.
+///
+/// # Why the bind must be the wildcard on Linux
+///
+/// A socket bound to a unicast address never sees a multicast datagram on Linux. `net/ipv4/udp.c`'s
+/// `__udp_is_mcast_sock()`, the predicate `__udp4_lib_mcast_deliver()` filters candidate sockets
+/// with, rejects a socket when
+///
+/// ```text
+/// inet->inet_rcv_saddr && inet->inet_rcv_saddr != loc_addr
+/// ```
+///
+/// where `loc_addr` is the datagram's *destination* — the group address, `224.0.0.251` — and
+/// `inet_rcv_saddr` is whatever the socket was bound to. Bind to `192.168.1.5` and the two never
+/// match, so the group's datagrams are filtered out before delivery even though the interface
+/// joined the group. Joining a group and receiving its traffic are separate things: the join tells
+/// the kernel and the switch to accept the frames, the bind decides which sockets they reach.
+///
+/// This bit an earlier version of [`crate::publish::Responder`]: it bound `address:5353`, never saw
+/// the `_touch-remote._tcp.local` browse query an Apple TV sends, and DMAP pairing was invisible.
+/// Do not "tidy" this back into a per-interface bind.
+///
+/// The scanner's per-interface sockets in [`mod@super::multicast`] are *not* affected and deliberately
+/// keep their per-interface bind: they exist to transmit and to catch the unicast replies the `QU`
+/// bit asks for, both of which are unicast paths that `__udp_is_mcast_sock()` never touches. The
+/// scanner's group reception is the wildcard listener's job.
+///
+/// # Consequence of the wildcard bind
+///
+/// Every responder on the host receives every interface's group traffic, so on a multi-homed host a
+/// query arriving on one link is also answered out of the others. That is legitimate mDNS — each
+/// interface answers with its own `A` record — and the alternative, `IP_PKTINFO` plus a per-datagram
+/// arrival-interface check, buys nothing for a service that wants to be found on every link.
+///
+/// # Errors
+///
+/// As [`mcast_socket`]: the underlying [`io::Error`] if the socket cannot be created, if a mandatory
+/// option is rejected, or if binding `0.0.0.0:port` fails.
+pub fn mcast_responder_socket(interface: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {
+    build_socket(Some(interface), Ipv4Addr::UNSPECIFIED, port)
+}
+
+/// The shared body of [`mcast_socket`] and [`mcast_responder_socket`]: `interface` drives
+/// `IP_MULTICAST_IF` and the group join, `bind_to` drives the bind, and the two are independent.
+fn build_socket(
+    interface: Option<Ipv4Addr>,
+    bind_to: Ipv4Addr,
+    port: u16,
+) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
     socket.set_reuse_address(true)?;
@@ -71,8 +133,8 @@ pub fn mcast_socket(interface: Option<Ipv4Addr>, port: u16) -> io::Result<UdpSoc
         }
     }
 
-    let bind_address = SocketAddrV4::new(interface.unwrap_or(Ipv4Addr::UNSPECIFIED), port);
-    tracing::debug!(address = %bind_address, "binding multicast socket");
+    let bind_address = SocketAddrV4::new(bind_to, port);
+    tracing::debug!(address = %bind_address, ?interface, "binding multicast socket");
     socket.bind(&SocketAddr::V4(bind_address).into())?;
     socket.set_nonblocking(true)?;
 
@@ -136,7 +198,7 @@ fn is_private(address: Ipv4Addr) -> bool {
 mod tests {
     use std::net::Ipv4Addr;
 
-    use super::{is_private, mcast_socket, private_ipv4_addresses};
+    use super::{is_private, mcast_responder_socket, mcast_socket, private_ipv4_addresses};
 
     #[test]
     fn the_private_predicate_matches_pythons() {
@@ -182,5 +244,34 @@ mod tests {
         assert_ne!(bound.port(), 0);
         assert_eq!(socket.multicast_ttl_v4().ok(), Some(super::MULTICAST_TTL));
         assert_eq!(socket.multicast_loop_v4().ok(), Some(true));
+    }
+
+    /// The receive half of the responder's socket: bound to the wildcard even though it is given an
+    /// interface, because Linux's `__udp_is_mcast_sock()` will not deliver group traffic to a socket
+    /// whose `inet_rcv_saddr` is a unicast address. See [`mcast_responder_socket`].
+    #[tokio::test]
+    async fn a_responder_socket_binds_the_wildcard_not_its_interface() {
+        let interface = Ipv4Addr::new(192, 0, 2, 10);
+        let socket = mcast_responder_socket(interface, 0).expect("responder socket binds");
+        let bound = socket.local_addr().expect("a bound socket has an address");
+
+        assert_eq!(
+            bound.ip(),
+            std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            "a per-interface bind stops the kernel delivering multicast to this socket"
+        );
+        assert_ne!(bound.port(), 0);
+        assert_eq!(socket.multicast_ttl_v4().ok(), Some(super::MULTICAST_TTL));
+        assert_eq!(socket.multicast_loop_v4().ok(), Some(true));
+    }
+
+    /// The transmit-side sockets the scanner opens keep their per-interface bind: they only ever
+    /// receive unicast replies, so the kernel predicate above does not apply to them.
+    #[tokio::test]
+    async fn a_scanner_interface_socket_still_binds_its_interface() {
+        let socket = mcast_socket(Some(Ipv4Addr::LOCALHOST), 0).expect("interface socket binds");
+        let bound = socket.local_addr().expect("a bound socket has an address");
+
+        assert_eq!(bound.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 }

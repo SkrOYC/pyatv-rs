@@ -53,7 +53,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub use response::{ChunkedDecoder, Framing, Head, MAX_BODY_LEN, is_success};
+pub use response::{ChunkedDecoder, Framing, Head, MAX_BODY_LEN, MAX_CHUNKED_RAW_LEN, is_success};
 
 use crate::{Error, Result};
 
@@ -269,11 +269,27 @@ impl HttpClient {
             }
             Framing::Chunked => {
                 // The decoder is kept across reads so a body arriving in many pieces is decoded
-                // once rather than re-scanned from byte zero every time; it enforces the cap too.
+                // once rather than re-scanned from byte zero every time; it enforces
+                // `MAX_BODY_LEN` on the decoded data as it goes.
+                //
+                // That cap alone does not bound this loop, though, because the decoded body and the
+                // raw buffer are not the same quantity: chunk framing, and anything the decoder is
+                // still waiting to complete, sit in `buffer` without ever reaching `body`. The
+                // decoder bounds each individual incomplete region it can be strung along by (a
+                // chunk-size line, the trailer section); `MAX_CHUNKED_RAW_LEN` bounds the sum, and
+                // with it the memory this loop can be made to hold.
                 let mut decoder = ChunkedDecoder::new();
                 loop {
                     if decoder.feed(&buffer[head_len..])?.is_some() {
                         break decoder.into_body();
+                    }
+                    let raw = buffer.len() - head_len;
+                    if raw > MAX_CHUNKED_RAW_LEN {
+                        return Err(response::framing_too_large(
+                            "chunked response",
+                            raw,
+                            MAX_CHUNKED_RAW_LEN,
+                        ));
                     }
                     if read_more(stream, &mut buffer).await? == 0 {
                         return Err(closed("inside a chunked body"));

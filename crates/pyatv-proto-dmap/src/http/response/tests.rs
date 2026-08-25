@@ -221,6 +221,56 @@ fn a_chunked_body_over_the_cap_is_refused() {
     assert!(ChunkedDecoder::new().feed(&data).is_err());
 }
 
+/// A chunk-size line with no `CRLF` never becomes parseable, so the decoder can be strung along
+/// forever unless it bounds the incomplete line itself. [`MAX_BODY_LEN`] cannot see this: not one
+/// byte of it is chunk data.
+#[test]
+fn a_chunk_size_line_that_never_ends_is_refused() {
+    let mut decoder = ChunkedDecoder::new();
+    let mut data = Vec::new();
+
+    // Well under the cap: still just an incomplete line.
+    data.resize(super::MAX_CHUNK_LINE_LEN, b'a');
+    assert!(
+        decoder
+            .feed(&data)
+            .expect("still short, not malformed")
+            .is_none(),
+        "a line at exactly the cap is short, not refused"
+    );
+
+    data.push(b'a');
+    let error = decoder
+        .feed(&data)
+        .expect_err("a chunk size line past the cap must be refused");
+    assert!(error.to_string().contains("exceeds"), "{error}");
+    assert!(error.to_string().contains("chunk size line"), "{error}");
+}
+
+/// The same hole after the terminating chunk: trailer lines that never produce the blank line
+/// ending the trailer section.
+#[test]
+fn a_trailer_section_that_never_ends_is_refused() {
+    let mut decoder = ChunkedDecoder::new();
+    let mut data = b"4\r\nWiki\r\n0\r\n".to_vec();
+    let head_len = data.len();
+
+    while data.len() - head_len <= super::MAX_TRAILER_LEN {
+        data.extend_from_slice(b"X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+        // Nothing here is a blank line, so the trailer section never ends.
+        assert!(!data.ends_with(b"\r\n\r\n"));
+    }
+
+    let error = decoder
+        .feed(&data)
+        .expect_err("an endless trailer section must be refused");
+    assert!(error.to_string().contains("exceeds"), "{error}");
+    assert!(error.to_string().contains("trailer"), "{error}");
+
+    // The chunk before the terminator was still decoded normally on the way past.
+    assert_eq!(decoder.body(), b"Wiki");
+}
+
 /// The free function and the method agree, which is what lets [`crate::daap`] branch on a bare
 /// status after the head has been dropped.
 #[test]

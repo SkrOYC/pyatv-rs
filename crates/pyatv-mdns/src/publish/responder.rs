@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 
 use super::registration::{ANNOUNCE_COUNT, ANNOUNCE_INTERVAL, ServiceRegistration};
 use crate::dns::{DnsMessage, DnsResource, QueryType, RecordData};
-use crate::mdns::socket::{mcast_socket, private_ipv4_addresses};
+use crate::mdns::socket::{mcast_responder_socket, private_ipv4_addresses};
 use crate::mdns::{MDNS_PORT, MULTICAST_GROUP};
 
 /// Receive buffer size.
@@ -59,30 +59,41 @@ struct Inner {
 }
 
 impl Responder {
-    /// Publish on the real multicast group from one interface: bind `address:5353` and join
-    /// `224.0.0.251` on it.
+    /// Publish on the real multicast group from one interface: bind `0.0.0.0:5353`, point
+    /// `IP_MULTICAST_IF` at `address`, and join `224.0.0.251` on it.
     ///
-    /// The bind is per interface rather than to the wildcard because that is the only way
-    /// `IP_MULTICAST_IF` gets set: a socket bound to `0.0.0.0` sends its multicasts out of
-    /// whichever interface the kernel's routing table picks by default, which on a host with more
-    /// than one is quite likely not the one the Apple TV is on — and the responder would then be
-    /// announcing an `A` record for an address unreachable from where the announcement arrived.
-    /// [`mcast_socket`] with an interface sets `IP_MULTICAST_IF`, joins the group on it, and binds
-    /// to it, so what goes out and what comes in are both pinned to the right link.
+    /// Transmission is pinned to one interface and reception is not, and the split is deliberate.
+    ///
+    /// `IP_MULTICAST_IF` is what makes the outbound half correct: a socket without it sends its
+    /// multicasts out of whichever interface the kernel's routing table picks by default, which on
+    /// a host with more than one is quite likely not the one the Apple TV is on — and the responder
+    /// would then be announcing an `A` record for an address unreachable from where the
+    /// announcement arrived.
+    ///
+    /// The **bind**, though, must stay on the wildcard. A socket bound to `address` never receives
+    /// a datagram sent to the group on Linux, because `__udp_is_mcast_sock()` compares the socket's
+    /// `inet_rcv_saddr` against the datagram's destination — `224.0.0.251` — and drops the socket
+    /// from delivery when a non-zero `inet_rcv_saddr` differs from it. Binding `address:5353` here
+    /// is what made an Apple TV's `_touch-remote._tcp.local` browse query invisible and DMAP
+    /// pairing along with it. [`mcast_responder_socket`] documents the kernel predicate in full;
+    /// read it before changing this line.
     ///
     /// One responder therefore publishes **one** address, and `registration` should carry that one
     /// and no other; a caller with several interfaces builds one responder per interface, which is
-    /// what [`crate::publish`]'s only caller does.
+    /// what [`crate::publish`]'s only caller does. Those responders all share port 5353 through
+    /// `SO_REUSEPORT` and all see the whole host's group traffic, so a query arriving on one link is
+    /// answered out of every link — each with its own `A` record, which is what an mDNS responder on
+    /// a multi-homed host is supposed to do anyway.
     ///
     /// Announcements start immediately in the background, per RFC 6762 §8.3.
     ///
     /// # Errors
     ///
-    /// Returns the underlying [`io::Error`] if `address:5353` cannot be bound. `SO_REUSEPORT` is
+    /// Returns the underlying [`io::Error`] if `0.0.0.0:5353` cannot be bound. `SO_REUSEPORT` is
     /// set where the platform has it, so coexisting with avahi-daemon or mDNSResponder normally
     /// works; where it does not, this is where that shows up.
     pub fn bind(address: Ipv4Addr, registration: ServiceRegistration) -> io::Result<Self> {
-        let socket = mcast_socket(Some(address), MDNS_PORT)?;
+        let socket = mcast_responder_socket(address, MDNS_PORT)?;
         let destination = SocketAddr::V4(SocketAddrV4::new(MULTICAST_GROUP, MDNS_PORT));
         Ok(Self::with_socket(socket, destination, registration))
     }

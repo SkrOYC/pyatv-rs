@@ -424,6 +424,30 @@ fn publishable_addresses_exclude_loopback() {
     assert!(!publishable_addresses().contains(&Ipv4Addr::LOCALHOST));
 }
 
+/// `Responder::bind` must land on `0.0.0.0:5353`, never on the interface address it was given.
+///
+/// Linux's `__udp_is_mcast_sock()` refuses to deliver a datagram addressed to `224.0.0.251` to a
+/// socket whose `inet_rcv_saddr` is a unicast address, so a per-interface bind here means the
+/// responder never sees the `_touch-remote._tcp.local` browse query an Apple TV multicasts, and DMAP
+/// pairing silently never starts. The interface still governs *transmission*, via `IP_MULTICAST_IF`.
+///
+/// Binding the real 5353 is the point of the test, so it is `#[ignore]`d like the one below: with
+/// `SO_REUSEADDR` and `SO_REUSEPORT` it coexists with avahi-daemon, but a sandbox that forbids the
+/// port or the group join would fail it for an unrelated reason.
+#[tokio::test]
+#[ignore = "binds the real port 5353; run with --ignored"]
+async fn bind_listens_on_the_wildcard_so_multicast_is_delivered() {
+    let interface = Ipv4Addr::new(192, 168, 1, 50);
+    let responder =
+        Responder::bind(interface, registration(49_152).with_address(interface)).expect("bind");
+
+    let bound = responder
+        .local_addr()
+        .expect("a bound socket has an address");
+    assert_eq!(bound.ip(), std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    assert_eq!(bound.port(), MDNS_PORT);
+}
+
 /// The real thing, on the real group and the real port. Ignored by default: it needs a host that
 /// permits binding 5353 and joining `224.0.0.251`, which CI containers usually do not.
 #[tokio::test]

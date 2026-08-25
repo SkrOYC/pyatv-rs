@@ -26,6 +26,40 @@ pub const MAX_HEAD_LEN: usize = 16 * 1024;
 /// full resolution, so nothing legitimate comes near this and anything that does is not artwork.
 pub const MAX_BODY_LEN: usize = 8 * 1024 * 1024;
 
+/// How many bytes of chunk framing a chunked body may carry on top of [`MAX_BODY_LEN`].
+///
+/// [`MAX_BODY_LEN`] bounds the *decoded* body, which is not by itself a bound on memory: chunk
+/// framing costs at least five bytes per chunk (`"1\r\n" + byte + "\r\n"` is the smallest a
+/// one-byte chunk can be), so a peer that never sends a terminating chunk can make the raw read
+/// buffer grow without the decoded body ever approaching its cap. This is the allowance for that
+/// difference, and [`MAX_CHUNKED_RAW_LEN`] is what actually gets enforced.
+///
+/// A mebibyte is roughly 200 000 chunks, which no HTTP server produces for an eight-mebibyte body —
+/// a `Vec`-backed writer flushes in kibibytes, not in bytes. It is generous on purpose: the job here
+/// is to bound memory, not to second-guess a device's chunk sizes.
+pub const MAX_CHUNK_FRAMING_LEN: usize = 1024 * 1024;
+
+/// Cap on the *raw* bytes of a chunked body, framing included.
+///
+/// See [`MAX_CHUNK_FRAMING_LEN`]. Enforced by [`super::HttpClient`], which is the only place that
+/// knows how many raw bytes it has buffered; [`ChunkedDecoder`] sees only what it is handed.
+pub const MAX_CHUNKED_RAW_LEN: usize = MAX_BODY_LEN + MAX_CHUNK_FRAMING_LEN;
+
+/// Cap on one chunk-size line, including any `;ext=value` parameters.
+///
+/// A chunk-size line is a hexadecimal number: sixteen digits covers `usize::MAX`, and the rest is
+/// for extensions nothing in DAAP sends. A peer that opens a chunk-size line and never sends the
+/// `CRLF` that ends it is otherwise an unbounded read, since [`ChunkedDecoder::feed`] has nothing to
+/// measure until that `CRLF` arrives.
+pub const MAX_CHUNK_LINE_LEN: usize = 4 * 1024;
+
+/// Cap on the trailer section following the terminating zero-length chunk.
+///
+/// The same shape of hole one step further on: after `0\r\n` the decoder looks for the blank line
+/// that ends the trailers, and a peer that sends trailer lines forever never produces one. Nothing
+/// in DAAP sends trailers at all, so this is pure headroom.
+pub const MAX_TRAILER_LEN: usize = 8 * 1024;
+
 /// Whether a status code is one `_do` treats as success (`daap.py:136-137`).
 ///
 /// A free function rather than only a method on [`Head`] because the retry state machine in
@@ -40,6 +74,16 @@ pub fn is_success(status: u16) -> bool {
 pub(crate) fn body_too_large(bytes: usize) -> Error {
     Error::Http(format!(
         "response body of at least {bytes} bytes exceeds the {MAX_BODY_LEN}-byte cap"
+    ))
+}
+
+/// The same error for the framing around a body rather than the body itself.
+///
+/// `what` names the region — "chunked response", "chunk size line", "chunk trailer section" — so a
+/// log distinguishes a genuinely huge artwork response from a peer stringing the decoder along.
+pub(crate) fn framing_too_large(what: &str, bytes: usize, cap: usize) -> Error {
+    Error::Http(format!(
+        "{what} of at least {bytes} bytes exceeds the {cap}-byte cap"
     ))
 }
 
@@ -258,11 +302,25 @@ impl ChunkedDecoder {
     /// # Errors
     ///
     /// Returns [`Error::Http`] for a chunk size that is not hexadecimal, a chunk not terminated by
-    /// `CRLF`, or a body that would exceed [`MAX_BODY_LEN`].
+    /// `CRLF`, a body that would exceed [`MAX_BODY_LEN`], a chunk-size line longer than
+    /// [`MAX_CHUNK_LINE_LEN`], or a trailer section longer than [`MAX_TRAILER_LEN`].
+    ///
+    /// The last two exist because "more bytes are needed" and "this peer is never going to finish"
+    /// look identical from inside the decoder: without them, a chunk-size line with no `CRLF` and an
+    /// endless run of trailer lines both leave the caller reading forever into a growing buffer,
+    /// while [`MAX_BODY_LEN`] — which only ever sees decoded chunk data — stays at zero.
     pub fn feed(&mut self, data: &[u8]) -> Result<Option<usize>> {
         loop {
             let offset = self.consumed;
             let Some(line_end) = find_crlf(&data[offset..]) else {
+                let pending = data.len() - offset;
+                if pending > MAX_CHUNK_LINE_LEN {
+                    return Err(framing_too_large(
+                        "chunk size line",
+                        pending,
+                        MAX_CHUNK_LINE_LEN,
+                    ));
+                }
                 return Ok(None);
             };
             let header = core::str::from_utf8(&data[offset..offset + line_end])
@@ -277,6 +335,16 @@ impl ChunkedDecoder {
             if size == 0 {
                 // Trailer section, ending with its own blank line.
                 let Some(end) = find_head_end_after_chunks(&data[start..]) else {
+                    // `start` is inside `data`: `find_crlf` only reports a `CRLF` it has both
+                    // bytes of, so `offset + line_end + 2` cannot be past the end.
+                    let pending = data.len() - start;
+                    if pending > MAX_TRAILER_LEN {
+                        return Err(framing_too_large(
+                            "chunk trailer section",
+                            pending,
+                            MAX_TRAILER_LEN,
+                        ));
+                    }
                     return Ok(None);
                 };
                 self.consumed = start + end;

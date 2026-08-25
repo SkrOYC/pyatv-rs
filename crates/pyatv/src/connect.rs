@@ -39,7 +39,7 @@ use std::sync::Arc;
 use pyatv_core::facade::{
     DEFAULT_PRIORITIES, FacadeAppleTV, ListenerHub, SetupData, StateDispatcher,
 };
-use pyatv_core::interface::{AppleTV, DeviceListener, PowerListener};
+use pyatv_core::interface::{AppleTV, DeviceListener};
 use pyatv_core::storage::{Settings, Storage};
 use pyatv_core::{BaseConfig, BaseService, Error, Protocol, Result};
 use pyatv_proto_airplay::raop::{RaopSetupOptions, setup as raop_setup};
@@ -193,7 +193,10 @@ async fn setup_protocol(
                 service: service.clone(),
                 info: settings.info.clone(),
                 listener: Some(Arc::clone(listeners) as Arc<dyn DeviceListener>),
-                power_listener: Some(Arc::clone(listeners) as Arc<dyn PowerListener>),
+                // Tagged with the protocol reporting through it, so that a device connected over
+                // both MRP and Companion produces one callback per transition rather than two —
+                // upstream subscribes only the main `Power` instance (`facade.py:777-781`).
+                power_listener: Some(listeners.power_listener(Protocol::Companion)),
                 state_dispatcher: Some(Arc::clone(listeners) as Arc<dyn StateDispatcher>),
             };
             Ok(companion_setup(options)

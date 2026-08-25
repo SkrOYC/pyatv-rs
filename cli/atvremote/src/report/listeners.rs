@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use pyatv::{
-    AudioListener, DeviceListener, KeyboardFocusState, KeyboardListener, OutputDevice,
-    PlaybackListener, Playing, PowerListener, PowerState,
+    App, AudioListener, DeviceListener, FeatureName, FeatureState, Features, KeyboardFocusState,
+    KeyboardListener, Metadata, OutputDevice, PlaybackListener, Playing, PowerListener, PowerState,
 };
 use serde_json::Value;
 use tokio::sync::Notify;
@@ -51,7 +51,16 @@ impl Listeners {
     pub fn register(reporter: Reporter, atv: &dyn pyatv::AppleTV) -> Self {
         let aborted = Arc::new(Notify::new());
 
-        let playback: Arc<dyn PlaybackListener> = Arc::new(PlaybackPrinter { reporter });
+        // `PushPrinter(args.output, atv)` (`atvscript.py:311`): the printer is given the device so
+        // its callback can read the app that owns each update. Only the two handles the callback
+        // actually reads are taken rather than the whole `AppleTV` — they are `Arc`s the facade
+        // hands out for exactly this, and taking them here saves threading the device handle
+        // through the whole command dispatcher.
+        let playback: Arc<dyn PlaybackListener> = Arc::new(PlaybackPrinter {
+            reporter,
+            metadata: atv.metadata(),
+            features: atv.features(),
+        });
         let power: Arc<dyn PowerListener> = Arc::new(PowerPrinter { reporter });
         let audio: Arc<dyn AudioListener> = Arc::new(AudioPrinter { reporter });
         let keyboard: Arc<dyn KeyboardListener> = Arc::new(KeyboardPrinter { reporter });
@@ -106,21 +115,38 @@ impl Listeners {
     }
 }
 
-/// Prints playback updates.
-#[derive(Debug, Clone, Copy)]
+/// Prints playback updates, with the app that owns them.
+#[derive(Debug)]
 struct PlaybackPrinter {
     reporter: Reporter,
+    /// `self.atv.metadata`, absent when no connected protocol reports metadata at all.
+    metadata: Option<Arc<dyn Metadata>>,
+    /// `self.atv.features`, which decides whether the app is worth asking for.
+    features: Arc<dyn Features>,
+}
+
+impl PlaybackPrinter {
+    /// The app that owns this update, read the way `PushPrinter.playstatus_update` reads it.
+    ///
+    /// `self.atv.metadata.app if not self.atv.features.in_state(Unavailable, App) else None`
+    /// (`atvscript.py:51-55`). Note the gate: anything *but* `Unavailable` is asked, so a protocol
+    /// reporting `Unknown` is still consulted. That is deliberately weaker than the one the
+    /// one-shot `playing` command uses, which is `in_state(Available, App)`
+    /// (`atvscript.py:300-307`, and `commands::media::playing` here).
+    fn app(&self) -> Option<App> {
+        let metadata = self.metadata.as_ref()?;
+        (self.features.get_feature(FeatureName::App).state != FeatureState::Unavailable)
+            .then(|| metadata.app())
+            .flatten()
+    }
 }
 
 impl PlaybackListener for PlaybackPrinter {
     /// Text: the same block `playing` prints, then twenty dashes as a rule
-    /// (`atvremote.py:507-510`). JSON: one `output_playing` envelope (`atvscript.py:49-59`).
-    ///
-    /// The app is not available here — upstream reads `self.atv.metadata.app` inside the callback
-    /// (`atvscript.py:51-55`) but this listener holds no device handle, so `app` and `app_id` are
-    /// reported `null` on pushed updates. `--json playing` fills them in.
+    /// (`atvremote.py:507-510`). JSON: one `output_playing` envelope (`atvscript.py:49-59`),
+    /// including the `app`/`app_id` pair that `output_playing` adds.
     fn playstatus_update(&self, playing: &Playing) {
-        self.reporter.playing(playing, None);
+        self.reporter.playing(playing, self.app().as_ref());
         if !self.reporter.is_json() {
             println!("{}", "-".repeat(20));
         }
@@ -254,8 +280,14 @@ fn power_state_member(state: PowerState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::power_state_member;
-    use pyatv::PowerState;
+    use std::sync::Arc;
+
+    use super::{PlaybackPrinter, power_state_member};
+    use crate::report::Reporter;
+    use pyatv::{
+        App, ArtworkInfo, BoxFuture, FeatureInfo, FeatureName, FeatureState, Features, Metadata,
+        Playing, PowerState, Result,
+    };
 
     /// `print("New power state:", new_state.name)` — the bare member name, not `PowerState.On`.
     #[test]
@@ -263,5 +295,108 @@ mod tests {
         assert_eq!(power_state_member(PowerState::On), "On");
         assert_eq!(power_state_member(PowerState::Off), "Off");
         assert_eq!(power_state_member(PowerState::Unknown), "Unknown");
+    }
+
+    /// A device that always names the same app.
+    #[derive(Debug)]
+    struct FakeMetadata;
+
+    impl Metadata for FakeMetadata {
+        fn device_id(&self) -> Option<String> {
+            None
+        }
+
+        fn playing(&self) -> BoxFuture<'_, Result<Playing>> {
+            Box::pin(async { Ok(Playing::default()) })
+        }
+
+        fn artwork(
+            &self,
+            _width: Option<u32>,
+            _height: Option<u32>,
+        ) -> BoxFuture<'_, Result<Option<ArtworkInfo>>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn artwork_id(&self) -> Option<String> {
+            None
+        }
+
+        fn app(&self) -> Option<App> {
+            Some(App {
+                name: "Music".to_owned(),
+                identifier: "com.apple.TVMusic".to_owned(),
+            })
+        }
+    }
+
+    /// A feature set that reports one fixed state for everything.
+    #[derive(Debug)]
+    struct Fixed(FeatureState);
+
+    impl Features for Fixed {
+        fn get_feature(&self, _feature: FeatureName) -> FeatureInfo {
+            FeatureInfo {
+                state: self.0,
+                reason: None,
+            }
+        }
+
+        fn all_features(&self, _include_unsupported: bool) -> Vec<(FeatureName, FeatureInfo)> {
+            Vec::new()
+        }
+    }
+
+    fn printer(metadata: Option<Arc<dyn Metadata>>, state: FeatureState) -> PlaybackPrinter {
+        PlaybackPrinter {
+            reporter: Reporter::new(true),
+            metadata,
+            features: Arc::new(Fixed(state)),
+        }
+    }
+
+    /// `--json push_updates` used to report `app` and `app_id` as `null` on every update, because
+    /// the printer held no device handle. Upstream's reads `self.atv.metadata.app` in the callback
+    /// (`atvscript.py:51-55`), and so does this one now.
+    #[test]
+    fn a_pushed_update_names_the_app_that_owns_it() {
+        let metadata: Arc<dyn Metadata> = Arc::new(FakeMetadata);
+        let app = printer(Some(metadata), FeatureState::Available)
+            .app()
+            .expect("the device names an app");
+
+        assert_eq!(app.name, "Music");
+        assert_eq!(app.identifier, "com.apple.TVMusic");
+    }
+
+    /// The gate is `not in_state(Unavailable, App)`, so `Unknown` still asks — unlike the one-shot
+    /// `playing` command, whose gate is `in_state(Available, App)`.
+    #[test]
+    fn the_app_is_asked_for_unless_the_feature_is_unavailable() {
+        let metadata: Arc<dyn Metadata> = Arc::new(FakeMetadata);
+
+        for state in [
+            FeatureState::Available,
+            FeatureState::Unknown,
+            FeatureState::Unsupported,
+        ] {
+            assert!(
+                printer(Some(Arc::clone(&metadata)), state).app().is_some(),
+                "{state:?} is not Unavailable, so upstream asks the device"
+            );
+        }
+
+        assert!(
+            printer(Some(metadata), FeatureState::Unavailable)
+                .app()
+                .is_none(),
+            "an Unavailable App feature is never asked for"
+        );
+    }
+
+    /// A device with no metadata protocol at all reports no app rather than panicking.
+    #[test]
+    fn a_device_without_metadata_reports_no_app() {
+        assert!(printer(None, FeatureState::Available).app().is_none());
     }
 }

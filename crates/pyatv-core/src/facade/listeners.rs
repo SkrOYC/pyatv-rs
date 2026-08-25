@@ -13,11 +13,14 @@
 //! other way to reach a facade that does not exist yet; here the hub *is* the thing handed out
 //! before the facade is finished.
 
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::consts::{KeyboardFocusState, PowerState, Protocol};
-use crate::interface::{AudioListener, DeviceListener, KeyboardListener, PowerListener};
+use crate::interface::{
+    AudioListener, DeviceListener, Keyboard, KeyboardListener, Power, PowerListener,
+};
 use crate::models::OutputDevice;
+use crate::relayer::Relayer;
 
 /// Where a protocol reports state it observed on the wire.
 ///
@@ -42,12 +45,6 @@ struct Tracked {
     volume: f32,
     output_devices: Vec<OutputDevice>,
     focus: KeyboardFocusState,
-    /// Which protocol's keyboard updates count, i.e. the keyboard relayer's main protocol.
-    ///
-    /// `message_filter=lambda message: message.protocol == self.main_protocol`
-    /// (`facade.py:554-558`). `None` before any protocol registers a keyboard, in which case
-    /// nothing is filtered out — there is no incumbent to prefer.
-    keyboard_protocol: Option<Protocol>,
 }
 
 /// The listener registry a facade shares with the protocol connections reporting to it.
@@ -69,6 +66,56 @@ pub struct ListenerHub {
     audio: Mutex<Vec<Weak<dyn AudioListener>>>,
     keyboard: Mutex<Vec<Weak<dyn KeyboardListener>>>,
     tracked: Mutex<Tracked>,
+    /// The relayers whose *current* main protocol decides whose updates are heard.
+    ///
+    /// Held [`Weak`] and consulted per update rather than snapshotted, because the answer changes:
+    /// a takeover puts another protocol at the front of a relayer, and upstream's filters are
+    /// closures over `self.main_protocol` (`facade.py:557`, `facade.py:777-781`) that see the new
+    /// answer from the next message on. The facade owns both relayers, so a strong reference here
+    /// would be a cycle.
+    filters: Filters,
+}
+
+/// The relayers [`ListenerHub`] filters against, set once by the facade that owns them.
+///
+/// [`OnceLock`] rather than a lock: [`crate::facade::FacadeAppleTV::new`] binds both before any
+/// protocol can report anything, and nothing rebinds them afterwards.
+#[derive(Debug, Default)]
+struct Filters {
+    keyboard: OnceLock<Weak<Relayer<dyn Keyboard>>>,
+    power: OnceLock<Weak<Relayer<dyn Power>>>,
+}
+
+/// Whether an update reported by `protocol` is the one its relayer currently answers with.
+///
+/// An unbound relayer, one that has been dropped, and one nobody has registered with all answer
+/// "yes": there is no incumbent to prefer, so nothing is filtered out.
+fn is_main<T: ?Sized>(slot: &OnceLock<Weak<Relayer<T>>>, protocol: Protocol) -> bool {
+    slot.get()
+        .and_then(Weak::upgrade)
+        .and_then(|relayer| relayer.main_protocol())
+        .is_none_or(|main| main == protocol)
+}
+
+/// A [`PowerListener`] that remembers which protocol reports through it.
+///
+/// [`PowerListener::power_state_changed`] carries no protocol of its own, but every connected
+/// protocol is handed one and reports its own view of the same device: MRP and Companion both push
+/// a transition, so a hub subscribed to both emits two callbacks for one event. Upstream avoids it
+/// by wiring only the main instance's listener at all — `power.listener = self._interfaces[Power]`
+/// (`facade.py:777-781`) — and binding the protocol at hand-out time is what lets the hub apply the
+/// same rule without having to rewire anything when a takeover moves the main protocol.
+#[derive(Debug)]
+struct ProtocolPowerListener {
+    hub: Arc<ListenerHub>,
+    protocol: Protocol,
+}
+
+impl PowerListener for ProtocolPowerListener {
+    fn power_state_changed(&self, old_state: PowerState, new_state: PowerState) {
+        self.hub
+            .power_state_changed_from(Some(self.protocol), old_state, new_state);
+    }
 }
 
 /// Add a weakly held listener to one of the lists, dropping any that have since died.
@@ -115,15 +162,64 @@ impl ListenerHub {
         subscribe(&self.keyboard, listener);
     }
 
-    /// Tell the hub which protocol's keyboard updates to accept.
+    /// Tell the hub which relayer decides whose keyboard updates to accept.
     ///
-    /// Called by the facade whenever a protocol registers, with the keyboard relayer's current
-    /// main protocol. Upstream expresses the same filter as a `message_filter` on the dispatcher
-    /// subscription (`pyatv/core/facade.py:554-558`); a focus change from any other protocol is
-    /// dropped rather than reported.
-    pub fn set_keyboard_protocol(&self, protocol: Option<Protocol>) {
-        if let Ok(mut tracked) = self.tracked.lock() {
-            tracked.keyboard_protocol = protocol;
+    /// Upstream expresses the same filter as a `message_filter` on the dispatcher subscription,
+    /// `lambda message: message.protocol == self.main_protocol` (`pyatv/core/facade.py:554-558`).
+    /// The closure is evaluated per message, so a takeover that moves the keyboard relayer's main
+    /// protocol changes which protocol is heard; this holds the relayer and asks it the same
+    /// question at the same moment. Only the first call has any effect.
+    pub fn set_keyboard_relayer(&self, relayer: &Arc<Relayer<dyn Keyboard>>) {
+        let _ = self.filters.keyboard.set(Arc::downgrade(relayer));
+    }
+
+    /// Tell the hub which relayer decides whose power updates to accept.
+    ///
+    /// Every connected protocol is handed a [`PowerListener`] and every one of them reports the
+    /// same device, so a hub subscribed to all of them emits one callback per protocol for a single
+    /// transition. Upstream wires only the main instance's listener at all — `power.listener =
+    /// self._interfaces[Power]` (`facade.py:777-781`) — and this is the same rule expressed as a
+    /// filter, so that a takeover moves it without anything having to be rewired. See
+    /// [`ListenerHub::power_listener`] for how a report is attributed to a protocol in the first
+    /// place. Only the first call has any effect.
+    pub fn set_power_relayer(&self, relayer: &Arc<Relayer<dyn Power>>) {
+        let _ = self.filters.power.set(Arc::downgrade(relayer));
+    }
+
+    /// The [`PowerListener`] to hand `protocol`'s `setup()`.
+    ///
+    /// Reports through it are attributed to `protocol` and dropped unless it is the power relayer's
+    /// main protocol, so a device connected over both MRP and Companion produces one callback per
+    /// transition rather than one per protocol.
+    #[must_use]
+    pub fn power_listener(self: &Arc<Self>, protocol: Protocol) -> Arc<dyn PowerListener> {
+        Arc::new(ProtocolPowerListener {
+            hub: Arc::clone(self),
+            protocol,
+        })
+    }
+
+    /// Fan a power transition out, unless a protocol other than the main one reported it.
+    ///
+    /// `protocol` is `None` for a report that arrived through [`ListenerHub`]'s own
+    /// [`PowerListener`] impl, which carries no attribution and is therefore never filtered.
+    fn power_state_changed_from(
+        &self,
+        protocol: Option<Protocol>,
+        old_state: PowerState,
+        new_state: PowerState,
+    ) {
+        if protocol.is_some_and(|reporter| !is_main(&self.filters.power, reporter)) {
+            tracing::trace!(
+                ?protocol,
+                "ignoring a power update from a protocol that is not the main one"
+            );
+            return;
+        }
+
+        tracing::debug!(?old_state, ?new_state, "the device power state changed");
+        for listener in awake(&self.power) {
+            listener.power_state_changed(old_state, new_state);
         }
     }
 
@@ -158,12 +254,15 @@ impl DeviceListener for ListenerHub {
     }
 }
 
+/// The untagged entry point, for a caller that reports on behalf of no particular protocol.
+///
+/// A facade-assembled connection never uses it: [`ListenerHub::power_listener`] is what
+/// `pyatv::connect` hands each protocol, precisely so the report can be attributed. It stays
+/// because a hub used by a single protocol — a test harness, an embedder wiring one protocol by
+/// hand — has nothing to disambiguate and should not have to name itself.
 impl PowerListener for ListenerHub {
     fn power_state_changed(&self, old_state: PowerState, new_state: PowerState) {
-        tracing::debug!(?old_state, ?new_state, "the device power state changed");
-        for listener in awake(&self.power) {
-            listener.power_state_changed(old_state, new_state);
-        }
+        self.power_state_changed_from(None, old_state, new_state);
     }
 }
 
@@ -247,15 +346,19 @@ impl StateDispatcher for ListenerHub {
     /// `FacadeKeyboard._focus_state_changed` (`facade.py:560-568`), including the
     /// only-the-main-protocol filter its `listen_to` applies (`facade.py:554-558`).
     fn keyboard_focus_updated(&self, protocol: Protocol, state: KeyboardFocusState) {
+        // Asked before the `tracked` lock is taken, and asked *now* rather than at registration:
+        // a takeover of the keyboard relayer changes the answer, and must change it here too.
+        if !is_main(&self.filters.keyboard, protocol) {
+            tracing::trace!(
+                ?protocol,
+                "ignoring a focus update from a protocol that is not the main one"
+            );
+            return;
+        }
+
         let Ok(mut tracked) = self.tracked.lock() else {
             return;
         };
-        if tracked
-            .keyboard_protocol
-            .is_some_and(|main| main != protocol)
-        {
-            return;
-        }
         let old_state = tracked.focus;
         if old_state == state {
             return;
@@ -271,176 +374,4 @@ impl StateDispatcher for ListenerHub {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use super::{ListenerHub, StateDispatcher};
-    use crate::consts::{KeyboardFocusState, Protocol};
-    use crate::interface::{AudioListener, KeyboardListener};
-    use crate::models::OutputDevice;
-
-    #[derive(Debug, Default)]
-    struct Recorder {
-        volumes: Mutex<Vec<(f32, f32)>>,
-        devices: Mutex<Vec<(usize, usize)>>,
-        device_volumes: Mutex<Vec<(String, f32, f32)>>,
-        focus: Mutex<Vec<(KeyboardFocusState, KeyboardFocusState)>>,
-    }
-
-    impl AudioListener for Recorder {
-        fn volume_update(&self, old_level: f32, new_level: f32) {
-            self.volumes
-                .lock()
-                .expect("uncontended")
-                .push((old_level, new_level));
-        }
-
-        fn volume_device_update(
-            &self,
-            output_device: &OutputDevice,
-            old_level: f32,
-            new_level: f32,
-        ) {
-            self.device_volumes.lock().expect("uncontended").push((
-                output_device.identifier.clone(),
-                old_level,
-                new_level,
-            ));
-        }
-
-        fn outputdevices_update(&self, old_devices: &[OutputDevice], new_devices: &[OutputDevice]) {
-            self.devices
-                .lock()
-                .expect("uncontended")
-                .push((old_devices.len(), new_devices.len()));
-        }
-    }
-
-    impl KeyboardListener for Recorder {
-        fn focusstate_update(&self, old_state: KeyboardFocusState, new_state: KeyboardFocusState) {
-            self.focus
-                .lock()
-                .expect("uncontended")
-                .push((old_state, new_state));
-        }
-    }
-
-    fn hub() -> (ListenerHub, Arc<Recorder>) {
-        let hub = ListenerHub::default();
-        let recorder = Arc::new(Recorder::default());
-        hub.add_audio_listener(&(Arc::clone(&recorder) as Arc<dyn AudioListener>));
-        hub.add_keyboard_listener(&(Arc::clone(&recorder) as Arc<dyn KeyboardListener>));
-        (hub, recorder)
-    }
-
-    /// `test_audio_listener_volume_updates` / `test_audio_no_listener_volume_duplicates`
-    /// (`tests/core/test_facade.py:838-850`).
-    #[test]
-    fn volume_updates_fire_once_per_actual_change() {
-        let (hub, recorder) = hub();
-
-        hub.volume_updated(Protocol::Mrp, 20.0);
-        hub.volume_updated(Protocol::Mrp, 20.0);
-        hub.volume_updated(Protocol::Mrp, 30.0);
-
-        assert_eq!(
-            *recorder.volumes.lock().expect("uncontended"),
-            vec![(0.0, 20.0), (20.0, 30.0)]
-        );
-        assert!((hub.volume() - 30.0).abs() < f32::EPSILON);
-    }
-
-    /// `test_audio_listener_output_devices_updates` and its duplicate-suppressing sibling
-    /// (`test_facade.py:852-888`).
-    #[test]
-    fn output_device_updates_fire_once_per_actual_change() {
-        let (hub, recorder) = hub();
-        let group = vec![OutputDevice::new("a").with_name("Kitchen")];
-
-        hub.output_devices_updated(Protocol::Mrp, group.clone());
-        hub.output_devices_updated(Protocol::Mrp, group.clone());
-        hub.output_devices_updated(Protocol::Mrp, Vec::new());
-
-        assert_eq!(
-            *recorder.devices.lock().expect("uncontended"),
-            vec![(0, 1), (1, 0)]
-        );
-    }
-
-    /// `test_audio_listener_volume_device_updates` (`test_facade.py:890-...`): the group entry is
-    /// updated in place and the listener sees the device it belongs to.
-    #[test]
-    fn a_per_device_volume_updates_the_group_entry() {
-        let (hub, recorder) = hub();
-        hub.output_devices_updated(
-            Protocol::Mrp,
-            vec![OutputDevice::new("a").with_name("Kitchen")],
-        );
-
-        hub.output_device_volume_updated(Protocol::Mrp, "a", 40.0);
-        hub.output_device_volume_updated(Protocol::Mrp, "a", 40.0);
-
-        assert_eq!(
-            *recorder.device_volumes.lock().expect("uncontended"),
-            vec![("a".to_owned(), 0.0, 40.0)]
-        );
-        assert!((hub.output_devices()[0].volume - 40.0).abs() < f32::EPSILON);
-    }
-
-    /// A push for a speaker that is not in the group still reaches the listener, described by a
-    /// bare identifier (`facade.py:486-487`).
-    #[test]
-    fn a_per_device_volume_for_an_unknown_device_still_fires() {
-        let (hub, recorder) = hub();
-        hub.output_device_volume_updated(Protocol::Mrp, "stranger", 10.0);
-
-        assert_eq!(
-            *recorder.device_volumes.lock().expect("uncontended"),
-            vec![("stranger".to_owned(), 0.0, 10.0)]
-        );
-    }
-
-    /// `test_keyboard_listener_updates` / `test_keyboard_no_listener_duplicates`
-    /// (`test_facade.py:930-950`).
-    #[test]
-    fn keyboard_focus_updates_fire_once_per_actual_change() {
-        let (hub, recorder) = hub();
-
-        hub.keyboard_focus_updated(Protocol::Companion, KeyboardFocusState::Focused);
-        hub.keyboard_focus_updated(Protocol::Companion, KeyboardFocusState::Focused);
-        hub.keyboard_focus_updated(Protocol::Companion, KeyboardFocusState::Unfocused);
-
-        assert_eq!(
-            *recorder.focus.lock().expect("uncontended"),
-            vec![
-                (KeyboardFocusState::Unknown, KeyboardFocusState::Focused),
-                (KeyboardFocusState::Focused, KeyboardFocusState::Unfocused),
-            ]
-        );
-    }
-
-    /// Only the keyboard relayer's main protocol is listened to (`facade.py:554-558`).
-    #[test]
-    fn keyboard_focus_from_another_protocol_is_ignored() {
-        let (hub, recorder) = hub();
-        hub.set_keyboard_protocol(Some(Protocol::Companion));
-
-        hub.keyboard_focus_updated(Protocol::Mrp, KeyboardFocusState::Focused);
-        assert!(recorder.focus.lock().expect("uncontended").is_empty());
-
-        hub.keyboard_focus_updated(Protocol::Companion, KeyboardFocusState::Focused);
-        assert_eq!(recorder.focus.lock().expect("uncontended").len(), 1);
-    }
-
-    /// A listener the caller dropped stops being called rather than keeping itself alive.
-    #[test]
-    fn listeners_are_held_weakly() {
-        let hub = ListenerHub::default();
-        let recorder = Arc::new(Recorder::default());
-        hub.add_audio_listener(&(Arc::clone(&recorder) as Arc<dyn AudioListener>));
-
-        drop(recorder);
-        hub.volume_updated(Protocol::Mrp, 50.0);
-        assert!((hub.volume() - 50.0).abs() < f32::EPSILON);
-    }
-}
+mod tests;
