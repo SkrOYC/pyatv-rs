@@ -61,9 +61,9 @@ Delivered in 3d17a46 (`pyatv-proto-dmap`, `pyatv_mdns::publish`): tag table, cod
 
 `pyatv-proto-dmap`: HTTP + Home Sharing pairing (pairing GUID), DMAP tag encoding, and long-poll push updates, for Apple TV gen 1–3 / tvOS ≤ 12. Lowest priority — it is legacy and frozen upstream — but included for parity. Deliverable: control and metadata for a legacy device. (`docs/research/airplay-raop-dmap.md`)
 
-## Step 8 — Facade completion, CLI parity, hardening (in progress)
+## Step 8 — Facade completion, CLI parity, hardening ✅
 
-Gap analysis: `docs/research/step8-parity-gap-analysis.md`. Landed in 3d17a46: per-method relaying, takeover/release, Audio output devices and listeners, helpers. In flight: FacadePushUpdater through the trait object, CLI parity incl. `--json`, doc/feature-powerset/MSRV/bench gates, deny policy.
+Gap analysis: `docs/research/step8-parity-gap-analysis.md`. Delivered in 3d17a46, fc5a6db and 201bcb8: per-method relaying with takeover/release, `FacadePushUpdater` through the trait object, listener hubs that filter on each relayer's current main protocol, `atvremote` at command parity (38 subcommands, 30 buttons, `--json` in the `atvscript` envelope), rustdoc/feature-powerset/MSRV/deny/bench gates, five criterion benches, and a user-facing README. The independent review caught two blockers (responder multicast bind — RISKS L14; uncapped chunked-body buffers in DMAP) which are fixed and pinned by tests.
 
 
 Wire every protocol into `FacadeAppleTV`, finalize the `Relayer` priorities and per-capability overrides against current pyatv source, complete `atvremote` command coverage (and consider an `atvscript`-equivalent JSON mode), tighten `cargo-deny` bans to `deny`, run `cargo hack` feature-powerset checks, add `criterion` benchmarks for the hot codec/audio paths, and write user-facing docs. Deliverable: a coherent library + CLI at rough feature parity with pyatv for supported devices.
