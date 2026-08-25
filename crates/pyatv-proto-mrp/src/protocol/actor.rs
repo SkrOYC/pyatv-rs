@@ -124,6 +124,17 @@ impl Actor {
     pub async fn run(mut self) {
         let stopped = self.serve().await;
 
+        // The two `serve` exits that are *not* a caller's `close()` still have to release the
+        // transport: a peer that closed the read side leaves the write half open, and a failed
+        // connection leaves the socket — or, for the tunnel, the data channel's frame loop and the
+        // AirPlay session behind it — running with nothing driving them. Upstream reaches the same
+        // place through `connection_lost` → `MrpProtocol.stop()` (`protocol.py:170-181`).
+        if matches!(stopped, Stopped::PeerClosed | Stopped::ConnectionLost(_))
+            && let Err(error) = self.transport.close().await
+        {
+            tracing::debug!(%error, "the MRP transport did not close cleanly after the peer left");
+        }
+
         if !self.outstanding.is_empty() {
             // `if self._outstanding: _LOGGER.warning("There were %d outstanding requests", ...)`
             // (`protocol.py:176-180`).

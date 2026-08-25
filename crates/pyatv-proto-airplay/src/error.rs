@@ -58,6 +58,30 @@ pub enum Error {
     #[error("device requires a password")]
     PasswordRequired,
 
+    /// Playback could not be started, or the device reported an error while playing.
+    ///
+    /// `PlaybackError` (`pyatv/exceptions.py`), raised by `AirPlayPlayer` both when every `/play`
+    /// attempt was refused with `500` and when `/playback-info` carries an `error` key
+    /// (`pyatv/protocols/airplay/player.py:68,100-102`).
+    #[error("{0}")]
+    Playback(String),
+
+    /// An audio source could not be opened, decoded or resampled.
+    ///
+    /// pyatv lets `miniaudio`'s own exceptions escape `open_source`
+    /// (`pyatv/protocols/raop/audio_source.py:727-739`); this port names the failure instead, since
+    /// "the file is not audio this build can decode" and "the device refused the stream" want
+    /// different answers from a caller.
+    #[error("audio source error: {0}")]
+    Audio(String),
+
+    /// An operation was attempted in a state that does not allow it.
+    ///
+    /// `exceptions.InvalidStateError` (`pyatv/protocols/raop/__init__.py:131-136`), raised when a
+    /// second `stream_file` starts while one is already running.
+    #[error("invalid state: {0}")]
+    InvalidState(String),
+
     /// Underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -77,7 +101,16 @@ impl From<Error> for pyatv_core::Error {
             Error::NotStarted(_) | Error::UnsupportedAuthentication { .. } => {
                 Self::Pairing(rendered)
             }
-            Error::NoEncryptionKeys(_) => Self::NotSupported(rendered),
+            Error::NoEncryptionKeys(_) | Error::Audio(_) => Self::NotSupported(rendered),
+            Error::InvalidState(_) => Self::Command {
+                command: "stream_file".to_owned(),
+                reason: rendered,
+            },
+            // `pyatv_core` has no playback variant; the command that failed names itself instead.
+            Error::Playback(_) => Self::Command {
+                command: "play_url".to_owned(),
+                reason: rendered,
+            },
             Error::Malformed(_) | Error::Status { .. } | Error::Plist(_) => {
                 Self::InvalidResponse(rendered)
             }

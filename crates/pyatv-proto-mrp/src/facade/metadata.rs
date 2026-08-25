@@ -22,6 +22,7 @@ use pyatv_core::interface::{BoxFuture, Metadata, PlaybackListener, PushUpdater};
 use pyatv_core::models::{App, ArtworkInfo, Playing};
 use pyatv_core::{Error as CoreError, Result as CoreResult};
 
+use crate::player_state::queue_index;
 use crate::protobuf::extensions;
 use crate::protocol::MrpProtocol;
 use crate::{Result, messages};
@@ -172,14 +173,11 @@ impl MrpMetadata {
                 .and_then(|it| it.artwork_mime_type.clone())
         });
 
-        let location_field = i32::try_from(location).unwrap_or_default();
+        // Sent verbatim, as upstream sends `playing.location` (`__init__.py:587`), negative or
+        // not: normalising it here would ask the device about a different queue entry.
         let response = self
             .protocol
-            .send_and_receive(messages::playback_queue_request(
-                location_field,
-                width,
-                height,
-            )?)
+            .send_and_receive(messages::playback_queue_request(location, width, height)?)
             .await?;
 
         // `if not resp.HasField("type"): return None` (`__init__.py:590-591`).
@@ -188,9 +186,14 @@ impl MrpMetadata {
         }
 
         let inner = response.inner(&extensions::SET_STATE_MESSAGE)?;
-        let Some(item) = inner
+        let items = inner
             .playback_queue
-            .and_then(|queue| queue.content_items.into_iter().nth(location))
+            .map(|queue| queue.content_items)
+            .unwrap_or_default();
+        // `contentItems[playing.location]` (`__init__.py:592`) — the same Python subscript the
+        // player state uses, so the same resolution applies.
+        let Some(item) =
+            queue_index(location, items.len()).and_then(|index| items.into_iter().nth(index))
         else {
             return Ok(None);
         };
@@ -311,8 +314,8 @@ impl PushUpdater for MrpPushUpdater {
         self.protocol.state().push_active()
     }
 
-    fn add_listener(&self, listener: Arc<dyn PlaybackListener>) {
-        self.protocol.state().add_push_listener(listener);
+    fn set_listener(&self, listener: &Arc<dyn PlaybackListener>) {
+        self.protocol.state().set_push_listener(listener);
     }
 
     fn start(&self, _initial_delay_ms: u64) -> BoxFuture<'_, CoreResult<()>> {

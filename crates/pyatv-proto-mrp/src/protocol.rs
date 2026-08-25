@@ -143,13 +143,17 @@ impl MrpProtocol {
             options.listener.clone(),
         );
         let actor = tokio::spawn(actor.run());
+        // Listener callbacks run here rather than on the actor, so a slow caller cannot stall a
+        // request or — on a tunnel — the data channel's acknowledgements. See `state::notify`.
+        let mut tasks = vec![reader, actor];
+        tasks.extend(state.start_notifier());
 
         Self {
             requests,
             transport,
             state,
             options,
-            tasks: vec![reader, actor],
+            tasks,
             heartbeat: Mutex::new(None),
         }
     }

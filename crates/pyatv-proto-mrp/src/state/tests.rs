@@ -118,11 +118,12 @@ fn set_now_playing_client(bundle: &str) -> MrpMessage {
 fn a_set_state_for_the_active_client_reaches_the_listener() {
     let state = MrpState::new();
     let recorder = Arc::new(Recorder::default());
-    state.add_push_listener(Arc::clone(&recorder) as Arc<dyn PlaybackListener>);
+    state.set_push_listener(&(Arc::clone(&recorder) as Arc<dyn PlaybackListener>));
     state.set_push_active(true);
 
     state.handle(&set_now_playing_client("app")).unwrap();
     state.handle(&set_state("app", "Track")).unwrap();
+    state.deliver_pending();
 
     let updates = recorder.updates.lock().unwrap();
     assert!(
@@ -137,12 +138,66 @@ fn a_set_state_for_the_active_client_reaches_the_listener() {
 fn nothing_is_pushed_while_the_updater_is_stopped() {
     let state = MrpState::new();
     let recorder = Arc::new(Recorder::default());
-    state.add_push_listener(Arc::clone(&recorder) as Arc<dyn PlaybackListener>);
+    state.set_push_listener(&(Arc::clone(&recorder) as Arc<dyn PlaybackListener>));
 
     state.handle(&set_now_playing_client("app")).unwrap();
     state.handle(&set_state("app", "Track")).unwrap();
+    state.deliver_pending();
 
     assert!(recorder.updates.lock().unwrap().is_empty());
+}
+
+/// Registering twice replaces rather than accumulates: one update, one callback.
+///
+/// `PlayerStateManager.listener`'s setter assigns a single `weakref.ref`
+/// (`player_state.py:229-235`), so a caller that registers again silently supersedes the previous
+/// listener. A list would have delivered the same update to both.
+#[test]
+fn registering_a_second_listener_replaces_the_first() {
+    let state = MrpState::new();
+    let first = Arc::new(Recorder::default());
+    let second = Arc::new(Recorder::default());
+
+    state.set_push_listener(&(Arc::clone(&first) as Arc<dyn PlaybackListener>));
+    state.set_push_listener(&(Arc::clone(&second) as Arc<dyn PlaybackListener>));
+    state.set_push_active(true);
+
+    state.post_update();
+    state.deliver_pending();
+
+    assert!(
+        first.updates.lock().unwrap().is_empty(),
+        "the replaced listener must hear nothing"
+    );
+    assert_eq!(second.updates.lock().unwrap().len(), 1);
+}
+
+/// Dropping the caller's last `Arc` unsubscribes, and the stale slot is pruned.
+///
+/// The slot is a `Weak`, so the state does not keep the listener alive; that is what makes
+/// "dropping this is what unsubscribes" true for `atvremote push_updates` and for any other
+/// caller that has no way to deregister.
+#[test]
+fn dropping_the_listener_unsubscribes_it() {
+    let state = MrpState::new();
+    let recorder = Arc::new(Recorder::default());
+    let weak = Arc::downgrade(&recorder);
+
+    state.set_push_listener(&(Arc::clone(&recorder) as Arc<dyn PlaybackListener>));
+    state.set_push_active(true);
+    drop(recorder);
+
+    assert_eq!(
+        weak.strong_count(),
+        0,
+        "the state must not be holding the listener alive"
+    );
+
+    state.post_update();
+    state.deliver_pending();
+    // Nothing to assert on the recorder — it is gone. What is asserted is that delivering a
+    // callback to a dropped listener neither panics nor resurrects it.
+    assert!(weak.upgrade().is_none());
 }
 
 #[test]
@@ -172,6 +227,7 @@ fn power_state_follows_the_logical_device_count() {
     state.handle(&device_info(0)).unwrap();
     assert_eq!(state.power_state(), PowerState::Off);
 
+    state.deliver_pending();
     assert_eq!(
         *recorder.transitions.lock().unwrap(),
         vec![
@@ -179,6 +235,31 @@ fn power_state_follows_the_logical_device_count() {
             (PowerState::On, PowerState::Off)
         ]
     );
+}
+
+/// A `DeviceInfoMessage` that omits `logicalDeviceCount` reports `Off`, not `Unknown`.
+///
+/// pyatv reads the proto2 scalar default of `0` and takes its `== 0` branch
+/// (`__init__.py:686-695`); `prost` surfaces the same field as `None`, and mapping that to
+/// `Unknown` would disagree with pyatv on every device that leaves the field out. See
+/// `power::from_device_info`'s own documentation.
+#[test]
+fn an_absent_logical_device_count_reads_as_off() {
+    assert_eq!(
+        crate::state::power::from_device_info(&crate::protobuf::DeviceInfoMessage::default()),
+        PowerState::Off
+    );
+
+    let state = MrpState::new();
+    let message = MrpMessage::with_extension(
+        envelope(Type::DeviceInfoMessage),
+        &extensions::DEVICE_INFO_MESSAGE,
+        &crate::protobuf::DeviceInfoMessage::default(),
+    )
+    .unwrap();
+
+    state.handle(&message).unwrap();
+    assert_eq!(state.power_state(), PowerState::Off);
 }
 
 #[test]

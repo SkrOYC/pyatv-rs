@@ -27,6 +27,10 @@ use crate::codec::{BPLIST_CONTENT_TYPE, CONTENT_TYPE, RTSP_1_0, Response, USER_A
 use crate::http::{HttpConnection, RequestSpec};
 use crate::{Error, Result};
 
+pub mod digest;
+
+pub use digest::{DigestInfo, digest_response};
+
 /// RTSP methods pyatv sends. Not a subset of the HTTP verbs, which is one reason a generic HTTP
 /// client cannot be used here.
 pub mod method {
@@ -99,6 +103,48 @@ pub struct RtspSession {
     active_remote: u32,
     /// Incremented on every request; the device echoes it back.
     cseq: u32,
+    /// Set once a password-protected receiver has been challenged, and then applied to every
+    /// subsequent request on this connection (`pyatv/support/rtsp.py:275-279`).
+    digest: Option<DigestInfo>,
+}
+
+/// The parameters of one RTSP exchange.
+///
+/// The argument list of `RtspSession.exchange` (`pyatv/support/rtsp.py:254-262`) as a struct, so
+/// the RAOP verbs — which need a `Content-Type` that is not a property list, extra headers, and in
+/// one case an `HTTP/1.1` protocol token — can reach the same code path the tunnel's `SETUP` uses.
+/// Construct with `..Exchange::default()` and override only what differs.
+#[derive(Debug, Clone, Copy)]
+pub struct Exchange<'a> {
+    /// The verb.
+    pub method: &'a str,
+    /// Request target. `None` uses the `rtsp://…` session URI.
+    pub uri: Option<&'a str>,
+    /// `Content-Type`, emitted before `Content-Length` — upstream's `content_type` parameter.
+    pub content_type: Option<&'a str>,
+    /// Extra headers, appended after the four every request carries.
+    pub headers: &'a [(&'a str, &'a str)],
+    /// Body bytes.
+    pub body: &'a [u8],
+    /// Return the response whatever its status.
+    pub allow_error: bool,
+    /// Protocol token. `RTSP/1.0` for everything except `/auth-setup`, which upstream sends as
+    /// `HTTP/1.1` (`pyatv/support/rtsp.py:112-123`).
+    pub protocol: &'a str,
+}
+
+impl Default for Exchange<'_> {
+    fn default() -> Self {
+        Self {
+            method: method::POST,
+            uri: None,
+            content_type: None,
+            headers: &[],
+            body: &[],
+            allow_error: false,
+            protocol: RTSP_1_0,
+        }
+    }
 }
 
 impl RtspSession {
@@ -121,7 +167,32 @@ impl RtspSession {
             dacp_id: format!("{dacp_id:X}"),
             active_remote,
             cseq: 0,
+            digest: None,
         }
+    }
+
+    /// The random 32-bit session identifier.
+    ///
+    /// Doubles as the RTP `ssrc` and as the AirPlay 2 audio stream's `streamConnectionID`; the
+    /// three are literally the same number, not independently drawn
+    /// (`stream_client.py:586`, `airplayv2.py:143`).
+    #[must_use]
+    pub fn session_id(&self) -> u32 {
+        self.session_id
+    }
+
+    /// Start answering a password challenge on every subsequent request.
+    ///
+    /// `self.digest_info = info` (`pyatv/support/rtsp.py:159-160`), set once from the `401` that
+    /// answered the first `ANNOUNCE` and never refreshed afterwards.
+    pub fn set_digest(&mut self, digest: DigestInfo) {
+        self.digest = Some(digest);
+    }
+
+    /// Whether a password challenge has been answered on this connection.
+    #[must_use]
+    pub fn has_digest(&self) -> bool {
+        self.digest.is_some()
     }
 
     /// The `rtsp://{local_ip}/{session_id}` URI the session verbs target.
@@ -158,39 +229,81 @@ impl RtspSession {
         body: Option<&plist::Value>,
         allow_error: bool,
     ) -> Result<Response> {
+        // `isinstance(body, dict)` selects the binary plist body and its content type
+        // (`pyatv/support/rtsp.py:284-289`); the header lands *after* `Content-Length`, which is
+        // where upstream's `hdrs` dict puts it.
+        let encoded = body.map(encode_plist).transpose()?;
+        let headers: &[(&str, &str)] = match encoded {
+            Some(_) => &[(CONTENT_TYPE, BPLIST_CONTENT_TYPE)],
+            None => &[],
+        };
+
+        self.send(
+            http,
+            &Exchange {
+                method,
+                uri,
+                headers,
+                body: encoded.as_deref().unwrap_or_default(),
+                allow_error,
+                ..Exchange::default()
+            },
+        )
+        .await
+    }
+
+    /// Send one arbitrary RTSP exchange and await its response.
+    ///
+    /// The general form [`RtspSession::exchange`] is a special case of. Every request carries the
+    /// same four identifiers plus, once a challenge has been answered, an `Authorization` header
+    /// recomputed for this verb and URI (`pyatv/support/rtsp.py:264-279`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Status`] for a non-success status unless
+    /// [`Exchange::allow_error`] is set, and [`Error::Io`] on a transport failure.
+    pub async fn send(
+        &mut self,
+        http: &mut HttpConnection,
+        exchange: &Exchange<'_>,
+    ) -> Result<Response> {
         let cseq = self.cseq;
         self.cseq += 1;
 
-        let session_uri = match uri {
+        let session_uri = match exchange.uri {
             Some(_) => String::new(),
             None => self.uri(http.local_address()?),
         };
-        let target = uri.unwrap_or(&session_uri);
+        let target = exchange.uri.unwrap_or(&session_uri);
 
         let cseq_value = cseq.to_string();
         let active_remote = self.active_remote.to_string();
+        let authorization = self
+            .digest
+            .as_ref()
+            .map(|digest| digest.authorization(exchange.method, target));
+
         let mut headers = vec![
             ("CSeq", cseq_value.as_str()),
             ("DACP-ID", self.dacp_id.as_str()),
             ("Active-Remote", active_remote.as_str()),
             ("Client-Instance", self.dacp_id.as_str()),
         ];
-
-        let encoded = body.map(encode_plist).transpose()?;
-        if encoded.is_some() {
-            headers.push((CONTENT_TYPE, BPLIST_CONTENT_TYPE));
+        if let Some(authorization) = authorization.as_deref() {
+            headers.push(("Authorization", authorization));
         }
+        headers.extend_from_slice(exchange.headers);
 
         let response = http
             .send(&RequestSpec {
-                method,
+                method: exchange.method,
                 uri: target,
-                protocol: RTSP_1_0,
+                protocol: exchange.protocol,
                 user_agent: Some(USER_AGENT),
+                content_type: exchange.content_type,
                 headers: &headers,
-                body: encoded.as_deref().unwrap_or_default(),
-                allow_error,
-                ..RequestSpec::default()
+                body: exchange.body,
+                allow_error: exchange.allow_error,
             })
             .await?;
 
@@ -294,34 +407,55 @@ impl Default for RtspSession {
     }
 }
 
-/// Build the SDP body for an `ANNOUNCE` request.
+/// The parameters an `ANNOUNCE` SDP body is built from.
 ///
-/// pyatv hand-builds this as a string template. Note the codec named in `rtpmap` is `L16` — raw
-/// 16-bit linear PCM — even though the `fmtp` line follows ALAC's conventional field layout. See
-/// `docs/research/rust-crates.md` §7.
-// TODO(step-1): reproduce pyatv's ANNOUNCE_PAYLOAD template exactly, including the v=/o=/s=/c=/t=/
-// m=/a=rtpmap/a=fmtp line order.
-#[must_use]
-pub fn announce_sdp(session_id: u32, local_addr: &str, remote_addr: &str) -> String {
-    let _ = (session_id, local_addr, remote_addr);
-    todo!("rtsp::announce_sdp")
+/// Only these three are substituted into pyatv's `ANNOUNCE_PAYLOAD` template; the codec, payload
+/// type and frames
+/// per packet are literals in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnnounceFormat {
+    /// Bits per channel, i.e. `8 * bytes_per_channel`.
+    pub bits_per_channel: u32,
+    /// Channel count.
+    pub channels: u32,
+    /// Sample rate in Hz.
+    pub sample_rate: u32,
 }
 
-/// Answer an RTSP `401` Digest challenge.
+/// Build the SDP body for an `ANNOUNCE` request.
 ///
-/// pyatv computes this by hand with MD5 rather than through an HTTP auth middleware.
-// TODO(step-1): MD5 Digest per RFC 2617. Adding an MD5 dependency for this is unavoidable; it is
-// used only for the challenge response, never for anything security-bearing.
+/// `ANNOUNCE_PAYLOAD` (`pyatv/support/rtsp.py:25-35`), reproduced line for line including the
+/// trailing CRLF on the last line. Note that the codec named in `rtpmap` is `L16` — raw 16-bit
+/// linear PCM — even though the `fmtp` line follows ALAC's conventional field layout, and that the
+/// `96 L16/44100/2` and `352` tokens are hardcoded upstream rather than templated on
+/// [`AnnounceFormat`]: only `bits_per_channel`, `channels` and `sample_rate` are substituted,
+/// which is why a receiver asking for something other than 44100/2 gets an internally inconsistent
+/// body. That inconsistency is upstream's and is reproduced (`docs/research/rust-crates.md` §7,
+/// `airplay-playurl-raop-port-spec.md` §11).
 #[must_use]
-pub fn digest_response(
-    username: &str,
-    password: &str,
-    realm: &str,
-    nonce: &str,
-    uri: &str,
+pub fn announce_sdp(
+    session_id: u32,
+    local_ip: &str,
+    remote_ip: &str,
+    format: AnnounceFormat,
 ) -> String {
-    let _ = (username, password, realm, nonce, uri);
-    todo!("rtsp::digest_response")
+    let AnnounceFormat {
+        bits_per_channel,
+        channels,
+        sample_rate,
+    } = format;
+
+    format!(
+        "v=0\r\n\
+         o=iTunes {session_id} 0 IN IP4 {local_ip}\r\n\
+         s=iTunes\r\n\
+         c=IN IP4 {remote_ip}\r\n\
+         t=0 0\r\n\
+         m=audio 0 RTP/AVP 96\r\n\
+         a=rtpmap:96 L16/44100/2\r\n\
+         a=fmtp:96 {FRAMES_PER_PACKET} 0 {bits_per_channel} 40 10 14 {channels} 255 0 0 \
+         {sample_rate}\r\n"
+    )
 }
 
 #[cfg(test)]

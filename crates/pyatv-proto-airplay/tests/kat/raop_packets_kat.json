@@ -1,0 +1,374 @@
+{
+  "announce": [
+    {
+      "body": "v=0\r\no=iTunes 1234567890 0 IN IP4 10.0.0.2\r\ns=iTunes\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 L16/44100/2\r\na=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\n",
+      "bytes_per_channel": 2,
+      "channels": 2,
+      "local_ip": "10.0.0.2",
+      "name": "stereo_16_bit_44100",
+      "remote_ip": "10.0.0.1",
+      "sample_rate": 44100,
+      "session_id": 1234567890
+    },
+    {
+      "body": "v=0\r\no=iTunes 1 0 IN IP4 192.168.1.20\r\ns=iTunes\r\nc=IN IP4 192.168.1.30\r\nt=0 0\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 L16/44100/2\r\na=fmtp:96 352 0 8 40 10 14 1 255 0 0 48000\r\n",
+      "bytes_per_channel": 1,
+      "channels": 1,
+      "local_ip": "192.168.1.20",
+      "name": "mono_8_bit_48000",
+      "remote_ip": "192.168.1.30",
+      "sample_rate": 48000,
+      "session_id": 1
+    }
+  ],
+  "audio_packet_header": [
+    {
+      "encoded": "80e000000000ac4400000000",
+      "fields": {
+        "proto": 128,
+        "seqno": 0,
+        "ssrc": 0,
+        "timestamp": 44100,
+        "type": 224
+      },
+      "name": "first_audio_packet",
+      "note": "type 0xE0 marks the very first audio packet of a stream"
+    },
+    {
+      "encoded": "806000010000ada400000000",
+      "fields": {
+        "proto": 128,
+        "seqno": 1,
+        "ssrc": 0,
+        "timestamp": 44452,
+        "type": 96
+      },
+      "name": "subsequent_audio_packet",
+      "note": "every later packet is 0x60"
+    }
+  ],
+  "digest": [
+    {
+      "header": "Digest username=\"pyatv\", realm=\"raop\", nonce=\"1a2b3c4d\", uri=\"rtsp://10.0.0.2/1234567890\", response=\"580546d73c0d27c6cab4c887a01ebe7b\"",
+      "method": "ANNOUNCE",
+      "name": "announce",
+      "nonce": "1a2b3c4d",
+      "password": "secret",
+      "realm": "raop",
+      "uri": "rtsp://10.0.0.2/1234567890",
+      "username": "pyatv"
+    },
+    {
+      "header": "Digest username=\"pyatv\", realm=\"AirPlay\", nonce=\"deadbeef\", uri=\"rtsp://10.0.0.2/1\", response=\"8e37ba151e13118607b272aba4fea36a\"",
+      "method": "SETUP",
+      "name": "setup",
+      "nonce": "deadbeef",
+      "password": "",
+      "realm": "AirPlay",
+      "uri": "rtsp://10.0.0.2/1",
+      "username": "pyatv"
+    }
+  ],
+  "encryption": [
+    {
+      "aad": "0000ac4400000000",
+      "header": "80e000000000ac4400000000",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "name": "audio_packet_0",
+      "nonce": "000000000000000000000000",
+      "packet": "80e000000000ac440000000018b94032a9e3a0d61b68566aa34e4028eae5c4e411c0dd05188f20b16bb472aa0000000000000000",
+      "plaintext": "000102030405060708090a0b0c0d0e0f"
+    },
+    {
+      "aad": "0000ada400000000",
+      "header": "806000010000ada400000000",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "name": "audio_packet_1",
+      "nonce": "000000000100000000000000",
+      "packet": "806000010000ada4000000009f56f15cb12fa91f21bfa4575e9897884457f9d806a6efa928d780d7e3cf3b4e0100000000000000",
+      "plaintext": "000102030405060708090a0b0c0d0e0f"
+    },
+    {
+      "aad": "0000af0400000000",
+      "header": "806000020000af0400000000",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "name": "audio_packet_2",
+      "nonce": "000000000200000000000000",
+      "packet": "806000020000af0400000000a9a2fc56e3efaa69c346357bc0c36fba0877961e28c3bbc3e8ab068d4d9c34740200000000000000",
+      "plaintext": "000102030405060708090a0b0c0d0e0f"
+    }
+  ],
+  "metadata": [
+    {
+      "album": "AL",
+      "artist": "AR",
+      "body": "6d6c69740000001d6d696e6d00000001546173616c00000002414c61736172000000024152",
+      "name": "full",
+      "title": "T"
+    },
+    {
+      "album": null,
+      "artist": null,
+      "body": "6d6c6974000000096d696e6d0000000154",
+      "name": "title_only",
+      "title": "T"
+    },
+    {
+      "album": "\u00c5lbum",
+      "artist": "\u00c4rtist",
+      "body": "6d6c6974000000276d696e6d00000001c3a96173616c00000005c3856c62756d6173617200000006c3847274697374",
+      "divergence": "pyatv writes the character count as the tag length; the port writes the UTF-8 byte count, which is what DMAP actually specifies",
+      "name": "utf8",
+      "title": "\u00e9"
+    },
+    {
+      "album": null,
+      "artist": null,
+      "body": "6d6c697400000000",
+      "name": "empty",
+      "title": null
+    }
+  ],
+  "retransmit_request": [
+    {
+      "encoded": "80550001002a0003",
+      "fields": {
+        "lost_packets": 3,
+        "lost_seqno": 42,
+        "proto": 128,
+        "seqno": 1,
+        "type": 85
+      },
+      "name": "retransmit_request",
+      "note": "what the receiver asks for over the control channel"
+    }
+  ],
+  "rtp_header": [
+    {
+      "encoded": "90d40007",
+      "fields": {
+        "proto": 144,
+        "seqno": 7,
+        "type": 212
+      },
+      "name": "sync_first",
+      "note": "proto 0x90 marks the first sync packet after RECORD"
+    },
+    {
+      "encoded": "80d40007",
+      "fields": {
+        "proto": 128,
+        "seqno": 7,
+        "type": 212
+      },
+      "name": "sync_subsequent",
+      "note": "every later sync packet drops the marker bit"
+    },
+    {
+      "encoded": "8060ffff",
+      "fields": {
+        "proto": 128,
+        "seqno": 65535,
+        "type": 96
+      },
+      "name": "seqno_wraps_at_16_bits",
+      "note": "the sequence number is a big-endian u16 and wraps, it does not saturate"
+    }
+  ],
+  "source": "pyatv",
+  "sync_packet": [
+    {
+      "encoded": "90d400070001000083aa7e804000000000020000",
+      "fields": {
+        "last_sync_frac": 1073741824,
+        "last_sync_sec": 2208988800,
+        "now": 131072,
+        "now_without_latency": 65536,
+        "proto": 144,
+        "seqno": 7,
+        "type": 212
+      },
+      "name": "sync_first",
+      "note": "`_send_sync_packet` with first=True (`stream_client.py:152-171`)"
+    },
+    {
+      "encoded": "80d400070001ac4483aa7e81400000000002ac44",
+      "fields": {
+        "last_sync_frac": 1073741824,
+        "last_sync_sec": 2208988801,
+        "now": 175172,
+        "now_without_latency": 109636,
+        "proto": 128,
+        "seqno": 7,
+        "type": 212
+      },
+      "name": "sync_periodic",
+      "note": "the same packet one second later, marker bit cleared"
+    }
+  ],
+  "timing_math": {
+    "ntp2ms": [
+      {
+        "milliseconds": 2208988800250,
+        "ntp": 9487534654304026624
+      },
+      {
+        "milliseconds": 250,
+        "ntp": 1073741824
+      }
+    ],
+    "ntp2parts": [
+      {
+        "fraction": 1073741824,
+        "ntp": 9487534654304026624,
+        "seconds": 2208988800
+      },
+      {
+        "fraction": 0,
+        "ntp": 0,
+        "seconds": 0
+      }
+    ],
+    "ntp2ts": [
+      {
+        "ntp": 9487534654304026624,
+        "rate": 44100,
+        "timestamp": 97416406091025
+      },
+      {
+        "ntp": 9487534654304026624,
+        "rate": 48000,
+        "timestamp": 106031462412000
+      },
+      {
+        "ntp": 0,
+        "rate": 44100,
+        "timestamp": 0
+      }
+    ],
+    "ts2ms": [
+      {
+        "milliseconds": 1000,
+        "rate": 44100,
+        "timestamp": 44100
+      },
+      {
+        "milliseconds": 7,
+        "rate": 44100,
+        "timestamp": 352
+      }
+    ],
+    "ts2ntp": [
+      {
+        "ntp": 0,
+        "rate": 44100,
+        "timestamp": 0
+      },
+      {
+        "ntp": 4294967296,
+        "rate": 44100,
+        "timestamp": 44100
+      },
+      {
+        "ntp": 34275328,
+        "rate": 44100,
+        "timestamp": 352
+      },
+      {
+        "ntp": 12023627776,
+        "rate": 44100,
+        "timestamp": 123457
+      }
+    ]
+  },
+  "timing_packet": [
+    {
+      "encoded": "80d2000700000000000000000000000000000000000000000000000000000000",
+      "fields": {
+        "padding": 0,
+        "proto": 128,
+        "recvtime_frac": 0,
+        "recvtime_sec": 0,
+        "reftime_frac": 0,
+        "reftime_sec": 0,
+        "sendtime_frac": 0,
+        "sendtime_sec": 0,
+        "seqno": 7,
+        "type": 210
+      },
+      "name": "timing_request",
+      "note": "what a receiver sends to the timing server"
+    },
+    {
+      "encoded": "80d30007000000001111111122222222aabbccddeeff0011aabbccddeeff0011",
+      "fields": {
+        "padding": 0,
+        "proto": 128,
+        "recvtime_frac": 4009689105,
+        "recvtime_sec": 2864434397,
+        "reftime_frac": 572662306,
+        "reftime_sec": 286331153,
+        "sendtime_frac": 4009689105,
+        "sendtime_sec": 2864434397,
+        "seqno": 7,
+        "type": 211
+      },
+      "name": "timing_response",
+      "note": "the reply, with the request's send time echoed as reftime"
+    }
+  ],
+  "volume": {
+    "dbfs_to_pct": [
+      {
+        "dbfs": -144.0,
+        "percent": 0.0
+      },
+      {
+        "dbfs": -30.0,
+        "percent": 0.0
+      },
+      {
+        "dbfs": -29.9,
+        "percent": 0.3333333333333381
+      },
+      {
+        "dbfs": -15.0,
+        "percent": 50.0
+      },
+      {
+        "dbfs": -10.0,
+        "percent": 66.66666666666667
+      },
+      {
+        "dbfs": 0.0,
+        "percent": 100.0
+      }
+    ],
+    "pct_to_dbfs": [
+      {
+        "dbfs": -144.0,
+        "percent": 0.0
+      },
+      {
+        "dbfs": -29.7,
+        "percent": 1.0
+      },
+      {
+        "dbfs": -22.5,
+        "percent": 25.0
+      },
+      {
+        "dbfs": -20.1,
+        "percent": 33.0
+      },
+      {
+        "dbfs": -15.0,
+        "percent": 50.0
+      },
+      {
+        "dbfs": 0.0,
+        "percent": 100.0
+      }
+    ]
+  }
+}

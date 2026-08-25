@@ -98,9 +98,26 @@ pub(super) async fn tunnel(
 
     match mrp_setup(transport, options).await {
         Ok(mut data) => {
+            let session = Arc::new(Mutex::new(Some(session)));
+
+            // The device can end the session without anyone asking — a reboot, a sleep, a dropped
+            // socket. MRP notices, because its reader sees the data channel close, and reports it
+            // through the `DeviceListener` path; nothing downstream of that used to close the
+            // *AirPlay* half, so the `/feedback` keepalive went on posting to a receiver that had
+            // already hung up. Registering here closes it on either notification.
+            //
+            // The hub holds listeners weakly, so the `Arc` has to live somewhere: the handle
+            // below owns it, and the facade owns the handle for as long as the protocol is
+            // registered.
+            let teardown = Arc::new(TunnelTeardown {
+                session: Arc::clone(&session),
+            });
+            listeners.add_listener(&(Arc::clone(&teardown) as Arc<dyn DeviceListener>));
+
             data.handle = Some(Arc::new(TunnelHandle {
                 mrp: data.handle.take(),
-                session: Mutex::new(Some(session)),
+                session,
+                _teardown: teardown,
             }));
             Ok(Some(data))
         }
@@ -141,6 +158,18 @@ fn gate(
         return None;
     };
 
+    // `elif mrp_tunnel == MrpTunnel.Force:` (`__init__.py:378-380`) sits ahead of both remaining
+    // branches upstream, so forcing skips *both* checks: `is_remote_control_supported`'s
+    // model/build test and the `credentials.type in [HAP, Transient]` test. It skips both here
+    // too, plus this port's own AirPlay-2 check below — that is what the setting is for. It is the
+    // escape hatch for a device whose TXT record understates what it can do, which is not
+    // hypothetical: the feature bits are the only evidence the checks have, and a firmware that
+    // reports them differently would otherwise be unreachable with no way to override.
+    //
+    // What `Force` does **not** skip is the credentials lookup above, because there is nothing to
+    // force without one: pair-verify needs a key pair, and upstream would reach
+    // `_create_mrp_tunnel_data(core, credentials)` with a `Null` credential and fail inside the
+    // handshake instead. Declining early says why.
     if setting == MrpTunnel::Force {
         tracing::debug!("remote control channel is supported (forced)");
         return Some(credentials);
@@ -202,7 +231,55 @@ fn options(
 #[derive(Debug)]
 struct TunnelHandle {
     mrp: Option<Arc<dyn ProtocolHandle>>,
-    session: Mutex<Option<Ap2Session>>,
+    session: Arc<Mutex<Option<Ap2Session>>>,
+    /// Kept only so the hub's [`std::sync::Weak`] stays upgradable for the life of the protocol.
+    _teardown: Arc<TunnelTeardown>,
+}
+
+/// Closes the AirPlay session when the *device* ends the connection.
+///
+/// `_close_rc` (`__init__.py:287-291`) is the same teardown [`TunnelHandle::close`] performs; this
+/// is the path that reaches it when nobody called `close()`. It has no upstream counterpart —
+/// pyatv's `AirPlayMrpConnection.connection_lost` only forwards to the device listener
+/// (`mrp_connection.py:63-76`) and leaves the session's `/feedback` task running, which is a leak
+/// this port declines to reproduce.
+#[derive(Debug)]
+struct TunnelTeardown {
+    session: Arc<Mutex<Option<Ap2Session>>>,
+}
+
+impl TunnelTeardown {
+    /// Close the session on a spawned task.
+    ///
+    /// [`DeviceListener`]'s methods are synchronous and are called from inside the MRP actor's
+    /// own shutdown, so closing has to happen elsewhere: blocking here would block the actor, and
+    /// the session's teardown does I/O. Taking the `Option` makes a second notification — the hub
+    /// can deliver both `connection_lost` and `connection_closed` over a session's life — a no-op.
+    fn tear_down(&self, why: &str) {
+        tracing::debug!(
+            why,
+            "tearing the AirPlay tunnel down after the device ended it"
+        );
+
+        let session = Arc::clone(&self.session);
+        tokio::spawn(async move {
+            if let Some(mut session) = session.lock().await.take()
+                && let Err(error) = session.close().await
+            {
+                tracing::debug!(%error, "the AirPlay control connection did not close cleanly");
+            }
+        });
+    }
+}
+
+impl DeviceListener for TunnelTeardown {
+    fn connection_lost(&self, reason: &str) {
+        self.tear_down(reason);
+    }
+
+    fn connection_closed(&self) {
+        self.tear_down("the device closed the connection");
+    }
 }
 
 impl ProtocolHandle for TunnelHandle {

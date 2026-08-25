@@ -38,6 +38,9 @@ pub fn build_playing_at(state: ActivePlayer<'_>, now: f64) -> Playing {
         position: position(state, device_state, now),
         shuffle: Some(shuffle(state)),
         repeat: Some(repeat(state)),
+        // `hash=item_hash()`, and `item_hash` is `state.item_identifier` verbatim
+        // (`__init__.py:250-252,283`).
+        hash: state.item_identifier().map(str::to_owned),
         series_name: metadata.and_then(|it| it.series_name.clone()),
         season_number: metadata
             .and_then(|it| it.season_number)

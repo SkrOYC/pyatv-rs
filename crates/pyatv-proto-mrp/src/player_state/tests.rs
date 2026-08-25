@@ -196,3 +196,59 @@ fn is_close_matches_pythons_defaults() {
     assert!(is_close(1.0, 1.0));
     assert!(!is_close(1.5, 1.0));
 }
+
+/// `queue_index` resolves a device-reported location the way Python's subscript does.
+///
+/// The case that matters is the negative one: pyatv's `if len(self.items) >= (self.location + 1)`
+/// guard lets it through and `items[-1]` is the last entry, where a `usize` conversion would clamp
+/// to `0` and report the *first* entry as the one playing.
+#[test]
+fn a_queue_location_resolves_like_a_python_subscript() {
+    use crate::player_state::queue_index;
+
+    assert_eq!(queue_index(0, 3), Some(0));
+    assert_eq!(queue_index(2, 3), Some(2));
+    assert_eq!(queue_index(3, 3), None, "past the end is no item");
+
+    assert_eq!(queue_index(-1, 3), Some(2), "the last item, as in Python");
+    assert_eq!(queue_index(-3, 3), Some(0));
+    assert_eq!(
+        queue_index(-4, 3),
+        None,
+        "Python raises IndexError here; reporting no item is the documented divergence"
+    );
+
+    assert_eq!(
+        queue_index(0, 0),
+        None,
+        "an empty queue has no current item"
+    );
+    assert_eq!(queue_index(-1, 0), None);
+    assert_eq!(queue_index(i32::MIN, 3), None);
+}
+
+/// The whole path, not just the helper: a negative location picks the last queue entry.
+#[test]
+fn a_negative_location_selects_the_last_queue_item() {
+    let mut player = PlayerState::default();
+    player.handle_set_state(&SetStateMessage {
+        playback_queue: Some(PlaybackQueue {
+            location: Some(-1),
+            content_items: vec![
+                ContentItem {
+                    identifier: Some("first".to_owned()),
+                    ..ContentItem::default()
+                },
+                ContentItem {
+                    identifier: Some("last".to_owned()),
+                    ..ContentItem::default()
+                },
+            ],
+            ..PlaybackQueue::default()
+        }),
+        ..SetStateMessage::default()
+    });
+
+    assert_eq!(player.location, -1, "the raw value is kept as reported");
+    assert_eq!(player.item_identifier(), Some("last"));
+}

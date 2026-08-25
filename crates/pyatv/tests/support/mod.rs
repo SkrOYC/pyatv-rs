@@ -56,10 +56,24 @@ pub struct FakeAppleTv {
 impl FakeAppleTv {
     /// Start all three, pair AirPlay and Companion, and leave everything ready to connect to.
     pub async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// As [`FakeAppleTv::start`], with a receiver that refuses every remote-control `SETUP`.
+    ///
+    /// The tunnel then fails *after* pair-verify, which is where a real refusal lands, so what a
+    /// test built on this exercises is the bring-up failure path rather than the gate that
+    /// declines before dialling.
+    pub async fn start_without_a_tunnel() -> Self {
+        Self::start_with(true).await
+    }
+
+    async fn start_with(refuse_setup: bool) -> Self {
         let mrp = FakeMrpDevice::start(PIN_CODE).await;
         let airplay = FakeAirPlayDevice::start_with(FakeOptions {
             pin: AIRPLAY_PIN,
             data_bridge: Some(mrp.address()),
+            refuse_setup,
             ..FakeOptions::default()
         })
         .await;

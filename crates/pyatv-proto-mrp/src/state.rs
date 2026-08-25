@@ -11,28 +11,68 @@
 //! listener notifications, which is what lets the player-state and push-update rules be tested
 //! without a socket.
 
+mod notify;
 pub mod power;
 pub mod volume;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use pyatv_core::consts::PowerState;
 use pyatv_core::interface::{PlaybackListener, PowerListener};
 use pyatv_core::models::{App, Playing};
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::Result;
 use crate::message::MrpMessage;
 use crate::player_state::{ActivePlayer, Changed, PlayerStateManager};
 use crate::playing::build_playing;
 use crate::protobuf::{DeviceInfoMessage, extensions, protocol_message::Type};
+use crate::state::notify::Notification;
 use crate::state::volume::VolumeState;
 
-/// Registered push-update listeners, and whether updates are flowing.
+/// The registered push-update listener, and whether updates are flowing.
+///
+/// **One slot, held weakly.** `PlayerStateManager.listener` is a single `weakref.ref` that a
+/// second registration replaces and that yields `None` once the caller drops its own reference
+/// (`pyatv/protocols/mrp/player_state.py:229-235`); `PushUpdater.listener` upstream is the same
+/// property. A `Vec<Arc<dyn PlaybackListener>>` diverged from that twice over — two registrations
+/// delivered every update twice, and a caller that dropped its listener kept receiving updates,
+/// because the `Arc` in the list was the thing keeping it alive.
 #[derive(Debug, Default)]
 struct PushState {
-    listeners: Vec<Arc<dyn PlaybackListener>>,
+    listener: Option<Weak<dyn PlaybackListener>>,
     active: bool,
+}
+
+/// The listener slots, shared with the notifier task.
+///
+/// Split out of [`MrpState`] so the notifier needs no reference to the state at all: there is no
+/// `Arc` cycle to break with a `Weak`, and a queued callback cannot keep a finished session alive.
+#[derive(Debug, Default)]
+struct Listeners {
+    push: Mutex<PushState>,
+    power: Mutex<Option<Arc<dyn PowerListener>>>,
+}
+
+impl Listeners {
+    /// The push listener, if one is registered and its owner still holds it.
+    ///
+    /// Prunes the slot on the way past when the caller has dropped its `Arc`, so a stale `Weak`
+    /// is not re-upgraded on every subsequent update.
+    fn push_listener(&self) -> Option<Arc<dyn PlaybackListener>> {
+        let mut push = self.push.lock().ok()?;
+        let listener = push.listener.as_ref().and_then(Weak::upgrade);
+        if listener.is_none() {
+            push.listener = None;
+        }
+        listener
+    }
+
+    /// The power listener, if one is registered.
+    fn power_listener(&self) -> Option<Arc<dyn PowerListener>> {
+        self.power.lock().ok()?.clone()
+    }
 }
 
 /// Everything the device has told us, shared between the protocol actor and the facades.
@@ -48,8 +88,11 @@ pub struct MrpState {
     /// Fired whenever a `DeviceInfoMessage` re-derives the output device list.
     output_devices_changed: Notify,
     power: watch::Sender<PowerState>,
-    push: Mutex<PushState>,
-    power_listener: Mutex<Option<Arc<dyn PowerListener>>>,
+    listeners: Arc<Listeners>,
+    /// Where callbacks are queued for the notifier task; see [`notify`].
+    notifications: mpsc::Sender<Notification>,
+    /// The other end, until [`MrpState::start_notifier`] takes it.
+    inbox: Mutex<Option<mpsc::Receiver<Notification>>>,
 }
 
 impl Default for MrpState {
@@ -60,8 +103,13 @@ impl Default for MrpState {
 
 impl MrpState {
     /// A state that has heard nothing yet.
+    ///
+    /// Callbacks queue from this point on but are not delivered until
+    /// [`MrpState::start_notifier`] runs, which needs a Tokio runtime and so cannot happen here.
     #[must_use]
     pub fn new() -> Self {
+        let (notifications, inbox) = mpsc::channel(notify::QUEUE_DEPTH);
+
         Self {
             players: Mutex::new(PlayerStateManager::new()),
             device_info: Mutex::new(None),
@@ -69,14 +117,61 @@ impl MrpState {
             volume_changed: Notify::new(),
             output_devices_changed: Notify::new(),
             power: watch::Sender::new(PowerState::Unknown),
-            push: Mutex::new(PushState::default()),
-            power_listener: Mutex::new(None),
+            listeners: Arc::new(Listeners::default()),
+            notifications,
+            inbox: Mutex::new(Some(inbox)),
+        }
+    }
+
+    /// Start delivering queued callbacks, off whatever task calls into this state.
+    ///
+    /// Returns `None` if a notifier is already running. Must be called from inside a Tokio
+    /// runtime; [`crate::protocol::MrpProtocol::connect`] does it and keeps the handle.
+    pub fn start_notifier(&self) -> Option<JoinHandle<()>> {
+        let receiver = self.inbox.lock().ok()?.take()?;
+        Some(tokio::spawn(notify::run(
+            receiver,
+            Arc::clone(&self.listeners),
+        )))
+    }
+
+    /// Queue one callback, dropping it with a log rather than waiting for room.
+    ///
+    /// See [`notify`] for why backpressure is the wrong answer here.
+    fn post(&self, notification: Notification) {
+        match self.notifications.try_send(notification) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(dropped)) => tracing::warn!(
+                ?dropped,
+                depth = notify::QUEUE_DEPTH,
+                "dropping an MRP listener callback: the listener is not keeping up"
+            ),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("the MRP notifier has stopped; dropping a callback");
+            }
+        }
+    }
+
+    /// Deliver everything queued so far on the calling thread.
+    ///
+    /// Only for tests, which want a deterministic point at which "the callback has happened" is
+    /// true instead of a sleep. It runs [`notify::deliver`], the same dispatch the task uses.
+    #[cfg(test)]
+    pub(crate) fn deliver_pending(&self) {
+        let Ok(mut inbox) = self.inbox.lock() else {
+            return;
+        };
+        let Some(receiver) = inbox.as_mut() else {
+            return;
+        };
+        while let Ok(notification) = receiver.try_recv() {
+            notify::deliver(&notification, &self.listeners);
         }
     }
 
     /// Register the listener notified when the device reports a new power state.
     pub fn set_power_listener(&self, listener: Option<Arc<dyn PowerListener>>) {
-        if let Ok(mut slot) = self.power_listener.lock() {
+        if let Ok(mut slot) = self.listeners.power.lock() {
             *slot = listener;
         }
     }
@@ -133,20 +228,23 @@ impl MrpState {
         self.with_playing(|playing| playing.playback_state())
     }
 
-    /// Index of the playing item within the active player's queue.
+    /// The active player's device-reported queue index; see
+    /// [`crate::player_state::queue_index`].
     #[must_use]
     #[allow(
         clippy::redundant_closure_for_method_calls,
         reason = "as `MrpState::playback_state`: the function-item form does not satisfy the \
                   higher-ranked bound"
     )]
-    pub fn location(&self) -> usize {
+    pub fn location(&self) -> i32 {
         self.with_playing(|playing| playing.location())
     }
 
-    /// The identifier of the item currently playing, which is upstream's `Playing.hash`.
+    /// The identifier of the item currently playing, which is also
+    /// [`pyatv_core::models::Playing::hash`] (`__init__.py:250-252,283`).
     ///
-    /// Exposed separately because [`pyatv_core::models::Playing`] has no `hash` field.
+    /// Still exposed separately because `artwork_id` reads it without building a whole snapshot
+    /// (`__init__.py:600-610`).
     #[must_use]
     pub fn item_identifier(&self) -> Option<String> {
         self.with_playing(|playing| playing.item_identifier().map(str::to_owned))
@@ -161,57 +259,46 @@ impl MrpState {
     /// Whether push updates are flowing (`MrpPushUpdater.active`, `__init__.py:711-714`).
     #[must_use]
     pub fn push_active(&self) -> bool {
-        self.push.lock().is_ok_and(|push| push.active)
+        self.listeners.push.lock().is_ok_and(|push| push.active)
     }
 
-    /// Register a push-update listener.
-    pub fn add_push_listener(&self, listener: Arc<dyn PlaybackListener>) {
-        if let Ok(mut push) = self.push.lock() {
-            push.listeners.push(listener);
+    /// Register the push-update listener, replacing whatever was there.
+    ///
+    /// The slot is weak: this does **not** keep `listener` alive, and dropping the caller's last
+    /// `Arc` unsubscribes. That is upstream's contract (`player_state.py:229-235`) and the only
+    /// one that lets a caller stop receiving updates without a matching removal call.
+    pub fn set_push_listener(&self, listener: &Arc<dyn PlaybackListener>) {
+        if let Ok(mut push) = self.listeners.push.lock() {
+            push.listener = Some(Arc::downgrade(listener));
         }
     }
 
-    /// Start or stop forwarding player-state changes to the registered listeners.
+    /// Start or stop forwarding player-state changes to the registered listener.
     pub fn set_push_active(&self, active: bool) {
-        if let Ok(mut push) = self.push.lock() {
+        if let Ok(mut push) = self.listeners.push.lock() {
             push.active = active;
         }
     }
 
-    /// Push the current snapshot to every listener, whether or not anything changed.
+    /// Queue the current snapshot for the listener, whether or not anything changed.
     ///
     /// `MrpPushUpdater.start` schedules exactly one of these immediately rather than waiting for a
-    /// device-originated change (`__init__.py:716-727`).
+    /// device-originated change (`__init__.py:716-727`). The snapshot is taken **here**, on the
+    /// caller's thread, so the listener sees the state as it was when the change happened rather
+    /// than whatever it has become by the time the notifier gets to it.
     pub fn post_update(&self) {
         if !self.push_active() {
             return;
         }
 
-        let playing = self.playing();
-        let listeners = self
-            .push
-            .lock()
-            .map(|push| push.listeners.clone())
-            .unwrap_or_default();
-
-        for listener in listeners {
-            listener.playstatus_update(&playing);
-        }
+        self.post(Notification::Playing(Box::new(self.playing())));
     }
 
-    /// Report a push-channel failure to every listener.
+    /// Queue a push-channel failure for the listener.
     ///
     /// `MrpPushUpdater.state_updated`'s exception branch (`__init__.py:736-743`).
-    pub fn post_error(&self, error: &pyatv_core::Error) {
-        let listeners = self
-            .push
-            .lock()
-            .map(|push| push.listeners.clone())
-            .unwrap_or_default();
-
-        for listener in listeners {
-            listener.playstatus_error(error);
-        }
+    pub fn post_error(&self, error: pyatv_core::Error) {
+        self.post(Notification::PlaybackError(error));
     }
 
     /// Apply one inbound message.

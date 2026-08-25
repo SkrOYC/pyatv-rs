@@ -12,26 +12,33 @@
 //! [`remote_control_tunnel`] and `pyatv-proto-mrp` — this crate must not depend on the latter, so it
 //! stops at handing back a live [`DataStreamChannel`].
 //!
-//! `play_url` is Step 5 and is a documented stub here; [`AirPlayFeatures`] still reports it the way
-//! upstream does, from the advertised feature bits, because that reporting is what the facade and
-//! `atvremote` read and it is correct today even though the implementation is not there yet.
+//! `play_url` itself lives in [`crate::stream`]; what this module does is decide the address,
+//! credentials and protocol version one needs, and hand the facade an [`AirPlayStream`] holding
+//! them. [`AirPlayFeatures`] reports the feature the way upstream does, from the advertised feature
+//! bits, independently of whether this particular registration can act on it.
 
+mod credentials;
 mod interfaces;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use pyatv_core::airplay::{AirPlayFlags, CredentialsKind, is_remote_control_supported};
+use pyatv_core::airplay::{
+    AirPlayFlags, AirPlayVersion, CredentialsKind, get_protocol_version,
+    is_remote_control_supported,
+};
 use pyatv_core::consts::{DeviceModel, Protocol};
 use pyatv_core::device_info::lookup_model;
 use pyatv_core::facade::SetupData;
 use pyatv_core::features::FeatureName;
-use pyatv_core::models::{BaseConfig, BaseService, DeviceInfo};
+use pyatv_core::models::{BaseService, DeviceInfo};
 use pyatv_pairing::{AuthenticationType, HapCredentials};
 
+pub use credentials::{play_credentials, tunnel_credentials};
 pub use interfaces::{AirPlayFeatures, AirPlayRemoteControl, AirPlayStream};
 
 use crate::ap2::{Ap2Session, DataStreamChannel, InfoSettings, SeqnoPolicy};
+use crate::stream::PlayOptions;
 use crate::{Error, Result};
 
 /// The features `Protocol::AirPlay` declares, before availability is resolved per call.
@@ -74,6 +81,18 @@ pub fn device_facts(service: &BaseService) -> DeviceInfo {
 pub struct AirPlaySetupOptions {
     /// The AirPlay service being connected, for its TXT properties.
     pub service: BaseService,
+    /// Where the device is, so `play_url` has somewhere to connect
+    /// (`__init__.py:124-126` reads `config.address` and `service.port`).
+    pub address: IpAddr,
+    /// What `play_url` should pair-verify with, from [`play_credentials`]. `None` leaves the
+    /// registered [`AirPlayStream`] unconfigured, so it reports `play_url` unsupported rather than
+    /// failing the whole connect — upstream's registration is unconditional too.
+    pub credentials: Option<HapCredentials>,
+    /// Which protocol version to play with. Upstream reads
+    /// `settings.protocols.raop.protocol_version` even for the AirPlay-proper path
+    /// (`__init__.py:150-156`), and its default is
+    /// [`AirPlayVersion::Auto`].
+    pub protocol_version: AirPlayVersion,
 }
 
 /// Describe what the AirPlay protocol contributes to the facade.
@@ -88,13 +107,25 @@ pub struct AirPlaySetupOptions {
 #[must_use]
 pub fn setup(options: &AirPlaySetupOptions) -> SetupData {
     let flags = airplay_flags(&options.service);
+    let stream = if let Some(credentials) = options.credentials.clone() {
+        AirPlayStream::new(PlayOptions::new(
+            SocketAddr::new(options.address, options.service.port),
+            credentials,
+            get_protocol_version(&options.service, options.protocol_version),
+        ))
+    } else {
+        tracing::debug!("no credentials for AirPlay, registering play_url as unsupported");
+        AirPlayStream::unconfigured()
+    };
 
     SetupData {
         protocol: Some(Protocol::AirPlay),
         features: DECLARED_FEATURES.into_iter().collect(),
         features_impl: Some(Arc::new(AirPlayFeatures::new(flags))),
-        remote_control: Some(Arc::new(AirPlayRemoteControl)),
-        stream: Some(Arc::new(AirPlayStream)),
+        // The same stream, so that `stop()` reaches the playback `play_url` started
+        // (`__init__.py:329-333` passes one instance to both).
+        remote_control: Some(Arc::new(AirPlayRemoteControl::new(stream.clone()))),
+        stream: Some(Arc::new(stream)),
         device_info: device_facts(&options.service),
         ..SetupData::default()
     }
@@ -111,59 +142,6 @@ fn airplay_flags(service: &BaseService) -> AirPlayFlags {
         tracing::debug!(%error, "unparsable AirPlay feature string, assuming no flags");
         AirPlayFlags::empty()
     })
-}
-
-/// Pick the credentials the MRP tunnel should authenticate with.
-///
-/// **A deliberate divergence from pyatv, and the one that makes the tunnel reachable at all on
-/// current hardware.** Upstream reads `extract_credentials(core.service)`
-/// (`auth/__init__.py:120-133`), i.e. the *AirPlay* service's own stored credentials. On the tvOS 27
-/// test device that string is always empty, because AirPlay pair-setup never displays a PIN there
-/// and so can never be completed (`docs/RISKS.md` M7).
-///
-/// The live experiment in `docs/research/airplay-tunnel-auth-experiment-2026-08-24.md` established
-/// that the AirPlay `/pair-verify` endpoint accepts **any** HAP pairing registered on the device,
-/// whichever protocol created it — verified twice, with two independent controller identities — and
-/// that transient pairing is refused outright with `470`. So this falls back to the Companion
-/// service's credentials, which a user *can* obtain because Companion pairing does show a PIN.
-///
-/// Returns `None` when neither service holds credentials that parse as HAP. Legacy, transient and
-/// null credentials are all rejected: `is_remote_control_supported` would refuse them for an
-/// `AppleTV*` model anyway, and the device refuses the transient handshake before any TLV is
-/// exchanged.
-///
-/// Pure over the configuration — it opens no connection and reads no storage.
-#[must_use]
-pub fn tunnel_credentials(config: &BaseConfig) -> Option<HapCredentials> {
-    for protocol in [Protocol::AirPlay, Protocol::Companion] {
-        let Some(credentials) = config
-            .get_service(protocol)
-            .and_then(|service| service.credentials.as_deref())
-            .filter(|it| !it.is_empty())
-        else {
-            continue;
-        };
-
-        match HapCredentials::parse(credentials) {
-            Ok(parsed) if parsed.authentication_type() == AuthenticationType::Hap => {
-                tracing::debug!(
-                    ?protocol,
-                    "using this service's HAP credentials for the tunnel"
-                );
-                return Some(parsed);
-            }
-            Ok(parsed) => tracing::debug!(
-                ?protocol,
-                auth_type = ?parsed.authentication_type(),
-                "ignoring non-HAP credentials for the tunnel"
-            ),
-            Err(error) => {
-                tracing::debug!(?protocol, %error, "ignoring unparsable credentials");
-            }
-        }
-    }
-
-    None
 }
 
 /// Whether a tunnel should be attempted at all.
@@ -234,21 +212,21 @@ fn tunnel_error(error: Error) -> Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{
         AirPlayFeatures, AirPlaySetupOptions, DECLARED_FEATURES, device_facts, is_tunnel_supported,
-        setup, tunnel_credentials,
+        setup,
     };
     use pyatv_core::airplay::AirPlayFlags;
     use pyatv_core::consts::{DeviceModel, Protocol};
     use pyatv_core::features::{FeatureName, FeatureState};
     use pyatv_core::interface::Features as _;
-    use pyatv_core::models::{BaseConfig, BaseService};
+    use pyatv_core::models::BaseService;
     use pyatv_pairing::HapCredentials;
 
     /// The test device's own TXT record (`docs/research/airplay-control-mrp-tunnel-port-spec.md`
     /// §1), so the assertions below are about real values rather than invented ones.
-    fn test_device_service() -> BaseService {
+    pub(super) fn test_device_service() -> BaseService {
         let mut service = BaseService::new(Protocol::AirPlay, 7000);
         service.identifier = Some("AA:BB:CC:DD:EE:FF".to_owned());
         for (key, value) in [
@@ -266,7 +244,7 @@ mod tests {
         service
     }
 
-    fn hap_credentials() -> HapCredentials {
+    pub(super) fn hap_credentials() -> HapCredentials {
         HapCredentials::parse(&format!(
             "{}:{}:{}:{}",
             "aa".repeat(32),
@@ -277,8 +255,7 @@ mod tests {
         .expect("well-formed HAP credentials")
     }
 
-    /// Both video bits are set on the test device, so `PlayUrl` reports available even though the
-    /// implementation is a Step 5 stub.
+    /// Both video bits are set on the test device, so `PlayUrl` reports available.
     #[test]
     fn play_url_is_available_when_either_video_bit_is_set() {
         let features = AirPlayFeatures::new(AirPlayFlags::SUPPORTS_AIRPLAY_VIDEO_V1);
@@ -328,18 +305,45 @@ mod tests {
         }
     }
 
+    /// Options pointing at the test device, with whatever credentials the caller wants.
+    fn setup_options(credentials: Option<HapCredentials>) -> AirPlaySetupOptions {
+        AirPlaySetupOptions {
+            service: test_device_service(),
+            address: "10.0.0.5".parse().expect("an address"),
+            credentials,
+            protocol_version: pyatv_core::airplay::AirPlayVersion::Auto,
+        }
+    }
+
     /// Exactly two declared names (`__init__.py:335`).
     #[test]
     fn airplay_declares_two_features() {
-        let data = setup(&AirPlaySetupOptions {
-            service: test_device_service(),
-        });
+        let data = setup(&setup_options(Some(hap_credentials())));
 
         assert_eq!(data.protocol, Some(Protocol::AirPlay));
         assert_eq!(data.features.len(), 2);
         for feature in DECLARED_FEATURES {
             assert!(data.features.contains(&feature), "{feature}");
         }
+        assert!(data.stream.is_some());
+        assert!(data.remote_control.is_some());
+    }
+
+    /// Without credentials the registration still happens — upstream's is unconditional — and
+    /// `play_url` reports itself unsupported when it is called.
+    #[tokio::test]
+    async fn a_stream_without_credentials_refuses_to_play() {
+        let data = setup(&setup_options(None));
+        let stream = data.stream.expect("a stream is always registered");
+
+        let error = stream
+            .play_url("http://example/video.mp4")
+            .await
+            .expect_err("there is nowhere to play to");
+        assert!(
+            matches!(error, pyatv_core::Error::NotSupported(_)),
+            "{error}"
+        );
     }
 
     #[test]
@@ -371,60 +375,6 @@ mod tests {
 
         service.properties.remove("psi");
         assert_eq!(device_facts(&service).output_device_id(), Some("fallback"));
-    }
-
-    /// The documented divergence: with no AirPlay credentials, Companion's are used.
-    #[test]
-    fn companion_credentials_are_the_fallback() {
-        let mut config = BaseConfig::new("Living Room", "10.0.0.5".parse().expect("an address"));
-        config.add_service(test_device_service());
-
-        assert!(tunnel_credentials(&config).is_none());
-
-        let mut companion = BaseService::new(Protocol::Companion, 49_152);
-        companion.identifier = Some("AA:BB:CC:DD:EE:FF".to_owned());
-        companion.credentials = Some(hap_credentials().to_string());
-        config.add_service(companion);
-
-        assert_eq!(tunnel_credentials(&config), Some(hap_credentials()));
-    }
-
-    /// AirPlay's own credentials win when it has any, which is upstream's only source.
-    #[test]
-    fn airplay_credentials_win_over_companions() {
-        let mut config = BaseConfig::new("Living Room", "10.0.0.5".parse().expect("an address"));
-
-        let mut airplay = test_device_service();
-        let airplay_credentials = HapCredentials::parse(&format!(
-            "{}:{}:{}:{}",
-            "11".repeat(32),
-            "22".repeat(32),
-            "33".repeat(36),
-            "44".repeat(36)
-        ))
-        .expect("well-formed");
-        airplay.credentials = Some(airplay_credentials.to_string());
-        config.add_service(airplay);
-
-        let mut companion = BaseService::new(Protocol::Companion, 49_152);
-        companion.identifier = Some("AA:BB:CC:DD:EE:FF".to_owned());
-        companion.credentials = Some(hap_credentials().to_string());
-        config.add_service(companion);
-
-        assert_eq!(tunnel_credentials(&config), Some(airplay_credentials));
-    }
-
-    /// Non-HAP credentials are skipped rather than returned and rejected later.
-    #[test]
-    fn transient_and_null_credentials_are_not_used() {
-        let mut config = BaseConfig::new("Living Room", "10.0.0.5".parse().expect("an address"));
-
-        let mut companion = BaseService::new(Protocol::Companion, 49_152);
-        companion.identifier = Some("AA:BB:CC:DD:EE:FF".to_owned());
-        companion.credentials = Some(HapCredentials::transient().to_string());
-        config.add_service(companion);
-
-        assert_eq!(tunnel_credentials(&config), None);
     }
 
     /// The gate that upstream's `elif` chain applies, on the test device's real TXT values.

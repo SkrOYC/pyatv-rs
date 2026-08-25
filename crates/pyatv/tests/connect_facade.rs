@@ -252,3 +252,82 @@ async fn a_device_with_no_credentials_connects_without_a_tunnel() {
 
     atv.close().await.expect("closing must succeed");
 }
+
+/// A tunnel that *fails* — as opposed to one the gate declines — must not take AirPlay with it.
+///
+/// The regression: `setup_protocol` propagated the tunnel's error with `?`, which discarded the
+/// `AirPlay` registration it had already built two lines earlier. A receiver that refuses the
+/// remote-control `SETUP` therefore lost `play_url` as well, even though the AirPlay half had
+/// connected fine and needs nothing from the tunnel. Upstream cannot hit this: its `setup()` is a
+/// generator, so the first `yield` has already escaped by the time the second one raises.
+#[tokio::test]
+async fn a_refused_tunnel_setup_leaves_airplay_registered() {
+    let device = FakeAppleTv::start_without_a_tunnel().await;
+    let atv = device.connect().await;
+
+    assert!(
+        atv.metadata().is_none(),
+        "the tunnel was refused, so nothing registers Metadata"
+    );
+    assert_ne!(
+        atv.features().get_feature(FeatureName::PlayUrl).state,
+        FeatureState::Unsupported,
+        "AirPlay's own registration must survive the tunnel's failure"
+    );
+    assert_ne!(
+        atv.features().get_feature(FeatureName::AppList).state,
+        FeatureState::Unsupported,
+        "and so must Companion's"
+    );
+
+    atv.close().await.expect("closing must succeed");
+}
+
+/// When the *device* ends the session, the AirPlay keepalive stops too.
+///
+/// MRP notices first — its reader sees the tunnelled data channel close — and reports it through
+/// the `DeviceListener` path. Nothing downstream of that used to close the AirPlay half, so the
+/// `/feedback` poster went on talking to a receiver that had already hung up, for the rest of the
+/// process's life. The listener must also hear about it exactly once, as a *loss* rather than an
+/// orderly close.
+#[tokio::test]
+async fn a_device_initiated_close_tears_the_airplay_session_down() {
+    let device = FakeAppleTv::start().await;
+    let atv = device.connect().await;
+
+    let listener = Arc::new(CountingListener::default());
+    atv.add_listener(&(Arc::clone(&listener) as Arc<dyn DeviceListener>));
+
+    // Prove the tunnel is live first, so a passing test cannot be one that never came up.
+    atv.metadata()
+        .expect("MRP must be registered")
+        .playing()
+        .await
+        .expect("playing() must not fail while connected");
+
+    let airplay_state = device.airplay.state();
+    until("the keepalive to post at least once", || {
+        (airplay_state.feedbacks.load(Ordering::SeqCst) > 0).then_some(())
+    })
+    .await;
+
+    // The device hangs up, without anyone calling `close()`.
+    device.mrp.kill_connections();
+
+    until("the caller to be told the connection ended", || {
+        (listener.lost.load(Ordering::SeqCst) + listener.closed.load(Ordering::SeqCst) > 0)
+            .then_some(())
+    })
+    .await;
+
+    // Give the spawned teardown a moment, then confirm the keepalive really has stopped rather
+    // than merely paused between posts.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let feedbacks = airplay_state.feedbacks.load(Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        airplay_state.feedbacks.load(Ordering::SeqCst),
+        feedbacks,
+        "the AirPlay keepalive must stop when the device ends the session"
+    );
+}

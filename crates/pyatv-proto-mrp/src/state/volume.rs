@@ -64,6 +64,21 @@ impl MrpState {
     /// its own. `None` only while no `DeviceInfoMessage` has arrived at all — an *empty* UID is
     /// `Some("")` here, matching upstream, whose `is_available` check is `device_uid is not None`
     /// and so treats an empty string as present.
+    ///
+    /// # Divergence: which `DeviceInfoMessage` this reads
+    ///
+    /// Upstream's property reads `self.protocol.device_info` — the connection-time snapshot
+    /// `MrpProtocol.start()` stored — and **not** the one `MrpPower` caches as it updates
+    /// (`__init__.py:643-645,673`). So under pyatv the audio UID is fixed for the life of the
+    /// connection even after the device sends a `DEVICE_INFO_UPDATE_MESSAGE` naming a different
+    /// cluster; only power state follows the updates.
+    ///
+    /// This reads the latest message instead, because the split looks like an oversight rather
+    /// than a decision — two objects observing the same field, one refreshing and one not — and
+    /// because a stale UID addresses `SET_VOLUME_MESSAGE` at the wrong output device, which fails
+    /// silently. The observable difference is confined to a device that re-clusters mid-session;
+    /// if a capture ever shows real firmware doing that and pyatv still working, this is the note
+    /// to revisit.
     #[must_use]
     pub fn device_uid(&self) -> Option<String> {
         let info = self.device_info()?;

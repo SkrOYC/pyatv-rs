@@ -45,6 +45,7 @@ mod setup;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use pyatv_pairing::hkdf_derive::{data_stream_salt, transport::AIRPLAY_DATA_STREAM};
@@ -68,6 +69,18 @@ const INBOUND_QUEUE_DEPTH: usize = 64;
 
 /// How many unsent outbound frames are queued before [`DataStreamChannel::send`] waits.
 const OUTBOUND_QUEUE_DEPTH: usize = 64;
+
+/// How long [`DataStreamChannel::send_payload`] waits for room in the outbound queue.
+///
+/// Not an upstream concept — pyatv writes straight into an `asyncio` transport, whose buffer is
+/// unbounded, so a stalled write shows up as memory growth rather than as a parked caller. A
+/// bounded queue is the better trade, but only if a caller can never park on it forever: the MRP
+/// protocol actor performs *every* write from its single `select!` loop, so one `send_payload` that
+/// never returns stops the actor from serving anything at all, including the shutdown request that
+/// would free it. The deadline is deliberately a shade above `pyatv-proto-mrp`'s own five-second
+/// `REQUEST_TIMEOUT`, so an exchange times out on its own terms first and this only fires when the
+/// write side is genuinely wedged.
+const SEND_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// What to do with the frame header's `seqno` on each outbound message.
 ///
@@ -205,18 +218,31 @@ impl DataStreamChannel {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Plist`] if the envelope cannot be serialised, and [`Error::Io`] if the
-    /// channel has been closed.
+    /// Returns [`Error::Plist`] if the envelope cannot be serialised, [`Error::Io`] with
+    /// [`std::io::ErrorKind::BrokenPipe`] if the channel has been closed, and [`Error::Io`] with
+    /// [`std::io::ErrorKind::TimedOut`] if the outbound queue stayed full for [`SEND_TIMEOUT`].
     pub async fn send_payload(&self, data: &[u8]) -> Result<()> {
         let envelope = payload::encode_envelope(data.to_vec())?;
         let frame = frame::encode_sync(self.next_seqno(), &envelope);
 
-        self.outbound.send(frame).await.map_err(|_| {
+        let closed = || {
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 format!("data channel to {} is closed", self.address),
             ))
-        })
+        };
+
+        match tokio::time::timeout(SEND_TIMEOUT, self.outbound.send(frame)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(closed()),
+            Err(_) => Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "data channel to {} did not drain within {SEND_TIMEOUT:?}",
+                    self.address
+                ),
+            ))),
+        }
     }
 
     /// Await the next `params.data` blob the receiver sent.
@@ -329,6 +355,26 @@ async fn run(
 }
 
 /// Decode every complete frame in `buffer`, acknowledging and dispatching as it goes.
+///
+/// # Acknowledge first, then dispatch
+///
+/// Upstream's ordering is the other way round — `_process_payload` runs and *then* the `rply` goes
+/// out (`channels.py:241-255`) — but every step of it is synchronous, so "before" and "after" are
+/// the same instant as far as the socket is concerned. Here they are not, and getting the order
+/// wrong is a three-way deadlock rather than a latency wobble:
+///
+/// 1. this loop parks awaiting room in the bounded inbound queue,
+/// 2. so it never writes the `rply`, and never services the outbound queue either,
+/// 3. so the MRP actor's next write parks on the full outbound queue,
+/// 4. so the MRP actor never runs its own `recv`, which is the only thing that drains the inbound
+///    queue that step 1 is waiting on.
+///
+/// The acknowledgement is what the receiver actually needs — an unacknowledged `sync` makes it
+/// treat the channel as unresponsive and drop the tunnel — so it goes out unconditionally and
+/// first, straight down the writer this loop owns rather than through the outbound queue. The
+/// payload is then offered without waiting, and dropped with a log if nothing is draining, exactly
+/// as the event channel does (`ap2/event_channel.rs`). A dropped payload costs one push update; a
+/// deadlock costs the session.
 async fn drain(
     buffer: &mut BytesMut,
     writer: &mut HapWriter,
@@ -346,17 +392,15 @@ async fn drain(
             "inbound data frame"
         );
 
-        if !message.payload.is_empty() {
-            dispatch(&message, inbound, address).await;
-        }
-
         // Upstream acknowledges *any* `sync`-prefixed frame regardless of whether its payload was
-        // understood (`channels.py:253-255`); a receiver that gets no reply treats the channel as
-        // unresponsive.
+        // understood (`channels.py:253-255`).
         if message.header.wants_reply() {
             writer
                 .send(&frame::encode_reply(message.header.seqno))
                 .await?;
+        }
+        if !message.payload.is_empty() {
+            dispatch(&message, inbound, address);
         }
     }
 
@@ -393,7 +437,11 @@ fn ascii_tag(tag: &[u8]) -> String {
 /// Splitting the blob into individual messages happens at the layer above, in
 /// [`DataStreamChannel::recv`] or in the tunnel transport, so that a caller working at the payload
 /// seam sees exactly the bytes the receiver put in the field.
-async fn dispatch(message: &DataStreamMessage, inbound: &mpsc::Sender<Bytes>, address: SocketAddr) {
+///
+/// **Never waits.** See [`drain`] for why offering the payload rather than handing it over is what
+/// keeps the acknowledgements flowing; a consumer that has stopped draining loses payloads, and
+/// says so in the log, instead of stalling the frame loop.
+fn dispatch(message: &DataStreamMessage, inbound: &mpsc::Sender<Bytes>, address: SocketAddr) {
     let Some(data) = payload::decode_envelope(&message.payload) else {
         tracing::debug!(
             %address,
@@ -403,86 +451,19 @@ async fn dispatch(message: &DataStreamMessage, inbound: &mpsc::Sender<Bytes>, ad
         return;
     };
 
-    if inbound.send(Bytes::from(data)).await.is_err() {
-        tracing::debug!(%address, "nothing is reading the data channel");
+    match inbound.try_send(Bytes::from(data)) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(dropped)) => tracing::warn!(
+            %address,
+            bytes = dropped.len(),
+            depth = INBOUND_QUEUE_DEPTH,
+            "dropping a data-channel payload because nothing is draining the queue"
+        ),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!(%address, "nothing is reading the data channel");
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{SeqnoPolicy, frame, payload};
-
-    /// The full outbound stack, asserted against its parts rather than against a captured blob:
-    /// header, envelope and varint prefix all have to line up for the bytes to decode again.
-    #[test]
-    fn an_outbound_frame_unwraps_back_to_the_message() {
-        let message = [0x08u8, 0x2A, 0x52, 0x01];
-
-        let envelope =
-            payload::encode_envelope(payload::encode_messages(&[&message])).expect("encodes");
-        let wire = frame::encode_sync(0x1_2345_6789, &envelope);
-
-        let mut buffer = bytes::BytesMut::from(&wire[..]);
-        let decoded = frame::decode(&mut buffer)
-            .expect("decodes")
-            .expect("a frame");
-
-        assert_eq!(decoded.header.seqno, 0x1_2345_6789);
-        assert_eq!(decoded.header.message_type, frame::MESSAGE_TYPE_SYNC);
-        assert_eq!(decoded.header.command, frame::COMMAND_COMM);
-        assert!(decoded.header.wants_reply());
-
-        let data = payload::decode_envelope(&decoded.payload).expect("an envelope");
-        let messages = payload::decode_messages(&data).expect("splits");
-        assert_eq!(messages.len(), 1);
-        assert_eq!(&messages[0][..], &message[..]);
-    }
-
-    /// The default policy is upstream's: one seqno for the life of the channel.
-    #[test]
-    fn the_default_seqno_policy_is_fixed() {
-        assert_eq!(SeqnoPolicy::default(), SeqnoPolicy::Fixed);
-    }
-
-    /// The contract the MRP protocol actor depends on: a reader parked in `recv_payload` holds the
-    /// inbound lock, and `close` must still complete and wake it. A `close` that took that lock
-    /// would deadlock against its own reader, which is exactly the shape of bug this asserts away.
-    #[tokio::test]
-    async fn closing_wakes_a_reader_parked_in_recv() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("binding a loopback port must succeed in tests");
-        let address = listener
-            .local_addr()
-            .expect("a bound listener must have an address");
-        // Accept and then sit idle, so the channel's reader has nothing to deliver and parks.
-        let accept = tokio::spawn(async move { listener.accept().await.map(|(stream, _)| stream) });
-
-        let keys = pyatv_pairing::pairing::SessionKeys {
-            shared_secret: Vec::new(),
-            output_key: [7u8; 32],
-            input_key: [9u8; 32],
-        };
-        let channel = std::sync::Arc::new(
-            super::DataStreamChannel::connect(address, &keys, SeqnoPolicy::Fixed)
-                .await
-                .expect("dialling a listening loopback port must succeed"),
-        );
-        let _peer = accept.await.expect("the accept task must not panic");
-
-        let reader = tokio::spawn({
-            let channel = std::sync::Arc::clone(&channel);
-            async move { channel.recv_payload().await }
-        });
-        // Give the reader time to take the lock and park inside it.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        channel.close();
-
-        let parked = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
-            .await
-            .expect("close must wake a parked reader")
-            .expect("the reader task must not panic");
-        assert_eq!(parked, None, "a closed channel reads as end-of-stream");
-    }
-}
+mod tests;

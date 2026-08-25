@@ -25,7 +25,30 @@ allow = [
   "Zlib",
 ]
 confidence-threshold = 0.93
-exceptions = []
+# MPL-2.0 is *file-level* copyleft: linking an unmodified MPL crate into an MIT project is fine, and
+# the obligation only attaches to MPL-licensed files that are themselves changed. Symphonia is the
+# audio decoder RAOP's `stream_file` needs (`docs/research/rust-crates.md` §7 flagged the licence as
+# wanting a sanity check, and this is it), and it is used unmodified — no vendoring, no patches.
+# Listed crate by crate rather than added to `allow` so that a *new* MPL dependency arriving through
+# some other path still fails the build and gets the same deliberate decision.
+exceptions = [
+  { allow = ["MPL-2.0"], crate = "symphonia" },
+  { allow = ["MPL-2.0"], crate = "symphonia-bundle-flac" },
+  { allow = ["MPL-2.0"], crate = "symphonia-bundle-mp3" },
+  { allow = ["MPL-2.0"], crate = "symphonia-codec-aac" },
+  { allow = ["MPL-2.0"], crate = "symphonia-codec-adpcm" },
+  { allow = ["MPL-2.0"], crate = "symphonia-codec-alac" },
+  { allow = ["MPL-2.0"], crate = "symphonia-codec-pcm" },
+  { allow = ["MPL-2.0"], crate = "symphonia-codec-vorbis" },
+  { allow = ["MPL-2.0"], crate = "symphonia-common" },
+  { allow = ["MPL-2.0"], crate = "symphonia-core" },
+  { allow = ["MPL-2.0"], crate = "symphonia-format-caf" },
+  { allow = ["MPL-2.0"], crate = "symphonia-format-isomp4" },
+  { allow = ["MPL-2.0"], crate = "symphonia-format-mkv" },
+  { allow = ["MPL-2.0"], crate = "symphonia-format-ogg" },
+  { allow = ["MPL-2.0"], crate = "symphonia-format-riff" },
+  { allow = ["MPL-2.0"], crate = "symphonia-metadata" },
+]
 
 [bans]
 # Duplicate versions are a warning, not an error: the crypto stack co-resolves cleanly today, and a

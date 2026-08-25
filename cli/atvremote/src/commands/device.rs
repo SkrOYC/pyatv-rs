@@ -102,12 +102,8 @@ pub async fn run(cli: &Cli) -> Result<()> {
             width,
             height,
         } => artwork(cli, output, *width, *height).await,
-        Command::PlayUrl { .. } | Command::StreamFile { .. } => {
-            bail!(
-                "this subcommand needs AirPlay video or RAOP audio, which this build cannot \
-                   stream yet"
-            )
-        }
+        Command::PlayUrl { url } => play_url(cli, url).await,
+        Command::StreamFile { path } => stream_file(cli, path).await,
         Command::Scan | Command::Pair { .. } => {
             unreachable!("dispatched before a connection is needed")
         }
@@ -261,7 +257,7 @@ async fn push_updates(cli: &Cli, timeout: Option<u64>) -> Result<()> {
         // Held for as long as updates are wanted: the updater keeps only a weak reference, so
         // dropping this is what unsubscribes.
         let listener: Arc<dyn PlaybackListener> = Arc::new(output::PrintingListener);
-        updater.add_listener(Arc::clone(&listener));
+        updater.set_listener(&listener);
 
         match timeout {
             Some(seconds) => println!("Following updates for {seconds}s"),
@@ -281,6 +277,94 @@ async fn push_updates(cli: &Cli, timeout: Option<u64>) -> Result<()> {
         }
 
         updater.stop();
+        Ok(())
+    })
+    .await
+}
+
+/// Play a video URL and block until the device stops playing it.
+///
+/// `atvremote play_url=<url>` upstream, which goes through the generic command dispatcher and so
+/// prints nothing at all — `play_url` returns `None` and `_pretty_print` has nothing to show
+/// (`atvremote.py:889-951,980-990`). The two lines here are this CLI's own addition: the call does
+/// not return until the media ends, which can be an hour, and a command that prints nothing for an
+/// hour looks hung.
+///
+/// Ctrl-C stops the playback the way `atv.remote_control.stop()` would, rather than killing the
+/// process with the connection still open.
+async fn play_url(cli: &Cli, url: &str) -> Result<()> {
+    let url = url.to_owned();
+    with_device(cli, async |atv| {
+        let stream = atv
+            .stream()
+            .ok_or_else(|| output::unsupported("play_url", "AirPlay"))?;
+
+        // `atv.features.in_state(Available, PlayUrl)` is what upstream's own docs tell a caller to
+        // check; the device answers `Unavailable` when it advertises neither video bit.
+        if atv.features().get_feature(FeatureName::PlayUrl).state != FeatureState::Available {
+            bail!("this device does not support play_url");
+        }
+
+        println!("Playing {url}");
+        let playing = stream.play_url(&url);
+        tokio::pin!(playing);
+
+        tokio::select! {
+            outcome = &mut playing => outcome?,
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                println!("Stopping");
+                // `close()` raises the stop signal; awaiting the call again lets it unwind and
+                // shut the connection down cleanly.
+                stream.close();
+                playing.await?;
+            }
+        }
+
+        println!("Playback finished");
+        Ok(())
+    })
+    .await
+}
+
+/// Stream an audio file, or a `http://` URL, over RAOP.
+///
+/// `stream_file` (`atvremote.py:953-966`), which like `play_url` returns nothing and prints
+/// nothing. The two progress lines and the Ctrl-C handling are this CLI's own, for the same reason
+/// they are on `play_url`: the call does not return until the whole file has been paced out in real
+/// time, and a command that prints nothing for the length of an album looks hung.
+///
+/// The path is passed through whole. A string that spells a URL is fetched rather than opened, and
+/// that decision belongs to the protocol crate — `_is_url` (`audio_source.py:731-735`) is what
+/// makes it upstream too.
+async fn stream_file(cli: &Cli, path: &Path) -> Result<()> {
+    let path = path.to_owned();
+    with_device(cli, async |atv| {
+        let stream = atv
+            .stream()
+            .ok_or_else(|| output::unsupported("stream_file", "RAOP"))?;
+
+        if atv.features().get_feature(FeatureName::StreamFile).state != FeatureState::Available {
+            bail!("this device does not support stream_file");
+        }
+
+        println!("Streaming {}", path.display());
+        let streaming = stream.stream_file(&path);
+        tokio::pin!(streaming);
+
+        tokio::select! {
+            outcome = &mut streaming => outcome?,
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                println!("Stopping");
+                // `close()` raises the stop flag the pacing loop polls; awaiting the call again
+                // lets it unwind through `TEARDOWN` rather than dropping the sockets.
+                stream.close();
+                streaming.await?;
+            }
+        }
+
+        println!("Streaming finished");
         Ok(())
     })
     .await

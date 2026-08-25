@@ -13,10 +13,13 @@ workspace = true
 
 [dependencies]
 bytes.workspace = true
+md-5 = "0.11.0"
 plist = "1.10.0"
 pyatv-core.workspace = true
 pyatv-pairing.workspace = true
 rand = "0.10.2"
+rubato = "5.0.0"
+symphonia = { version = "0.6.1", features = ["mp3", "aac", "alac", "isomp4", "caf", "aiff"] }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { version = "0.7.19", features = ["codec"] }
@@ -33,5 +36,7 @@ test-support = ["pyatv-pairing/test-server"]
 pyatv-proto-airplay = { path = ".", features = ["test-support"] }
 pyatv-pairing = { workspace = true, features = ["test-server"] }
 serde_json = "1.0.151"
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# `signal` is only for `examples/airplay_play_url_probe`, which stops a live playback on Ctrl-C.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+hound = "3.5.1"

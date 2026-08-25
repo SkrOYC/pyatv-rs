@@ -21,3 +21,5 @@
 pub mod fake_airplay;
 pub mod fake_bridge;
 pub mod fake_channels;
+pub mod fake_play;
+pub mod fake_raop;

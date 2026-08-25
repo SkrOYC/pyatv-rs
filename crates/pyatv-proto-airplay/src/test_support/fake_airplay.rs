@@ -46,9 +46,21 @@ use tokio::sync::Mutex;
 
 use super::fake_bridge::serve_data_bridge;
 use super::fake_channels::{bind_loopback, serve_data, serve_event};
+use super::fake_play::{self, PlayMode, PlayState};
 
 /// Content type every property-list body carries.
 const BPLIST: &str = "application/x-apple-binary-plist";
+
+/// Content type every TLV8 body carries.
+///
+/// pyatv's own fake labels the pair-*setup* TLVs `application/x-apple-binary-plist`
+/// (`server_auth.py:201,227`) and only the pair-*verify* ones `application/octet-stream`
+/// (`server_auth.py:261`). Real hardware does neither: the tvOS 27 captures in
+/// `docs/research/airplay-tunnel-auth-experiment-2026-08-24.md` (lines 36-52, 95) show
+/// `application/octet-stream` on **both** halves of the handshake, in both directions. This
+/// receiver follows the device rather than the fake, because the point of it is to catch a client
+/// that has quietly grown a dependency on something only pyatv's test double does.
+const TLV8: &str = "application/octet-stream";
 
 /// How the receiver should behave during remote-control setup.
 #[derive(Debug, Clone)]
@@ -67,6 +79,14 @@ pub struct FakeOptions {
     /// Point this at a hermetic MRP device's TCP address and the receiver becomes a real tunnel
     /// rather than a mirror; see [`super::fake_bridge`].
     pub data_bridge: Option<SocketAddr>,
+    /// Which `/play` header set to insist on; see [`super::fake_play`].
+    pub play_mode: PlayMode,
+    /// Answer every remote-control `SETUP` with `455 Method Not Valid In This State`.
+    ///
+    /// What a receiver that has no remote-control channel does, and the only way to exercise the
+    /// "tunnel bring-up failed" path: everything up to and including pair-verify succeeds, so the
+    /// failure lands where a real one would rather than at connect time.
+    pub refuse_setup: bool,
 }
 
 impl Default for FakeOptions {
@@ -77,6 +97,8 @@ impl Default for FakeOptions {
             timing_port: None,
             event_probe: None,
             data_bridge: None,
+            play_mode: PlayMode::default(),
+            refuse_setup: false,
         }
     }
 }
@@ -102,6 +124,8 @@ pub struct FakeState {
     pub mrp_received: Mutex<Vec<Vec<u8>>>,
     /// Raw replies the controller sent on the event channel.
     pub event_replies: Mutex<Vec<String>>,
+    /// What the `play_url` routes saw; see [`super::fake_play`].
+    pub play: PlayState,
 }
 
 /// A running fake receiver. Dropping it stops the accept loop.
@@ -211,6 +235,9 @@ async fn serve(
             buffer.drain(..consumed);
 
             let (response, enable) = handle(&request, &accessory, &state, &options).await;
+            // Applied once here rather than threaded through every route, so a route added later
+            // gets it for free — and so the rule is stated in one place instead of seventeen.
+            let response = echo_protocol(response, &request.protocol);
 
             let outbound = match session.as_mut() {
                 Some(session) => match session.encrypt(&response) {
@@ -313,7 +340,7 @@ async fn handle(
                 _ => return (response(501, "Not implemented", &cseq, None, &[]), None),
             };
             match body {
-                Ok(tlv) => (response(200, "OK", &cseq, Some(BPLIST), &tlv), None),
+                Ok(tlv) => (response(200, "OK", &cseq, Some(TLV8), &tlv), None),
                 Err(error) => (response(500, &error.to_string(), &cseq, None, &[]), None),
             }
         }
@@ -338,10 +365,7 @@ async fn handle(
                                 .ok()
                         })
                         .flatten();
-                    (
-                        response(200, "OK", &cseq, Some("application/octet-stream"), &tlv),
-                        keys,
-                    )
+                    (response(200, "OK", &cseq, Some(TLV8), &tlv), keys)
                 }
                 Err(error) => (response(500, &error.to_string(), &cseq, None, &[]), None),
             }
@@ -356,7 +380,19 @@ async fn handle(
             (response(200, "OK", &cseq, None, &[]), None)
         }
         ("GET", "/info") => (response(200, "OK", &cseq, Some(BPLIST), &info_body()), None),
-        _ => (response(404, "File not found", &cseq, None, &[]), None),
+        _ => match fake_play::handle(request, &state.play, options.play_mode).await {
+            Some(reply) => (
+                response(
+                    reply.status,
+                    reply.reason,
+                    &cseq,
+                    reply.content_type,
+                    &reply.body,
+                ),
+                None,
+            ),
+            None => (response(404, "File not found", &cseq, None, &[]), None),
+        },
     }
 }
 
@@ -368,6 +404,10 @@ async fn setup(
     options: &FakeOptions,
     cseq: &str,
 ) -> Vec<u8> {
+    if options.refuse_setup {
+        return response(455, "Method Not Valid In This State", cseq, None, &[]);
+    }
+
     let Ok(body) = plist::from_bytes::<plist::Value>(&request.body) else {
         return response(400, "Bad request", cseq, None, &[]);
     };
@@ -473,8 +513,35 @@ fn sequence_number(body: &[u8]) -> Option<u8> {
         .copied()
 }
 
+/// Rewrite a response's protocol token to the one the request used.
+///
+/// `format_response` builds every reply as `HttpResponse(request.protocol, request.version, …)`
+/// (`server_auth.py:193-204,230-241,251-262`, `support/http.py:143-150`), so a receiver answers
+/// `RTSP/1.0` to an RTSP request and `HTTP/1.1` to an HTTP one **on the same socket** — AirPlay 2
+/// runs both over one connection. The tvOS 27 captures in
+/// `docs/research/airplay-tunnel-auth-experiment-2026-08-24.md` show exactly that: `HTTP/1.1 200
+/// OK` to `POST /pair-verify HTTP/1.1` (line 42) and `RTSP/1.0 200 OK` to `SETUP … RTSP/1.0`
+/// (line 128).
+///
+/// [`response`] always writes `HTTP/1.1`, which is the shape pyatv's own client happens to accept
+/// either way; answering as the device really does is what makes a client that has grown a
+/// dependency on the constant fail here rather than on hardware.
+fn echo_protocol(response: Vec<u8>, protocol: &str) -> Vec<u8> {
+    const DEFAULT: &[u8] = b"HTTP/1.1";
+
+    if protocol.as_bytes() == DEFAULT || !response.starts_with(DEFAULT) {
+        return response;
+    }
+
+    let mut out = protocol.as_bytes().to_vec();
+    out.extend_from_slice(&response[DEFAULT.len()..]);
+    out
+}
+
 /// Serialise a response the way `format_response` does (`pyatv/support/http.py:143-167`):
 /// `Server` first, then the caller's headers, then `Content-Length` only for a non-empty body.
+///
+/// The protocol token is a placeholder that [`echo_protocol`] replaces with the request's.
 fn response(
     code: u16,
     message: &str,

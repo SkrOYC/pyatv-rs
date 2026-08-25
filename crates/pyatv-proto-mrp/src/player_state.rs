@@ -47,8 +47,40 @@ pub struct PlayerState {
     pub supported_commands: Vec<CommandInfo>,
     /// The playback queue.
     pub items: Vec<ContentItem>,
-    /// Index into [`PlayerState::items`] of the item actually playing.
-    pub location: usize,
+    /// Index into [`PlayerState::items`] of the item actually playing, **as the device reported
+    /// it**.
+    ///
+    /// Signed, and deliberately not normalised, because `PlaybackQueue.location` is an
+    /// `optional int32` that pyatv assigns verbatim (`player_state.py:111`) and then both indexes
+    /// a Python list with and sends back in `playback_queue_request` (`__init__.py:587-592`). Use
+    /// [`queue_index`] to turn it into an offset.
+    pub location: i32,
+}
+
+/// Resolve a device-reported queue `location` against a queue of `len` items.
+///
+/// Reproduces what Python's list indexing does with the value pyatv stores, which is not what a
+/// `usize` conversion would do:
+///
+/// * A non-negative index in range is itself.
+/// * A **negative** index counts back from the end — `items[-1]` is the last item. pyatv's guard
+///   is `if len(self.items) >= (self.location + 1)` (`player_state.py:75,82`), which any negative
+///   value passes, so the negative index reaches the subscript and Python resolves it that way.
+///   Clamping a negative location to `0` instead — what `usize::try_from(…).unwrap_or_default()`
+///   does — silently reports the *first* queue item as the one playing.
+/// * Anything still out of range is `None`. Python would raise `IndexError` here, out of a
+///   property that half of `build_playing_instance` reads; returning "no item" is the same
+///   observable state as an empty queue and is the one divergence in this function, taken
+///   deliberately rather than reproducing a crash.
+#[must_use]
+pub fn queue_index(location: i32, len: usize) -> Option<usize> {
+    let index = if location >= 0 {
+        usize::try_from(location).ok()?
+    } else {
+        len.checked_sub(usize::try_from(location.unsigned_abs()).ok()?)?
+    };
+
+    (index < len).then_some(index)
 }
 
 impl PlayerState {
@@ -79,16 +111,23 @@ impl PlayerState {
         }
     }
 
+    /// The queue item [`PlayerState::location`] points at, if the queue reaches that far.
+    #[must_use]
+    pub fn current_item(&self) -> Option<&ContentItem> {
+        self.items
+            .get(queue_index(self.location, self.items.len())?)
+    }
+
     /// Metadata of the item at [`PlayerState::location`], if the queue reaches that far.
     #[must_use]
     pub fn metadata(&self) -> Option<&ContentItemMetadata> {
-        self.items.get(self.location)?.metadata.as_ref()
+        self.current_item()?.metadata.as_ref()
     }
 
     /// Identifier of the item at [`PlayerState::location`] (`player_state.py:76-81`).
     #[must_use]
     pub fn item_identifier(&self) -> Option<&str> {
-        self.items.get(self.location)?.identifier.as_deref()
+        self.current_item()?.identifier.as_deref()
     }
 
     /// Playback state with upstream's two re-derivations applied (`player_state.py:41-70`).
@@ -130,7 +169,8 @@ impl PlayerState {
         }
         if let Some(queue) = message.playback_queue.as_ref() {
             self.items.clone_from(&queue.content_items);
-            self.location = usize::try_from(queue.location.unwrap_or_default()).unwrap_or_default();
+            // Verbatim, as upstream (`player_state.py:111`); see [`queue_index`].
+            self.location = queue.location.unwrap_or_default();
         }
     }
 
@@ -256,9 +296,9 @@ impl<'a> ActivePlayer<'a> {
         self.player.map_or("", |it| it.identifier.as_str())
     }
 
-    /// Index of the playing item within the queue.
+    /// The device-reported queue index of the playing item; see [`queue_index`].
     #[must_use]
-    pub fn location(self) -> usize {
+    pub fn location(self) -> i32 {
         self.player.map_or(0, |it| it.location)
     }
 

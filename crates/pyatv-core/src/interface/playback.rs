@@ -54,9 +54,14 @@ pub trait PlaybackListener: Send + Sync + std::fmt::Debug {
 pub trait PushUpdater: Send + Sync + std::fmt::Debug {
     /// Whether updates are currently flowing.
     fn active(&self) -> bool;
-    /// Register a listener. Listeners are held weakly by the facade in pyatv; here the caller keeps
-    /// the `Arc` alive for as long as it wants updates.
-    fn add_listener(&self, listener: Arc<dyn PlaybackListener>);
+    /// Register the listener, replacing whatever was registered before.
+    ///
+    /// One slot, not a list, and held **weakly** — pyatv's `PushUpdater.listener` is a property
+    /// backed by a single `weakref.ref` (`pyatv/protocols/mrp/player_state.py:229-235`). Two
+    /// consequences follow, and both are contract rather than implementation detail: registering
+    /// twice does not deliver twice, and the caller must keep its own `Arc` alive for as long as
+    /// it wants updates, because dropping the last one is what unsubscribes.
+    fn set_listener(&self, listener: &Arc<dyn PlaybackListener>);
     /// Begin pushing updates after an optional initial delay in milliseconds.
     fn start(&self, initial_delay_ms: u64) -> BoxFuture<'_, Result<()>>;
     /// Stop pushing updates.

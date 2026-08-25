@@ -33,9 +33,26 @@ use crate::{Error, Result};
 
 /// How long to wait for a device to answer one request.
 ///
-/// pyatv uses ten seconds for a request (`pyatv/support/http.py:446`) but twenty-five to reach a
-/// device at all, because a sleeping Apple TV can take that long to wake up when a service is
-/// requested from it (`pyatv/support/http.py:36-39`). Both are kept.
+/// pyatv uses ten seconds for a request (`HttpConnection.send_and_receive`'s `timeout: int = 10`,
+/// `pyatv/support/http.py:446`) but twenty-five to reach a device at all, because a sleeping Apple
+/// TV can take that long to wake up when a service is requested from it
+/// (`pyatv/support/http.py:36-39`). Both are kept.
+///
+/// # Not the four seconds in `rtsp.py:316`
+///
+/// `RtspSession.exchange` looks like it bounds an RTSP request at four seconds, and it does not.
+/// Read in order (`pyatv/support/rtsp.py:290-320`): it `await`s `send_and_receive` — that is the
+/// ten seconds, and it is where a device that never answers is caught — then files the response
+/// under the `CSeq` it came back with and **sets that `CSeq`'s event**, and only then waits four
+/// seconds for the event belonging to the `CSeq` it asked about. In the ordinary case those are
+/// the same number, so the event is already set and the wait returns immediately. The four seconds
+/// only elapse when a response arrives carrying a *different* `CSeq` — reordering across
+/// concurrent in-flight requests, which this port's one-request-at-a-time
+/// [`HttpConnection::exchange`] cannot produce at all.
+///
+/// So the faithful bound for "device did not answer" is ten, not four; adopting four would make
+/// this client give up on requests pyatv would still be waiting for, on exactly the sleepy devices
+/// the long connect timeout above exists for.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long to wait for the TCP connection itself (`pyatv/support/http.py:39`).

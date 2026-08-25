@@ -63,6 +63,14 @@ pub struct DirectTransport {
     /// AEAD call with no `.await` inside it. Both directions share one cipher, as upstream does,
     /// so the two counters cannot drift apart.
     cipher: Mutex<Option<Chacha20Cipher>>,
+    /// Whether [`DirectTransport::writer`] still holds a socket.
+    ///
+    /// Duplicates what `writer.is_some()` says so that [`MrpTransport::connected`] can answer
+    /// without touching the lock. Reading it through `try_lock` conflated "closed" with "a write
+    /// is in flight", so a perfectly healthy connection reported itself disconnected for the
+    /// duration of every request — the opposite of what upstream's `self.transport is not None`
+    /// (`connection.py:74-77`) means.
+    open: std::sync::atomic::AtomicBool,
 }
 
 impl DirectTransport {
@@ -99,6 +107,7 @@ impl DirectTransport {
             }),
             writer: AsyncMutex::new(Some(write)),
             cipher: Mutex::new(None),
+            open: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -151,16 +160,27 @@ impl DirectTransport {
         }
     }
 
-    /// Pull one complete frame out of the buffer, reading more bytes until there is one.
+    /// Pull one complete frame out of the buffer and decrypt it, reading more bytes until there
+    /// is one.
     ///
     /// `data_received` (`connection.py:137-163`): read a varint length, wait for that many bytes,
     /// slice the frame off and leave the remainder buffered.
+    ///
+    /// # Why the decrypt happens here
+    ///
+    /// Both directions share one [`Chacha20Cipher`], whose inbound counter advances once per
+    /// `decrypt` call and must advance in the order the frames arrived — the sender's counter is
+    /// what they were sealed against. Splitting "take the frame" from "open the frame" lets two
+    /// concurrent `recv()` calls take frames in wire order under the lock and then open them in
+    /// whatever order the scheduler picks, which desyncs the counter permanently: every subsequent
+    /// frame fails its Poly1305 tag. Opening inside the critical section mirrors what
+    /// [`DirectTransport::write_frame`] already does for the outbound counter.
     async fn read_frame(&self) -> Result<Option<Bytes>> {
         let mut reader = self.reader.lock().await;
 
         loop {
             if let Some(frame) = take_frame(&mut reader.buffer)? {
-                return Ok(Some(frame));
+                return self.open(frame).map(Some);
             }
             if reader.finished {
                 return if reader.buffer.is_empty() {
@@ -222,7 +242,7 @@ impl MrpTransport for DirectTransport {
             let Some(frame) = self.read_frame().await? else {
                 return Ok(None);
             };
-            MrpMessage::decode(self.open(frame)?).map(Some)
+            MrpMessage::decode(frame).map(Some)
         })
     }
 
@@ -244,11 +264,12 @@ impl MrpTransport for DirectTransport {
     }
 
     fn connected(&self) -> bool {
-        self.writer.try_lock().is_ok_and(|writer| writer.is_some())
+        self.open.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn close(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
+            self.open.store(false, std::sync::atomic::Ordering::Relaxed);
             if let Some(mut socket) = self.writer.lock().await.take() {
                 socket.shutdown().await?;
             }
@@ -289,6 +310,38 @@ mod tests {
         assert!(take_frame(&mut buffer).unwrap().is_none());
     }
 
+    /// `connected()` reports the socket's state, not whether a write happens to hold the lock.
+    #[tokio::test]
+    async fn a_write_in_flight_does_not_read_as_disconnected() {
+        use crate::transport::MrpTransport as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a loopback port must succeed in tests");
+        let address = listener
+            .local_addr()
+            .expect("a bound listener must have an address");
+        let accept = tokio::spawn(async move { listener.accept().await });
+
+        let transport = super::DirectTransport::connect(address)
+            .await
+            .expect("dialling a listening loopback port must succeed");
+        let _peer = accept.await.expect("the accept task must not panic");
+
+        assert!(transport.connected());
+
+        // Hold the write lock, which is exactly what an in-flight `send` does.
+        let guard = transport.writer.lock().await;
+        assert!(
+            transport.connected(),
+            "a request in flight is not a disconnection"
+        );
+        drop(guard);
+
+        transport.close().await.expect("closing must succeed");
+        assert!(!transport.connected());
+    }
+
     /// A length prefix is not covered by the AEAD, so an absurd one must be rejected rather than
     /// used to size an allocation.
     #[test]
@@ -297,5 +350,83 @@ mod tests {
         let too_long = u64::try_from(MAX_FRAME_LEN).unwrap() + 1;
         buffer.extend_from_slice(&crate::variant::write(too_long));
         assert!(take_frame(&mut buffer).is_err());
+    }
+
+    /// Concurrent `recv()` calls must open frames in the order they arrived.
+    ///
+    /// The regression: taking a frame under the reader lock and then decrypting it outside let two
+    /// readers open frames out of order, which advances the shared inbound counter against the
+    /// wrong ciphertext and permanently desyncs the cipher — the symptom is every later frame
+    /// failing its Poly1305 tag, arbitrarily far from the cause.
+    ///
+    /// Every message carries its index, so the assertion is that all sixteen come back exactly
+    /// once and decrypt cleanly. *Which reader* gets which message is not the invariant and is not
+    /// asserted — the scheduler decides who acquires the reader lock next, and that is fine. What
+    /// must hold is that the frames are opened in the order they were sealed, which is what the
+    /// cipher's counter depends on and what a complete, undamaged set proves: a single out-of-order
+    /// `decrypt` fails its tag and takes every frame after it down with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_receives_stay_in_order() {
+        use crate::transport::MrpTransport as _;
+        use std::sync::Arc;
+
+        const MESSAGES: usize = 16;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a loopback port must succeed in tests");
+        let address = listener
+            .local_addr()
+            .expect("a bound listener must have an address");
+        let accept = tokio::spawn(async move { listener.accept().await });
+
+        let client = Arc::new(
+            super::DirectTransport::connect(address)
+                .await
+                .expect("dialling a listening loopback port must succeed"),
+        );
+        let (stream, peer) = accept
+            .await
+            .expect("the accept task must not panic")
+            .expect("the connection must be accepted");
+        let server = super::DirectTransport::from_stream(peer, stream);
+
+        // Mirrored: what one seals with, the other opens with.
+        let (a, b) = ([3u8; 32], [5u8; 32]);
+        client.enable_encryption(a, b).expect("keys install");
+        server.enable_encryption(b, a).expect("keys install");
+
+        for index in 0..MESSAGES {
+            let mut message =
+                crate::messages::create(crate::protobuf::protocol_message::Type::GenericMessage);
+            message
+                .set_identifier(format!("MESSAGE-{index}"))
+                .expect("stamping the identifier must succeed");
+            server.send(&message).await.expect("the write must succeed");
+        }
+
+        let readers: Vec<_> = (0..MESSAGES)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move { client.recv().await })
+            })
+            .collect();
+
+        let mut identifiers = Vec::with_capacity(MESSAGES);
+        for reader in readers {
+            let message = reader
+                .await
+                .expect("the reader task must not panic")
+                .expect("every frame must decrypt")
+                .expect("no reader may see an end-of-stream");
+            identifiers.push(message.identifier().map(str::to_owned));
+        }
+
+        identifiers.sort();
+        let mut expected: Vec<Option<String>> = (0..MESSAGES)
+            .map(|index| Some(format!("MESSAGE-{index}")))
+            .collect();
+        expected.sort();
+        assert_eq!(identifiers, expected);
     }
 }

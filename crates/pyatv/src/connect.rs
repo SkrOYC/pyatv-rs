@@ -20,9 +20,9 @@
 //!
 //! # What is wired up today
 //!
-//! Companion, `AirPlay` and MRP — the latter over its own socket when the device still advertises
-//! `_mediaremotetv._tcp`, and otherwise through the `AirPlay` tunnel, which is the only way in on
-//! tvOS 15 and later. RAOP and DMAP are recognised and skipped with a debug log until their own
+//! Companion, `AirPlay`, RAOP and MRP — the last over its own socket when the device still
+//! advertises `_mediaremotetv._tcp`, and otherwise through the `AirPlay` tunnel, which is the only
+//! way in on tvOS 15 and later. DMAP is recognised and skipped with a debug log until its own
 //! `setup()` lands; see `docs/ROADMAP.md`.
 
 mod mrp;
@@ -33,6 +33,7 @@ use pyatv_core::facade::{DEFAULT_PRIORITIES, FacadeAppleTV, ListenerHub, SetupDa
 use pyatv_core::interface::{AppleTV, DeviceListener, PowerListener};
 use pyatv_core::storage::{Settings, Storage};
 use pyatv_core::{BaseConfig, BaseService, Error, Protocol, Result};
+use pyatv_proto_airplay::raop::{RaopSetupOptions, setup as raop_setup};
 use pyatv_proto_airplay::{AirPlaySetupOptions, setup as airplay_setup};
 use pyatv_proto_companion::facade::{CompanionSetupOptions, setup as companion_setup};
 
@@ -197,6 +198,16 @@ async fn setup_protocol(
             // even attempted — a device whose tunnel is refused still streams video.
             let mut registrations = vec![airplay_setup(&AirPlaySetupOptions {
                 service: service.clone(),
+                address: config.address,
+                // `parse_credentials(service.credentials)` upstream (`__init__.py:84`); this port
+                // also accepts another service's HAP pairing, for the reason
+                // `pyatv_proto_airplay::setup::play_credentials` documents.
+                credentials: pyatv_proto_airplay::play_credentials(config, service)
+                    .inspect_err(|error| {
+                        tracing::debug!(%error, "unusable AirPlay credentials, play_url disabled");
+                    })
+                    .ok(),
+                protocol_version: settings.protocols.raop.protocol_version,
             })];
 
             if facade.connected_protocols().contains(&Protocol::Mrp) {
@@ -204,15 +215,46 @@ async fn setup_protocol(
                 // the first in every relayer. Skipping keeps the working direct connection instead
                 // of silently swapping it for a second one that has to be torn down separately.
                 tracing::debug!("MRP is already connected directly, not tunnelling it too");
-            } else if let Some(tunnel) = mrp::tunnel(config, service, settings, listeners).await? {
-                registrations.push(tunnel);
+            } else {
+                // Matched rather than `?`-ed: propagating here would discard the `AirPlay`
+                // registration built two lines above, so a receiver that refuses the
+                // remote-control `SETUP` — an unpaired device, a firmware that dropped the
+                // channel — would lose `play_url` as well as the tunnel it never had. The whole
+                // point of the unconditional registration is that AirPlay survives a failed
+                // tunnel; returning `Err` threw that away.
+                match mrp::tunnel(config, service, settings, listeners).await {
+                    Ok(Some(tunnel)) => registrations.push(tunnel),
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "the remote control tunnel failed; continuing with AirPlay only"
+                    ),
+                }
             }
 
             Ok(registrations)
         }
-        // TODO(step-5): wire RAOP and DMAP setup() as each lands. Skipping keeps a device with one
-        // working protocol usable instead of failing the whole connect.
-        other => {
+        Protocol::Raop => {
+            // `raop.setup()` has nothing to connect either — its `_connect` is `async def … return
+            // True` (`raop/__init__.py:568-570`) — so this registers unconditionally and the RTSP
+            // connection is opened per `stream_file` call.
+            //
+            // The credentials go through the same fallback chain `play_url` uses: on a tvOS 15+
+            // device the `_raop._tcp` service carries none of its own and the pairing that works is
+            // the Companion one.
+            Ok(vec![raop_setup(&RaopSetupOptions {
+                address: config.address,
+                service: service.clone(),
+                credentials: pyatv_proto_airplay::play_credentials(config, service)
+                    .inspect_err(|error| {
+                        tracing::debug!(%error, "unusable RAOP credentials, streaming unpaired");
+                    })
+                    .unwrap_or_default(),
+            })])
+        }
+        // TODO(step-5): wire DMAP setup() when it lands. Skipping keeps a device with one working
+        // protocol usable instead of failing the whole connect.
+        other @ Protocol::Dmap => {
             tracing::debug!(protocol = ?other, "skipping a protocol this build cannot connect yet");
             Ok(Vec::new())
         }

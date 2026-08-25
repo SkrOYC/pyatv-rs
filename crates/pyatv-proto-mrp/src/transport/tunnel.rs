@@ -48,6 +48,12 @@ pub const UNPREFIXED_MESSAGE_MARKER: u8 = 0x08;
 
 /// Refuse a `data` blob whose length prefix is implausible; see
 /// [`crate::transport::direct::MAX_FRAME_LEN`].
+///
+/// **Deliberately duplicated** in `pyatv-proto-airplay`'s
+/// `ap2::data_stream::payload::MAX_MESSAGE_LEN`, which caps the identical varint framing at the
+/// identical value. The two cannot share a constant: the workspace's dependency rule forbids the
+/// AirPlay crate depending on this one, and that rule is what keeps the data-stream framing usable
+/// without MRP. Both sites carry this note, so a change to one is a prompt to check the other.
 pub const MAX_MESSAGE_LEN: usize = 8 * 1024 * 1024;
 
 /// An opaque, already-encrypted byte channel carrying MRP payloads.

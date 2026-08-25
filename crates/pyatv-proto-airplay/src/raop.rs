@@ -7,9 +7,30 @@
 //! hardcoded: `sr` for sample rate, `ch` for channel count and `ss` for sample size in bits. Those
 //! keys reach here on the [`pyatv_core::BaseService::properties`] map that discovery populated.
 
+pub mod connection;
+pub mod context;
+pub mod facade;
+pub mod fifo;
+pub mod manager;
+pub mod metadata;
+pub mod net;
+pub mod pacing;
 pub mod packets;
+pub mod protocol;
+pub mod protocol_v1;
+pub mod protocol_v2;
+pub mod rtsp;
+pub mod stream;
+pub mod timing;
+pub mod volume;
+
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 use pyatv_core::BaseService;
+
+pub use facade::{RaopSetupOptions, setup};
+pub use protocol::{AirPlayMajorVersion, protocol_version};
 
 /// Audio format the receiver asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +69,28 @@ impl AudioProperties {
             sample_rate: read(service, "sr").unwrap_or(defaults.sample_rate),
             channels: read(service, "ch").unwrap_or(defaults.channels),
             sample_size: read(service, "ss").unwrap_or(defaults.sample_size),
+        }
+    }
+
+    /// The same, from a raw TXT map.
+    ///
+    /// `get_audio_properties` (`pyatv/protocols/raop/parsers.py:35-46`) is handed
+    /// `core.service.properties` rather than the service itself
+    /// (`stream_client.py:340-351`), and the streaming path only ever has the map.
+    #[must_use]
+    pub fn from_properties<S: BuildHasher>(properties: &HashMap<String, String, S>) -> Self {
+        fn read<T: std::str::FromStr, S: BuildHasher>(
+            properties: &HashMap<String, String, S>,
+            key: &str,
+        ) -> Option<T> {
+            properties.get(key).and_then(|raw| raw.parse().ok())
+        }
+
+        let defaults = Self::default();
+        Self {
+            sample_rate: read(properties, "sr").unwrap_or(defaults.sample_rate),
+            channels: read(properties, "ch").unwrap_or(defaults.channels),
+            sample_size: read(properties, "ss").unwrap_or(defaults.sample_size),
         }
     }
 }

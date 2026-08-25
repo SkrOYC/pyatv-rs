@@ -62,6 +62,24 @@ pub struct Playing {
     pub shuffle: Option<ShuffleState>,
     /// Repeat mode.
     pub repeat: Option<RepeatState>,
+    /// An identifier for the content, stable while the same thing is playing.
+    ///
+    /// `Playing.hash`, one of the fields `__eq__` compares (`interface.py:483,595-612`). MRP fills
+    /// it with the active player's `item_identifier` (`__init__.py:250-252,283`); a protocol that
+    /// has no such notion leaves it `None`.
+    ///
+    /// **Not printed by [`Display`](std::fmt::Display)** — `__str__` omits it
+    /// (`interface.py:540-589`), so `atvremote playing` never shows it and neither does this.
+    ///
+    /// # Divergence: no derived fallback
+    ///
+    /// Upstream's `hash` is a property, not a field: when the constructor was passed nothing it
+    /// returns `sha256(f"{title}{artist}{album}{total_time}")` instead of `None`
+    /// (`interface.py:601-612`), so a caller always gets a string. That fallback is deliberately
+    /// **not** reproduced here, because it would put a hashing dependency into `pyatv-core` for a
+    /// value nothing in this workspace consumes yet. A caller that wants pyatv's exact semantics
+    /// has every input to compute it. Revisit if a protocol or the CLI starts reading this.
+    pub hash: Option<String>,
     /// Series name for TV content.
     pub series_name: Option<String>,
     /// Season number for TV content.
@@ -181,6 +199,7 @@ mod tests {
             position: Some(617),
             shuffle: Some(ShuffleState::Songs),
             repeat: Some(RepeatState::All),
+            hash: Some("an-item-identifier".to_owned()),
             series_name: Some("A Show".to_owned()),
             season_number: Some(1),
             episode_number: Some(2),
@@ -264,6 +283,22 @@ mod tests {
                 "{playing:?}"
             );
         }
+    }
+
+    /// `hash` is compared but never printed: `__str__` has no branch for it
+    /// (`interface.py:540-589`), so neither does this.
+    #[test]
+    fn the_hash_is_never_printed() {
+        let playing = Playing {
+            hash: Some("an-item-identifier".to_owned()),
+            ..Playing::default()
+        };
+
+        assert_eq!(
+            playing.to_string(),
+            "  Media type: Unknown\nDevice state: Idle"
+        );
+        assert_ne!(playing, Playing::default(), "but it does affect equality");
     }
 
     /// `if self.content_identifier:` is a truthiness test, so an empty string is skipped.

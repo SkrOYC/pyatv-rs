@@ -8,6 +8,7 @@
 use pyatv_proto_mrp::test_support as support;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pyatv_core::consts::{DeviceState, MediaType, RepeatState, ShuffleState};
 use pyatv_core::interface::PlaybackListener;
@@ -263,7 +264,7 @@ async fn push_updates_deliver_every_state_change() {
         .push_updater
         .as_ref()
         .expect("PushUpdater is registered");
-    updater.add_listener(Arc::clone(&recorder) as Arc<dyn PlaybackListener>);
+    updater.set_listener(&(Arc::clone(&recorder) as Arc<dyn PlaybackListener>));
     updater.start(0).await.expect("starting must succeed");
     assert!(updater.active());
 
@@ -287,4 +288,99 @@ async fn push_updates_deliver_every_state_change() {
 
     updater.stop();
     assert!(!updater.active());
+}
+
+/// A listener that blocks for a long time on every update.
+///
+/// Blocking rather than sleeping asynchronously on purpose: `PlaybackListener` is a synchronous
+/// trait, so this is what a caller doing real work — writing to a terminal, updating a UI — looks
+/// like from the protocol's point of view.
+#[derive(Debug)]
+struct SleepingListener {
+    delay: Duration,
+    seen: Mutex<usize>,
+}
+
+impl PlaybackListener for SleepingListener {
+    fn playstatus_update(&self, _playing: &Playing) {
+        std::thread::sleep(self.delay);
+        if let Ok(mut seen) = self.seen.lock() {
+            *seen += 1;
+        }
+    }
+
+    fn playstatus_error(&self, _error: &pyatv_core::Error) {}
+}
+
+/// A listener that blocks must not hold up an unrelated request.
+///
+/// The regression this guards: callbacks used to run inside the protocol actor's `select!` loop,
+/// which is the only thing that writes to the transport. A listener that took a second per update
+/// therefore added a second per update to every command — and on a tunnelled connection it also
+/// stopped the data channel's `rply` acknowledgements for that long, which is what makes a real
+/// receiver decide the tunnel is dead.
+///
+/// Two worker threads are required, not incidental: the listener blocks the thread the notifier
+/// task is running on, and the assertion is precisely that the actor is somewhere else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocking_listener_does_not_hold_up_a_request() {
+    /// One callback has to outlast the bound on its own. The actor's `select!` is `biased`
+    /// towards requests, so under the old behaviour a request queued mid-callback was served as
+    /// soon as that *one* callback returned — the delay to beat is `DELAY`, not `CHANGES * DELAY`.
+    const DELAY: Duration = Duration::from_millis(1_200);
+    /// Enough queued work that a callback is certainly in flight when the request is issued.
+    const CHANGES: usize = 3;
+    /// Comfortably under [`DELAY`], comfortably over a loopback round trip.
+    const BOUND: Duration = Duration::from_millis(600);
+
+    let device = FakeMrpDevice::start(PIN_CODE).await;
+    device.state().example_video();
+    let data = connect(&device).await;
+
+    let listener = Arc::new(SleepingListener {
+        delay: DELAY,
+        seen: Mutex::new(0),
+    });
+    let updater = data
+        .push_updater
+        .as_ref()
+        .expect("PushUpdater is registered");
+    updater.set_listener(&(Arc::clone(&listener) as Arc<dyn PlaybackListener>));
+    updater.start(0).await.expect("starting must succeed");
+
+    for index in 0..CHANGES {
+        device.state().change_state(&PlayingState {
+            title: Some(format!("track {index}")),
+            ..PlayingState::default()
+        });
+    }
+
+    // Wait until the listener is definitely occupied before timing anything, so the measurement
+    // cannot land in a gap between updates.
+    until("the listener to start blocking", || {
+        (*listener
+            .seen
+            .lock()
+            .expect("the recorder must not be poisoned")
+            >= 1)
+            .then_some(())
+    })
+    .await;
+
+    let remote = data
+        .remote_control
+        .as_ref()
+        .expect("MRP registers a RemoteControl implementation");
+
+    let started = std::time::Instant::now();
+    remote
+        .select(pyatv_core::consts::InputAction::SingleTap)
+        .await
+        .expect("select must reach the device");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < BOUND,
+        "a blocking listener delayed an unrelated request by {elapsed:?}, over the {BOUND:?} bound"
+    );
 }

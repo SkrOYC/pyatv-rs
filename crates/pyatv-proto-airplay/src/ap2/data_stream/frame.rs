@@ -21,6 +21,20 @@ use crate::{Error, Result};
 /// Bytes in the header, `struct.calcsize(">I12s4sQI")`.
 pub const HEADER_LEN: usize = 32;
 
+/// Refuse a frame whose declared `size` cannot be real.
+///
+/// Not an upstream concept: `decode_message` trusts the field and waits for as many bytes as it
+/// asks for (`channels.py:165-188`). `size` is a `u32` and the reassembly buffer grows until it is
+/// satisfied, so a peer that writes `0xFFFFFFFF` — or a corrupted header that happens to — makes
+/// this side buffer four gigabytes and never emit a frame. It is not authenticated either: the HAP
+/// seal one layer down covers each 1024-byte block, and this header is plaintext *inside* those
+/// blocks, so a truncated or reordered stream produces arbitrary values here.
+///
+/// The cap is `pyatv_proto_mrp::transport::direct::MAX_FRAME_LEN`'s eight mebibytes, chosen there
+/// for the same reason and against the same traffic: the largest thing MRP carries in practice is
+/// artwork in a `PLAYBACK_QUEUE_REQUEST_MESSAGE` response.
+pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
+
 /// `DATA_HEADER_PADDING` (`channels.py:27`), always zero.
 pub const PADDING: u32 = 0x0000_0000;
 
@@ -71,9 +85,10 @@ impl DataHeader {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Malformed`] if `input` is shorter than [`HEADER_LEN`], or if the declared
+    /// Returns [`Error::Malformed`] if `input` is shorter than [`HEADER_LEN`], if the declared
     /// `size` does not even cover the header — upstream's `DataHeader.decode` would happily return
-    /// such a header and then slice a negative-length payload out of it.
+    /// such a header and then slice a negative-length payload out of it — or if it exceeds
+    /// [`MAX_FRAME_LEN`].
     pub fn decode(input: &[u8]) -> Result<Self> {
         let mut cursor = input.get(..HEADER_LEN).ok_or_else(|| {
             Error::Malformed(format!("data frame header is {} bytes", input.len()))
@@ -95,9 +110,16 @@ impl DataHeader {
             padding: cursor.get_u32(),
         };
 
-        if (header.size as usize) < HEADER_LEN {
+        let size = header.size as usize;
+        if size < HEADER_LEN {
             return Err(Error::Malformed(format!(
                 "data frame claims {} bytes, under the {HEADER_LEN}-byte header",
+                header.size
+            )));
+        }
+        if size > MAX_FRAME_LEN {
+            return Err(Error::Malformed(format!(
+                "data frame claims {} bytes, over the {MAX_FRAME_LEN}-byte cap",
                 header.size
             )));
         }
@@ -205,8 +227,8 @@ mod tests {
     use bytes::BytesMut;
 
     use super::{
-        COMMAND_COMM, COMMAND_NONE, DataHeader, HEADER_LEN, MESSAGE_TYPE_REPLY, MESSAGE_TYPE_SYNC,
-        decode, encode_reply, encode_sync,
+        COMMAND_COMM, COMMAND_NONE, DataHeader, HEADER_LEN, MAX_FRAME_LEN, MESSAGE_TYPE_REPLY,
+        MESSAGE_TYPE_SYNC, decode, encode_reply, encode_sync,
     };
 
     /// The header is 32 bytes, every field big-endian, in `struct.calcsize(">I12s4sQI")` order.
@@ -236,7 +258,8 @@ mod tests {
     #[test]
     fn a_header_round_trips() {
         let header = DataHeader {
-            size: 4_294_967_295,
+            // The largest size that still decodes; see `MAX_FRAME_LEN`.
+            size: u32::try_from(MAX_FRAME_LEN).expect("the cap fits in the field"),
             message_type: MESSAGE_TYPE_REPLY,
             command: COMMAND_NONE,
             seqno: u64::MAX,
@@ -309,5 +332,39 @@ mod tests {
 
         assert!(DataHeader::decode(&wire).is_err());
         assert!(decode(&mut BytesMut::from(&wire[..])).is_err());
+    }
+
+    /// A size the peer could never really mean is refused rather than used to size a reassembly
+    /// buffer that will never be satisfied.
+    #[test]
+    fn a_size_above_the_cap_is_rejected() {
+        let mut header = DataHeader {
+            size: u32::MAX,
+            message_type: MESSAGE_TYPE_SYNC,
+            command: COMMAND_COMM,
+            seqno: 1,
+            padding: 0,
+        };
+
+        assert!(DataHeader::decode(&header.encode()).is_err());
+        assert!(decode(&mut BytesMut::from(&header.encode()[..])).is_err());
+
+        // One byte over the cap, to prove the boundary is where it says it is.
+        header.size = u32::try_from(MAX_FRAME_LEN).expect("the cap fits in the field") + 1;
+        assert!(DataHeader::decode(&header.encode()).is_err());
+    }
+
+    /// A frame exactly at the cap still decodes — the bound is inclusive.
+    #[test]
+    fn a_size_at_the_cap_is_accepted() {
+        let header = DataHeader {
+            size: u32::try_from(MAX_FRAME_LEN).expect("the cap fits in the field"),
+            message_type: MESSAGE_TYPE_SYNC,
+            command: COMMAND_COMM,
+            seqno: 1,
+            padding: 0,
+        };
+
+        assert!(DataHeader::decode(&header.encode()).is_ok());
     }
 }

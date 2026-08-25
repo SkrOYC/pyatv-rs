@@ -21,6 +21,22 @@ use crate::{Error, Result};
 /// A varint never needs more than ten bytes to carry a `u64`.
 const VARINT_MAX_LEN: usize = 10;
 
+/// Refuse a message whose length prefix is implausible.
+///
+/// Not an upstream concept: `decode_protobufs` slices with whatever the varint claims and lets
+/// Python's own bounds checking sort it out. Here the same arithmetic is `consumed + length` on
+/// `usize`, which a hostile ten-group varint overflows outright — in release builds it wraps to a
+/// small number and silently mis-frames the stream, and the value is not authenticated by anything,
+/// because the HAP seal one layer down covers the block, not this prefix.
+///
+/// **Deliberately duplicated** from `pyatv_proto_mrp::transport::tunnel::MAX_MESSAGE_LEN`, which
+/// caps the identical varint framing at the identical value. The two crates cannot share the
+/// constant — the workspace's dependency rule forbids this crate depending on `pyatv-proto-mrp`,
+/// and that rule exists so the AirPlay framing stays usable without MRP at all. The duplication is
+/// noted in both places so a change to one is a prompt to check the other; the number itself is
+/// [`crate::ap2::data_stream::frame::MAX_FRAME_LEN`]'s, and far above any real MRP message.
+pub const MAX_MESSAGE_LEN: usize = 8 * 1024 * 1024;
+
 /// The tag byte every `ProtocolMessage` starts with: field 1 (`type`), wire type 0.
 ///
 /// `channels.py:204-210` explains why this is a safe discriminator: the smallest real message is
@@ -85,7 +101,12 @@ pub fn read_variant(input: &[u8]) -> Result<(u64, usize)> {
 pub fn encode_messages(messages: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
     for message in messages {
-        out.extend_from_slice(&write_variant(message.len() as u64));
+        // `usize` is at most 64 bits on every target this builds for, so the conversion cannot
+        // truncate; the fallback keeps the cast out of the code rather than papering over a real
+        // case.
+        out.extend_from_slice(&write_variant(
+            u64::try_from(message.len()).unwrap_or(u64::MAX),
+        ));
         out.extend_from_slice(message);
     }
     out
@@ -104,11 +125,11 @@ pub fn encode_messages(messages: &[&[u8]]) -> Vec<u8> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Malformed`] if a length prefix runs past the end of the buffer, or if a message
-/// does not start with [`PROTOCOL_MESSAGE_TAG`]. Upstream asserts the same thing and then swallows
-/// the resulting exception into a log line (`channels.py:220,224-225`); surfacing it is a
-/// deliberate improvement, since a silently dropped frame is invisible at exactly the moment it
-/// matters.
+/// Returns [`Error::Malformed`] if a length prefix runs past the end of the buffer or exceeds
+/// [`MAX_MESSAGE_LEN`], or if a message does not start with [`PROTOCOL_MESSAGE_TAG`]. Upstream
+/// asserts the same thing and then swallows the resulting exception into a log line
+/// (`channels.py:220,224-225`); surfacing it is a deliberate improvement, since a silently dropped
+/// frame is invisible at exactly the moment it matters.
 pub fn decode_messages(data: &[u8]) -> Result<Vec<Bytes>> {
     let mut messages = Vec::new();
     let mut rest = data;
@@ -118,16 +139,25 @@ pub fn decode_messages(data: &[u8]) -> Result<Vec<Bytes>> {
             std::mem::take(&mut rest)
         } else {
             let (length, consumed) = read_variant(rest)?;
+            // Capped *before* any arithmetic: `consumed + length` on a ten-group varint overflows
+            // `usize`, which panics under debug assertions and wraps in release.
             let length = usize::try_from(length)
-                .map_err(|_| Error::Malformed(format!("message length {length} is implausible")))?;
+                .ok()
+                .filter(|it| *it <= MAX_MESSAGE_LEN)
+                .ok_or_else(|| {
+                    Error::Malformed(format!("message length {length} exceeds {MAX_MESSAGE_LEN}"))
+                })?;
 
-            let body = rest.get(consumed..consumed + length).ok_or_else(|| {
+            let end = consumed
+                .checked_add(length)
+                .ok_or_else(|| Error::Malformed(format!("message length {length} overflows")))?;
+            let body = rest.get(consumed..end).ok_or_else(|| {
                 Error::Malformed(format!(
                     "message claims {length} bytes, {} remain",
-                    rest.len() - consumed
+                    rest.len().saturating_sub(consumed)
                 ))
             })?;
-            rest = &rest[consumed + length..];
+            rest = &rest[end..];
             body
         };
 
@@ -251,6 +281,31 @@ mod tests {
     #[test]
     fn a_length_running_past_the_buffer_is_an_error() {
         assert!(decode_messages(&[0x20, 0x08, 0x01]).is_err());
+    }
+
+    /// A maximal varint is refused before it can be added to anything.
+    ///
+    /// Nine `0xFF` groups then `0x7F` decodes to a value near `u64::MAX`; without the cap,
+    /// `consumed + length` panics under debug assertions and wraps in release, which would frame
+    /// the rest of the stream against a nonsense offset.
+    #[test]
+    fn a_maximal_length_prefix_cannot_overflow_the_offset() {
+        let hostile = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F];
+
+        let error = super::decode_messages(&hostile).expect_err("a maximal length must be refused");
+        assert!(
+            error.to_string().contains("exceeds"),
+            "the cap must be what rejects it: {error}"
+        );
+    }
+
+    /// The cap is a real bound, not just an overflow guard.
+    #[test]
+    fn a_length_above_the_cap_is_refused() {
+        let too_long =
+            super::write_variant(u64::try_from(super::MAX_MESSAGE_LEN).expect("fits") + 1);
+
+        assert!(super::decode_messages(&too_long).is_err());
     }
 
     /// Upstream asserts this and swallows the failure; here it is surfaced.
