@@ -51,13 +51,13 @@ where
     M: Message + Default,
 {
     assert_eq!(
-        extension.name(),
+        Some(extension.name().to_owned()),
         vector.extension_name,
         "{}: wrong extension handle",
         vector.name
     );
     assert_eq!(
-        extension.number(),
+        Some(extension.number()),
         vector.extension_number,
         "{}: {} has the wrong field number",
         vector.name,
@@ -65,7 +65,7 @@ where
     );
     assert_eq!(
         extensions::number_for_type(vector.message_type),
-        Some(vector.extension_number),
+        vector.extension_number,
         "{}: type {} does not map to its extension ({})",
         vector.name,
         vector.type_name,
@@ -114,15 +114,33 @@ fn every_vector_round_trips_byte_for_byte() {
     let vectors = kat::load();
     assert_eq!(
         vectors.len(),
-        8,
+        26,
         "vector count changed; review the new ones"
     );
 
     for vector in &vectors {
         let message = envelope(vector);
         assert_eq!(
+            message.error_code,
+            Some(0),
+            "{}: unexpected errorCode",
+            vector.name
+        );
+
+        let Some(number) = vector.extension_number else {
+            // A bare envelope: `get_keyboard_session()` and the `GENERIC_MESSAGE` heartbeat carry
+            // no payload, so there is nothing to extract.
+            assert!(
+                extensions::raw_for_type(&vector.protocol_message, vector.message_type)
+                    .is_ok_and(|payload| payload.is_none()),
+                "{}: a bare envelope must have no extension payload",
+                vector.name
+            );
+            continue;
+        };
+        assert_eq!(
             extensions::number_for_type(vector.message_type),
-            Some(vector.extension_number),
+            Some(number),
             "{}: {}",
             vector.name,
             vector.note
@@ -138,13 +156,6 @@ fn every_vector_round_trips_byte_for_byte() {
             .or_else(|| vector.inner_string.clone().map(String::into_bytes))
             .unwrap_or_else(|| panic!("{}: vector carries no payload", vector.name));
         assert_eq!(raw, payload.as_slice(), "{}: wrong payload", vector.name);
-
-        assert_eq!(
-            message.error_code,
-            Some(0),
-            "{}: unexpected errorCode",
-            vector.name
-        );
     }
 }
 
@@ -242,7 +253,7 @@ fn device_info_message() {
 fn device_info_update_reuses_the_device_info_extension() {
     let vector = vector("device_info_update");
     assert_eq!(vector.message_type, 37);
-    assert_eq!(vector.extension_number, 20);
+    assert_eq!(vector.extension_number, Some(20));
 
     let payload: DeviceInfoMessage = round_trip(&vector, &extensions::DEVICE_INFO_MESSAGE);
     assert_eq!(payload.protocol_version, Some(1));

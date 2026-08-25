@@ -14,7 +14,7 @@
 //! `docs/research/mrp-protobuf-spike.md` for why it exists.
 
 pub mod extensions;
-mod wire;
+pub mod wire;
 
 /// Re-exported so callers can encode and decode the generated types without depending on `prost`
 /// directly, and so a `prost` major bump is this crate's problem rather than every caller's.

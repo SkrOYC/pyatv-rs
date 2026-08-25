@@ -13,6 +13,11 @@ device->client message) and ``RegisterHIDDeviceMessage`` -- are built field by
 field against the vendored ``.proto`` definitions, still through the reference
 protobuf runtime.
 
+The second half of the file covers the *outbound message factories* the Rust
+``messages`` module ports one for one: the bring-up sequence, every command
+shape and the HID event payload. Those vectors are what pin the Rust builders
+to pyatv byte for byte, extension envelope included.
+
 Determinism: ``pyatv.protocols.mrp.messages.uuid4`` is replaced with a fixed
 queue, because ``messages.create()`` stamps every message with
 ``str(uuid4()).upper()`` as ``uniqueIdentifier``.
@@ -33,6 +38,7 @@ import uuid
 
 import google.protobuf
 
+from pyatv import const
 from pyatv.auth.hap_tlv8 import TlvValue
 from pyatv.protocols.mrp import messages, protobuf
 from pyatv.protocols.mrp.protobuf import GetKeyboardSessionMessage_pb2
@@ -41,7 +47,7 @@ from pyatv.settings import InfoSettings
 # Fixed UUIDs, consumed in order by the patched uuid4 below. Version-4 shaped so
 # that anything validating them still sees a plausible value.
 FIXED_UUIDS = [
-    uuid.UUID(f"11111111-2222-4333-8444-5555555555{index:02d}") for index in range(32)
+    uuid.UUID(f"11111111-2222-4333-8444-5555555555{index:02d}") for index in range(64)
 ]
 
 # Fixed pairing identifier, standing in for the per-installation one pyatv
@@ -121,6 +127,24 @@ def vector(name, message, extension, note):
     }
 
 
+def bare_vector(name, message, note):
+    """Serialise a message that carries no extension payload."""
+    return {
+        "name": name,
+        "note": note,
+        "type_name": protobuf.ProtocolMessage.Type.Name(message.type),
+        "type": message.type,
+        "extension_name": None,
+        "extension_number": None,
+        "unique_identifier": message.uniqueIdentifier,
+        "identifier": message.identifier if message.HasField("identifier") else None,
+        "error_code": message.errorCode,
+        "protocol_message": message.SerializeToString().hex(),
+        "inner": None,
+        "inner_string": None,
+    }
+
+
 def build():
     """Produce every vector."""
     patch_uuid()
@@ -182,6 +206,123 @@ def build():
             get_keyboard_session_message(),
             GetKeyboardSessionMessage_pb2.getKeyboardSessionMessage,
             "The corpus' only scalar extension: optional string at field 29.",
+        ),
+        # --- Outbound factories: the bring-up sequence -------------------
+        vector(
+            "set_connection_state",
+            messages.set_connection_state(),
+            protobuf.SetConnectionStateMessage_pb2.setConnectionStateMessage,
+            "Third message of MrpProtocol.start(); state=Connected (2), sent "
+            "fire-and-forget.",
+        ),
+        vector(
+            "client_updates_config",
+            messages.client_updates_config(),
+            protobuf.ClientUpdatesConfigMessage_pb2.clientUpdatesConfigMessage,
+            "Fourth message of start(), with the no-argument defaults: "
+            "nowPlayingUpdates off, everything else on.",
+        ),
+        bare_vector(
+            "get_keyboard_session",
+            messages.get_keyboard_session(),
+            "Fifth message of start(): a bare envelope with no payload at all.",
+        ),
+        bare_vector(
+            "generic_message",
+            messages.create(protobuf.GENERIC_MESSAGE),
+            "The heartbeat, and the flush round trip after every HID press.",
+        ),
+        bare_vector(
+            "wake_device",
+            messages.wake_device(),
+            "Power.turn_on()'s only message. wake_device() is a plain create(), so "
+            "the wakeDeviceMessage extension is never touched and field 45 does not "
+            "appear on the wire at all.",
+        ),
+        # --- Outbound factories: HID ------------------------------------
+        vector(
+            "send_hid_event_select_down",
+            messages.send_hid_event(1, 0x89, True),
+            protobuf.SendHIDEventMessage_pb2.sendHIDEventMessage,
+            "Select pressed. The 60-byte hidEventData literal with "
+            "usagePage=1, usage=0x89, down=1 at offset 43.",
+        ),
+        vector(
+            "send_hid_event_select_up",
+            messages.send_hid_event(1, 0x89, False),
+            protobuf.SendHIDEventMessage_pb2.sendHIDEventMessage,
+            "Select released; differs from the press in exactly one byte.",
+        ),
+        vector(
+            "send_hid_event_volume_up_down",
+            messages.send_hid_event(12, 0xE9, True),
+            protobuf.SendHIDEventMessage_pb2.sendHIDEventMessage,
+            "A two-byte usage page, to catch a big-endian mistake that a "
+            "single-byte page would hide.",
+        ),
+        # --- Outbound factories: commands -------------------------------
+        vector(
+            "send_command_pause",
+            messages.command(protobuf.CommandInfo_pb2.Pause),
+            protobuf.SendCommandMessage_pb2.sendCommandMessage,
+            "A plain command: no options submessage at all.",
+        ),
+        vector(
+            "send_command_next",
+            messages.command(protobuf.CommandInfo_pb2.NextTrack),
+            protobuf.SendCommandMessage_pb2.sendCommandMessage,
+            "NextTrack, whose enum value (5) is not its declaration index.",
+        ),
+        vector(
+            "send_command_skip_forward",
+            messages.command(protobuf.CommandInfo_pb2.SkipForward, skipInterval=15),
+            protobuf.SendCommandMessage_pb2.sendCommandMessage,
+            "_skip_command's default: an int assigned to the float "
+            "options.skipInterval field.",
+        ),
+        vector(
+            "repeat_all",
+            messages.repeat(const.RepeatState.All),
+            protobuf.SendCommandMessage_pb2.sendCommandMessage,
+            "ChangeRepeatMode with options.sendOptions zeroed first.",
+        ),
+        vector(
+            "shuffle_songs",
+            messages.shuffle(const.ShuffleState.Songs),
+            protobuf.SendCommandMessage_pb2.sendCommandMessage,
+            "ChangeShuffleMode, also with sendOptions zeroed.",
+        ),
+        # --- Outbound factories: volume, artwork, output devices --------
+        vector(
+            "set_volume",
+            messages.set_volume("E510C430-B01D-45DF-B558-6EA6F8251069", 0.42),
+            protobuf.SetVolumeMessage_pb2.setVolumeMessage,
+            "Volume travels as a 0..1 float32, not a percentage.",
+        ),
+        vector(
+            "playback_queue_request",
+            messages.playback_queue_request(0),
+            protobuf.PlaybackQueueRequestMessage_pb2.playbackQueueRequestMessage,
+            "The artwork fetch, with pyatv's default width=-1/height=400.",
+        ),
+        vector(
+            "add_output_devices",
+            messages.add_output_devices("DEVICE-A", "DEVICE-B"),
+            protobuf.ModifyOutputContextRequestMessage_pb2.modifyOutputContextRequestMessage,
+            "Both addingDevices and clusterAwareAddingDevices are populated; "
+            "writing only one half-applies the change.",
+        ),
+        vector(
+            "remove_output_devices",
+            messages.remove_output_devices("DEVICE-A"),
+            protobuf.ModifyOutputContextRequestMessage_pb2.modifyOutputContextRequestMessage,
+            "The removing pair.",
+        ),
+        vector(
+            "set_output_devices",
+            messages.set_output_devices("DEVICE-A"),
+            protobuf.ModifyOutputContextRequestMessage_pb2.modifyOutputContextRequestMessage,
+            "The setting pair.",
         ),
     ]
 

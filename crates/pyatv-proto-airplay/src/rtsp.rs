@@ -48,6 +48,9 @@ pub mod method {
     pub const OPTIONS: &str = "OPTIONS";
     /// Read the receiver's `/info` property list. An HTTP verb travelling under `RTSP/1.0`.
     pub const GET: &str = "GET";
+    /// Post the `/feedback` keepalive. Also an HTTP verb travelling under `RTSP/1.0`
+    /// (`pyatv/support/rtsp.py:246-248`).
+    pub const POST: &str = "POST";
 }
 
 /// Frames per RTP packet, from pyatv's `rtsp.py`.
@@ -247,6 +250,41 @@ impl RtspSession {
             .await?;
 
         decode_plist(&response.body)
+    }
+
+    /// Send a bodyless `RECORD` against the session URI.
+    ///
+    /// `RtspSession.record` (`pyatv/support/rtsp.py:178-184`), called with neither headers nor a
+    /// body by `AP2Session.setup_remote_control` (`ap2_session.py:81`). A receiver that answered
+    /// the event-channel `SETUP` with `skipRecord: true` does not want this at all — see
+    /// [`crate::ap2::EventChannelSetup::skip_record`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Status`] if the device refuses the request and [`Error::Io`] on a transport
+    /// failure.
+    pub async fn record(&mut self, http: &mut HttpConnection) -> Result<Response> {
+        self.exchange(http, method::RECORD, None, None, false).await
+    }
+
+    /// Send the two-second keepalive.
+    ///
+    /// `RtspSession.feedback` (`pyatv/support/rtsp.py:246-248`): a bare `POST` to the literal path
+    /// `/feedback`, still travelling as `RTSP/1.0` with the whole `CSeq`/DACP header block. It is
+    /// not a `SET_PARAMETER`-family verb and it does not target the `rtsp://…` session URI, both of
+    /// which the name invites getting wrong.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Status`] for a non-success status unless `allow_error` is set, and
+    /// [`Error::Io`] on a transport failure.
+    pub async fn feedback(
+        &mut self,
+        http: &mut HttpConnection,
+        allow_error: bool,
+    ) -> Result<Response> {
+        self.exchange(http, method::POST, Some(FEEDBACK_PATH), None, allow_error)
+            .await
     }
 }
 

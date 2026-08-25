@@ -11,7 +11,14 @@
 use serde_json::Value;
 
 /// One serialised `ProtocolMessage` and everything known about its extension field.
+///
+/// Two integration tests include this module and each reads a different subset of the fields, so
+/// dead-code analysis — which runs per test binary — flags whatever the other one uses.
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "each test binary consumes a different subset of the vector"
+)]
 pub struct Vector {
     /// Vector name, used to select the typed assertions and in failure messages.
     pub name: String,
@@ -21,10 +28,14 @@ pub struct Vector {
     pub type_name: String,
     /// `ProtocolMessage.Type` value.
     pub message_type: i32,
-    /// Extension field name as declared in the `.proto`.
-    pub extension_name: String,
-    /// Extension field number.
-    pub extension_number: u32,
+    /// Extension field name as declared in the `.proto`, or `None` for a bare envelope.
+    pub extension_name: Option<String>,
+    /// Extension field number, or `None` for a bare envelope.
+    ///
+    /// A handful of pyatv's factories — `get_keyboard_session()` and the `GENERIC_MESSAGE`
+    /// heartbeat — send an envelope with no payload at all, so the vector has no extension to
+    /// name.
+    pub extension_number: Option<u32>,
     /// The `uniqueIdentifier` pyatv stamped on the envelope.
     pub unique_identifier: String,
     /// The whole serialised envelope, extension included.
@@ -57,9 +68,9 @@ fn parse(value: &Value) -> Vector {
         note: string(value, "note"),
         type_name: string(value, "type_name"),
         message_type: integer(value, "type"),
-        extension_name: string(value, "extension_name"),
-        extension_number: u32::try_from(integer(value, "extension_number"))
-            .expect("extension_number out of range"),
+        extension_name: optional_string(value, "extension_name"),
+        extension_number: optional_integer(value, "extension_number")
+            .map(|number| u32::try_from(number).expect("extension_number out of range")),
         unique_identifier: string(value, "unique_identifier"),
         protocol_message: bytes(value, "protocol_message"),
         inner: optional_bytes(value, "inner"),
@@ -77,6 +88,19 @@ fn string(value: &Value, field: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("vector field `{field}` is missing or not a string"))
         .to_owned()
+}
+
+/// The string at `field`, or `None` when it is JSON null.
+fn optional_string(value: &Value, field: &str) -> Option<String> {
+    value.get(field)?.as_str().map(str::to_owned)
+}
+
+/// The integer at `field`, or `None` when it is JSON null.
+fn optional_integer(value: &Value, field: &str) -> Option<i32> {
+    let raw = value.get(field)?.as_i64()?;
+    Some(
+        i32::try_from(raw).unwrap_or_else(|_| panic!("vector field `{field}` does not fit in i32")),
+    )
 }
 
 /// The integer at `field`.

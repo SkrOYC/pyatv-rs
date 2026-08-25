@@ -24,14 +24,19 @@ pub mod http;
 pub mod pairing;
 pub mod raop;
 pub mod rtsp;
+pub mod setup;
 
-pub use ap2::{EventChannelSetup, InfoSettings, remote_control_setup_body};
+pub use ap2::{
+    Ap2Session, DataStreamChannel, EventChannel, EventChannelSetup, InfoSettings, SeqnoPolicy,
+    remote_control_setup_body,
+};
 pub use auth::{PairSetupProcedure, PairVerifyProcedure, extract_credentials, verify_connection};
 pub use codec::{AirPlayCodec, Frame};
 pub use error::Error;
 pub use http::HttpConnection;
 pub use pairing::{AirPlayPairingHandler, AirPlayPairingOptions};
 pub use rtsp::RtspSession;
+pub use setup::{remote_control_tunnel, tunnel_credentials};
 
 /// Convenience alias for fallible AirPlay operations.
 pub type Result<T, E = Error> = core::result::Result<T, E>;

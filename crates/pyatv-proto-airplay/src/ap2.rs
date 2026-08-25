@@ -6,8 +6,17 @@
 //! `docs/research/airplay-control-mrp-tunnel-port-spec.md` §3.4 is the byte-level reference; the
 //! key set below is complete and closed, and no other key is sent in that body.
 //!
-//! The data-stream channel's own `SETUP` (spec §3.5) is deliberately absent: it is the next step
-//! and belongs with the channel implementation that consumes its `dataPort`.
+//! The data-stream channel's own `SETUP` (spec §3.5) lives with the channel that consumes its
+//! `dataPort`, in [`data_stream`]; [`session::Ap2Session`] drives both.
+
+mod channel;
+pub mod data_stream;
+pub mod event_channel;
+pub mod session;
+
+pub use data_stream::{DataStreamChannel, DataStreamSetup, SeqnoPolicy};
+pub use event_channel::EventChannel;
+pub use session::{Ap2Session, RemoteControlPorts};
 
 use crate::rtsp::decode_plist;
 use crate::{Error, Result};
@@ -89,15 +98,27 @@ pub fn remote_control_setup_body(info: &InfoSettings, session_uuid: &str) -> pli
 
 /// What the receiver answers an event-channel `SETUP` with.
 ///
-/// Upstream reads only `eventPort` (`ap2_session.py:136`); `timingPort` is captured here because a
-/// receiver sends it and knowing whether it does is part of characterising a device.
+/// Upstream reads only `eventPort` (`ap2_session.py:136`); the other two keys are captured here
+/// because a receiver sends them and knowing whether it does is part of characterising a device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventChannelSetup {
     /// TCP port the *controller* dials out to for the event channel, despite the read/write key
-    /// naming implying the reverse (`ap2_session.py:137-148`).
+    /// naming implying the reverse (`ap2_session.py:137-148`, `hap_channel.py:92-96`).
     pub event_port: u16,
     /// `timingPort`, when the receiver sends one.
+    ///
+    /// The tvOS 27 test device omits it entirely, which is coherent with the `timingProtocol:
+    /// "None"` this port sends but would break a reader that assumed the key was present
+    /// (`docs/research/airplay-tunnel-auth-experiment-2026-08-24.md` experiment 4).
     pub timing_port: Option<u16>,
+    /// `skipRecord`, when the receiver sends one.
+    ///
+    /// Absent from pyatv entirely — the string appears nowhere in the checkout — but the tvOS 27
+    /// test device answers `true`, and the only thing there is to skip at this point in the
+    /// sequence is the `RECORD` upstream sends unconditionally between the two `SETUP`s
+    /// (`ap2_session.py:75-82`). [`session::Ap2Session::setup_remote_control`] honours it and sends
+    /// `RECORD` when it is absent, which is what upstream always does.
+    pub skip_record: Option<bool>,
 }
 
 impl EventChannelSetup {
@@ -116,7 +137,19 @@ impl EventChannelSetup {
             event_port: port(dictionary, "eventPort")?
                 .ok_or_else(|| Error::Plist("SETUP reply has no eventPort".to_owned()))?,
             timing_port: port(dictionary, "timingPort")?,
+            skip_record: dictionary
+                .get("skipRecord")
+                .and_then(plist::Value::as_boolean),
         })
+    }
+
+    /// Whether a `RECORD` should be sent after the event channel comes up.
+    ///
+    /// `true` unless the receiver explicitly said `skipRecord: true`. An absent key means "send
+    /// it", which is upstream's unconditional behaviour.
+    #[must_use]
+    pub fn should_record(&self) -> bool {
+        !self.skip_record.unwrap_or(false)
     }
 
     /// Read the ports out of a raw binary property list body.
@@ -262,8 +295,36 @@ mod tests {
             EventChannelSetup {
                 event_port: 49_153,
                 timing_port: Some(0),
+                skip_record: None,
             }
         );
+        assert!(
+            EventChannelSetup::parse(&encoded)
+                .expect("parses")
+                .should_record()
+        );
+    }
+
+    /// The tvOS 27 shape: `eventPort` and `skipRecord`, no `timingPort`
+    /// (`docs/research/airplay-tunnel-auth-experiment-2026-08-24.md` experiment 4).
+    #[test]
+    fn a_setup_reply_with_skip_record_suppresses_the_record() {
+        let mut reply = plist::Dictionary::new();
+        reply.insert("eventPort".to_owned(), 49_191u64.into());
+        reply.insert("skipRecord".to_owned(), true.into());
+        let encoded = encode_plist(&plist::Value::Dictionary(reply)).expect("encodes");
+
+        let parsed = EventChannelSetup::parse(&encoded).expect("parses");
+
+        assert_eq!(
+            parsed,
+            EventChannelSetup {
+                event_port: 49_191,
+                timing_port: None,
+                skip_record: Some(true),
+            }
+        );
+        assert!(!parsed.should_record());
     }
 
     /// `timingPort` is optional; `eventPort` is not.
