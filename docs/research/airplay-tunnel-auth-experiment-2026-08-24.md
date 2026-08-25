@@ -71,7 +71,7 @@ Selected values (identifiers and key material deliberately omitted):
 | key | value |
 |---|---|
 | `model` | `AppleTV14,1` |
-| `name` | `Sala` |
+| `name` | `Living Room` |
 | `osBuildVersion` | `00A0000a` |
 | `protocolVersion` | `1.1` |
 | `sourceVersion` | `980.67.2` |

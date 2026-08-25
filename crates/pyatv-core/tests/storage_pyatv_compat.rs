@@ -1,8 +1,10 @@
 //! `~/.pyatv.conf` compatibility, against a file pyatv actually wrote.
 //!
-//! `tests/fixtures/pyatv-0.16.conf` is a verbatim copy of the settings file pyatv produced after
-//! pairing Companion with an Apple TV — it holds nothing but that device's pairing credentials.
-//! Every assertion here is about interoperability rather than about this crate's own round trip:
+//! `tests/fixtures/pyatv-0.16.conf` is a byte-for-byte copy of the settings file pyatv produced
+//! after pairing Companion with a real Apple TV, with every identifier and credential swapped for
+//! a synthetic value of the same shape and length — it holds nothing but that device's pairing
+//! record, structurally. Every assertion here is about interoperability rather than about this
+//! crate's own round trip:
 //! a user who has already paired with pyatv must keep working, and a file this crate writes must
 //! be one pyatv's pydantic models accept unchanged.
 //!
@@ -18,11 +20,12 @@ use pyatv_core::storage::{FileStorage, MemoryStorage, Settings, Storage, Storage
 /// The file pyatv wrote, including its trailing newline.
 const PYATV_CONF: &str = include_str!("fixtures/pyatv-0.16.conf");
 
-/// The device the fixture describes, as a scan would report it.
+/// The device the fixture describes, as a scan would report it. These are synthetic values with
+/// the same shape as pyatv's own output — see `fixtures/pyatv-0.16.conf` for how they line up.
 const AIRPLAY_ID: &str = "DE:AD:BE:EF:00:01";
 const COMPANION_ID: &str = "DEADBEEF-0001-4000-8000-000000000001";
 const RAOP_ID: &str = "DEADBEEF0001";
-const COMPANION_CREDENTIALS: &str = "0000000000000000000000000000000000000000000000000000000000000000:0000000000000000000000000000000000000000000000000000000000000000";
+const COMPANION_CREDENTIALS: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f:44454144424545462d303030312d343030302d383030302d303030303030303030303031:30303030303030302d303030302d343030302d383030302d303030303030303030303032";
 
 /// A scratch file that removes itself.
 struct TempFile(std::path::PathBuf);
@@ -57,7 +60,7 @@ impl Drop for TempFile {
 
 /// The device the fixture was written for, as `scan` would hand it over.
 fn scanned_device() -> BaseConfig {
-    let mut config = BaseConfig::new("Living Room", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 6)));
+    let mut config = BaseConfig::new("Living Room", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
     for (protocol, port, identifier) in [
         (Protocol::AirPlay, 7000, AIRPLAY_ID),
         (Protocol::Companion, 49153, COMPANION_ID),
@@ -127,7 +130,7 @@ fn the_device_is_found_through_every_protocols_identifier() {
     }
 
     // And a config carrying only one of them resolves to the same record rather than a new one.
-    let mut partial = BaseConfig::new("Living Room", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 6)));
+    let mut partial = BaseConfig::new("Living Room", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
     let mut service = BaseService::new(Protocol::Companion, 49153);
     service.identifier = Some(COMPANION_ID.to_owned());
     partial.add_service(service);

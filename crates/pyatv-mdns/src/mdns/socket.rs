@@ -78,7 +78,7 @@ pub fn mcast_socket(interface: Option<Ipv4Addr>, port: u16) -> io::Result<UdpSoc
 /// ```
 ///
 /// where `loc_addr` is the datagram's *destination* — the group address, `224.0.0.251` — and
-/// `inet_rcv_saddr` is whatever the socket was bound to. Bind to `192.168.1.5` and the two never
+/// `inet_rcv_saddr` is whatever the socket was bound to. Bind to `192.0.2.7` and the two never
 /// match, so the group's datagrams are filtered out before delivery even though the interface
 /// joined the group. Joining a group and receiving its traffic are separate things: the join tells
 /// the kernel and the switch to accept the frames, the bind decides which sockets they reach.
