@@ -164,24 +164,28 @@ mod tests {
         let relayer: Arc<Relayer<dyn RemoteControl>> =
             Arc::new(Relayer::new(DEFAULT_PRIORITIES.to_vec()));
 
-        relayer.register(
-            Protocol::Mrp,
-            Arc::new(Recorder {
-                name: "mrp",
-                calls: Arc::clone(&calls),
-            }),
-            [FeatureName::Up, FeatureName::Stop]
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-        );
-        relayer.register(
-            Protocol::AirPlay,
-            Arc::new(Recorder {
-                name: "airplay",
-                calls: Arc::clone(&calls),
-            }),
-            [FeatureName::Stop].into_iter().collect::<BTreeSet<_>>(),
-        );
+        relayer
+            .register(
+                Protocol::Mrp,
+                Arc::new(Recorder {
+                    name: "mrp",
+                    calls: Arc::clone(&calls),
+                }),
+                [FeatureName::Up, FeatureName::Stop]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+            )
+            .expect("the protocol is in the priority list");
+        relayer
+            .register(
+                Protocol::AirPlay,
+                Arc::new(Recorder {
+                    name: "airplay",
+                    calls: Arc::clone(&calls),
+                }),
+                [FeatureName::Stop].into_iter().collect::<BTreeSet<_>>(),
+            )
+            .expect("the protocol is in the priority list");
 
         Fixture {
             remote: FacadeRemoteControl::new(Arc::clone(&relayer)),

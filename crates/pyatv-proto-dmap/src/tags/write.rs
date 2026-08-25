@@ -34,9 +34,23 @@ pub fn container_tag(key: &str, data: &[u8]) -> Vec<u8> {
 
 /// A tag whose data is `value`'s UTF-8 bytes (`string_tag`, `tags.py:70-76`).
 ///
-/// The length is the byte length, not the character count — pyatv encodes first and measures the
-/// Python `str`'s length second, which happens to agree for the ASCII payloads DMAP carries, and
-/// this measures the bytes, which is right for all of them.
+/// # Divergence: the length field counts bytes, not characters
+///
+/// Upstream writes `len(value).to_bytes(4, "big")` — the length of the Python `str`, in
+/// *characters* — in front of `value.encode("utf-8")`, its length in *bytes*. For anything outside
+/// ASCII those two disagree, the declared length is short, and every tag after it in the payload is
+/// read from the wrong offset: the message is not merely wrong, it is unparseable from that point
+/// on.
+///
+/// This is reachable rather than theoretical. `cmnm` in the pairing response carries the
+/// controller's display name, which the user chooses (`pairing.py:136`) and which pyatv defaults to
+/// `core.settings.info.name`; a name with an accent in it produces a payload a device cannot read.
+/// `cmbe` carries command words, which are ASCII today only because this client picks them.
+///
+/// Writing the byte length is therefore deliberate. It is the only length a reader can use, it is
+/// what every DMAP *decoder* — including pyatv's own `parser.py` — assumes, and it is identical to
+/// upstream's output for every ASCII value, which is everything pyatv's fixtures and this port's
+/// known-answer vectors contain.
 #[must_use]
 pub fn string_tag(key: &str, value: &str) -> Vec<u8> {
     raw_tag(key, value.as_bytes())
@@ -107,8 +121,26 @@ mod tests {
             string_tag("strb", "test string"),
             b"strb\x00\x00\x00\x0btest string"
         );
-        // Two-byte characters count as two.
-        assert_eq!(string_tag("strb", "\u{e5}\u{e4}").len(), 8 + 4);
+    }
+
+    /// The divergence from upstream, and the reason for it: a two-character value that is four
+    /// bytes must declare four, or everything after it in the payload is misframed.
+    #[test]
+    fn a_non_ascii_string_declares_its_byte_length_and_stays_parseable() {
+        // Two characters, two bytes each — `len(value)` upstream would write 2.
+        let tag = string_tag("cmnm", "\u{e5}\u{e4}");
+        assert_eq!(tag, b"cmnm\x00\x00\x00\x04\xc3\xa5\xc3\xa4");
+
+        // The point of the divergence: a following tag is still readable.
+        let payload = [tag, uint8_tag("cmcc", 0)].concat();
+        let parsed = crate::parser::parse(&payload).expect("byte lengths keep the payload framed");
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cmnm", "cmcc"]
+        );
     }
 
     /// `container_tag` is `raw_tag` (`tags.py:86-88`), and the nesting is just concatenation.

@@ -72,7 +72,7 @@ impl RaopMetadata {
 }
 
 impl Metadata for RaopMetadata {
-    fn device_id(&self) -> Option<&str> {
+    fn device_id(&self) -> Option<String> {
         None
     }
 

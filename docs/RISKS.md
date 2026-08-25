@@ -34,7 +34,7 @@ Distilled from the seven research reports. Each risk names its severity, why it 
 
 **L3 — RAOP may or may not require ALAC encoding.** pyatv's SDP template suggests raw PCM (L16); the `alac-encoder` crate is stale. Mitigation: confirm with a live capture at Step 6 before pulling in an ALAC encoder.
 
-**L4 — Provisional MSRV (1.88).** Chosen for let-chains; a dependency may demand higher. Mitigation: `cargo-msrv verify` in CI; bump deliberately with a version note (MSRV bump is a minor-version change for a library).
+**L4 — Provisional MSRV (1.88).** Chosen for let-chains; a dependency may demand higher. **Verified 2026-08-25 and still holding:** `cargo check --workspace --all-features --locked` compiles clean on rustc 1.88.0 with the current lockfile, so no bump is needed. Mitigation: the `msrv` job in `.github/workflows/ci.yml` reads the floor out of `[workspace.package] rust-version` and builds against exactly that toolchain on every PR — it does not repeat the number, so the job and the manifest cannot drift. Note that `cargo msrv verify` is *not* what runs there: cargo-msrv 0.19.3 looks for `package.rust-version` and cannot see `[workspace.package] rust-version` in a virtual manifest, so it fails at the workspace root before checking anything. It does work per member (`cargo msrv find --path crates/<name>`) and is in the devenv for exactly that job — finding a *new* floor after a dependency bump. Bump deliberately with a version note (an MSRV bump is a minor-version change for a library).
 
 **L5 — Point-in-time research.** All crate versions, star counts, and pyatv behavior were captured 2026-08-24. Mitigation: re-verify at the start of each phase; the reports cite their sources for exactly this reason.
 

@@ -8,9 +8,15 @@ mod support;
 use pyatv_core::interface::AppleTV;
 use pyatv_core::{Error as CoreError, InputAction, RepeatState, ShuffleState};
 use pyatv_proto_dmap::test_support::fake_dmap::FakeDmapDevice;
-use pyatv_proto_dmap::test_support::fake_state::{HSGID, PlayingResponse};
+use pyatv_proto_dmap::test_support::fake_state::{HSGID, PlayingResponse, SESSION_ID};
 
 use support::{connect, playing, wait_for_button};
+
+/// The one URL every `controlpromptentry` POST must have: the template from `__init__.py:63` with
+/// `[AUTH]` filled in, session id first (`parameters.insert(0, ...)`, `daap.py:169`).
+fn control_prompt_url() -> String {
+    format!("/ctrl-int/1/controlpromptentry?session-id={SESSION_ID}&prompt-id=0")
+}
 
 // ---- Remote control (`test_dmap_functional.py:153-165`) ----
 
@@ -59,13 +65,20 @@ async fn top_menu_is_sent_as_a_control_prompt() {
         .expect("top_menu must be accepted");
 
     wait_for_button(&use_cases, "topmenu").await;
-    assert!(
-        use_cases
-            .requests()
-            .iter()
-            .any(|target| target.starts_with("/ctrl-int/1/controlpromptentry?")),
-        "topmenu must use the control-prompt endpoint"
+
+    // The whole URL, not just the endpoint: the session id, its position, and `prompt-id=0` are all
+    // wire-visible and all easy to lose to a template edit.
+    let requests = use_cases.requests();
+    let prompts: Vec<&String> = requests
+        .iter()
+        .filter(|target| target.starts_with("/ctrl-int/1/controlpromptentry"))
+        .collect();
+    assert_eq!(
+        prompts,
+        vec![&control_prompt_url()],
+        "topmenu must be exactly one control-prompt POST, requests were {requests:?}"
     );
+    use_cases.assert_no_protocol_errors();
 }
 
 /// `test_button_play_pause` (`:163-165`): the transport buttons have endpoints of their own.
@@ -138,6 +151,18 @@ async fn a_direction_key_is_a_seven_step_gesture() {
             use_cases.state().buttons_press_count,
             7,
             "{direction} must be seven steps"
+        );
+
+        // All seven go to the same URL — the steps differ only in their bodies.
+        let requests = use_cases.requests();
+        let prompts: Vec<&String> = requests
+            .iter()
+            .filter(|target| target.starts_with("/ctrl-int/1/controlpromptentry"))
+            .collect();
+        assert_eq!(
+            prompts,
+            vec![&control_prompt_url(); 7],
+            "{direction}: requests were {requests:?}"
         );
         use_cases.assert_no_protocol_errors();
     }

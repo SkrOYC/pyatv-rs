@@ -212,8 +212,8 @@ impl MrpMetadata {
 }
 
 impl Metadata for MrpMetadata {
-    fn device_id(&self) -> Option<&str> {
-        self.identifier.as_deref()
+    fn device_id(&self) -> Option<String> {
+        self.identifier.clone()
     }
 
     fn playing(&self) -> BoxFuture<'_, CoreResult<Playing>> {

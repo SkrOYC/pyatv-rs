@@ -258,6 +258,10 @@ impl ServiceRegistration {
     /// Follows RFC 6763 §12: a `PTR` answer carries the instance's `SRV`, `TXT` and `A` records as
     /// additionals so a browsing client needs no follow-up query, and an `SRV` answer carries the
     /// `A` records. `ANY` matches everything for the name.
+    ///
+    /// The records come back with the cache-flush bit set on the unique ones, which is right for a
+    /// multicast response and **wrong for a legacy-unicast one**; [`Self::respond`] is what knows
+    /// which it is building and clears the bit where it has to.
     #[must_use]
     pub fn answer(&self, question: &DnsQuestion, ttl_cap: Option<u32>) -> Answer {
         let cap = |ttl: u32| ttl_cap.map_or(ttl, |cap| ttl.min(cap));
@@ -309,8 +313,13 @@ impl ServiceRegistration {
     /// `legacy` selects RFC 6762 §6.7 behaviour, which the caller decides by looking at the source
     /// port: a query from anything other than port 5353 comes from a one-shot resolver rather than
     /// a full mDNS implementation, so the response echoes the query's ID, repeats the question
-    /// section, and caps every TTL at [`LEGACY_UNICAST_TTL`]. A query from port 5353 gets the
-    /// normal form: zero ID, no questions, full TTLs.
+    /// section, caps every TTL at [`LEGACY_UNICAST_TTL`], and clears the cache-flush bit — §10.2
+    /// says it "MUST NOT be set" for a querier that is not an mDNS cache. A query from port 5353
+    /// gets the normal form: zero ID, no questions, full TTLs, cache-flush on the unique records.
+    ///
+    /// A multicast query's own Answer section suppresses answers it already holds, RFC 6762 §7.1:
+    /// a record the querier lists with at least half its TTL remaining is not re-sent. Legacy
+    /// queries are exempt, since a one-shot resolver does not do known-answer suppression.
     #[must_use]
     pub fn respond(&self, query: &DnsMessage, legacy: bool) -> Option<DnsMessage> {
         if query.header().is_response() {
@@ -336,6 +345,16 @@ impl ServiceRegistration {
             extend_unique(&mut response.resources, answer.additionals);
         }
 
+        if !legacy {
+            // RFC 6762 §7.1. A legacy resolver does not do known-answer suppression and does not
+            // put answers in its queries, so this is skipped for it rather than applied to an
+            // empty section — and applying it would risk withholding a record a resolver that
+            // *did* send one still needs, since its cache does not work the way an mDNS one does.
+            response
+                .answers
+                .retain(|record| !is_known_answer(query, record));
+        }
+
         if response.answers.is_empty() {
             return None;
         }
@@ -344,6 +363,11 @@ impl ServiceRegistration {
         response
             .resources
             .retain(|record| !response.answers.contains(record));
+
+        if legacy {
+            clear_cache_flush(&mut response.answers);
+            clear_cache_flush(&mut response.resources);
+        }
         Some(response)
     }
 
@@ -383,6 +407,43 @@ fn extend_unique(target: &mut Vec<DnsResource>, records: Vec<DnsResource>) {
             target.push(record);
         }
     }
+}
+
+/// Strip the cache-flush bit from every record in a legacy-unicast response.
+///
+/// RFC 6762 §6.7 requires it: the querier is a plain unicast DNS resolver, and §10.2 is explicit
+/// that the bit "MUST NOT be set" in responses sent to one. To such a resolver the class is not
+/// `IN` with a flag on it, it is class `0x8001` — an unknown class — and what it does with the
+/// record then is its own business, none of the possibilities good.
+///
+/// Only the *class* changes. The TTL cap that goes with §6.7 is applied separately, when the
+/// records are built, because it has to be visible to the caller inspecting them.
+fn clear_cache_flush(records: &mut [DnsResource]) {
+    for record in records {
+        record.qclass &= !CACHE_FLUSH;
+    }
+}
+
+/// Whether `query` already holds `record`, RFC 6762 §7.1 known-answer suppression.
+///
+/// A querier lists the records it has cached in its own Answer section, and a responder must not
+/// re-send one of them "if the answer it would give is already included in the Answer Section with
+/// an RR TTL at least half the correct value". Half, not equal: a record the querier is already
+/// most of the way through expiring is worth refreshing, one it has just learned is not.
+///
+/// The class comparison ignores the cache-flush bit, since a querier echoes back records it may
+/// have received with the bit set and the bit says nothing about whether it is the same record.
+fn is_known_answer(query: &DnsMessage, record: &DnsResource) -> bool {
+    query.answers.iter().any(|known| {
+        known
+            .qname
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(record.qname.trim_end_matches('.'))
+            && known.qtype == record.qtype
+            && (known.qclass & !CACHE_FLUSH) == (record.qclass & !CACHE_FLUSH)
+            && known.rd == record.rd
+            && known.ttl >= record.ttl / 2
+    })
 }
 
 #[cfg(test)]

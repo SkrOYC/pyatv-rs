@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use super::{Framing, Head, decode_chunked, parse_head};
+use super::{ChunkedDecoder, Framing, Head, MAX_BODY_LEN, decode_chunked, is_success, parse_head};
 
 fn head_of(raw: &[u8]) -> Head {
     parse_head(raw).expect("well formed").expect("complete").0
@@ -147,6 +147,90 @@ fn a_partial_chunked_body_asks_for_more() {
 #[test]
 fn a_bad_chunk_size_is_rejected() {
     assert!(decode_chunked(b"zz\r\nWiki\r\n0\r\n\r\n").is_err());
+}
+
+/// The decoder resumes where it stopped rather than starting over, so a chunk it has already
+/// consumed is not appended a second time when the rest of the body arrives.
+///
+/// Every split is exercised, which puts the boundary inside the chunk-size line, inside the chunk
+/// data, and between a chunk and its terminating `CRLF` in turn.
+#[test]
+fn a_chunked_body_split_across_reads_decodes_each_chunk_once() {
+    let raw = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+
+    for split in 1..raw.len() {
+        let mut decoder = ChunkedDecoder::new();
+        assert!(
+            decoder
+                .feed(&raw[..split])
+                .expect("a prefix is short, not malformed")
+                .is_none(),
+            "split at {split} should not be complete"
+        );
+
+        let consumed = decoder
+            .feed(raw)
+            .expect("well formed")
+            .expect("the whole body is there now");
+        assert_eq!(consumed, raw.len(), "split at {split}");
+        assert_eq!(decoder.into_body(), b"Wikipedia", "split at {split}");
+    }
+}
+
+/// The pathological case: one byte per read. Whatever the decoder does per call, the answer has to
+/// be the same, and the caller may only be told it is complete once.
+#[test]
+fn a_chunked_body_fed_one_byte_at_a_time_decodes_once() {
+    let raw = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\nExpires: never\r\n\r\n";
+
+    let mut decoder = ChunkedDecoder::new();
+    let mut completions = 0usize;
+    let mut consumed = None;
+    for end in 1..=raw.len() {
+        if let Some(total) = decoder.feed(&raw[..end]).expect("well formed") {
+            completions += 1;
+            consumed = Some(total);
+        }
+    }
+
+    assert_eq!(completions, 1, "completion must be reported exactly once");
+    assert_eq!(consumed, Some(raw.len()));
+    assert_eq!(decoder.body(), b"Wikipedia");
+    assert_eq!(decoder.into_body(), b"Wikipedia");
+}
+
+/// A chunked body is as unbounded as a `Content-Length` one, and is capped the same way — before
+/// the chunk it is about to refuse is copied anywhere.
+#[test]
+fn a_chunked_body_over_the_cap_is_refused() {
+    let oversized = format!("{:x}\r\n", MAX_BODY_LEN + 1);
+
+    let error = ChunkedDecoder::new()
+        .feed(oversized.as_bytes())
+        .expect_err("an oversized chunk must be refused");
+    assert!(error.to_string().contains("exceeds"), "{error}");
+
+    // And in aggregate, across chunks each of which is individually fine.
+    let chunk = vec![b'x'; 1024 * 1024];
+    let mut data = Vec::new();
+    for _ in 0..9 {
+        data.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        data.extend_from_slice(&chunk);
+        data.extend_from_slice(b"\r\n");
+    }
+    assert!(ChunkedDecoder::new().feed(&data).is_err());
+}
+
+/// The free function and the method agree, which is what lets [`crate::daap`] branch on a bare
+/// status after the head has been dropped.
+#[test]
+fn the_free_success_predicate_matches_the_method() {
+    for status in [199u16, 200, 204, 299, 300, 403, 500, 503] {
+        let raw = format!("HTTP/1.1 {status} Something\r\n\r\n");
+        assert_eq!(head_of(raw.as_bytes()).is_success(), is_success(status));
+    }
+    assert!(is_success(200) && is_success(299));
+    assert!(!is_success(199) && !is_success(300));
 }
 
 /// The reason `Accept-Encoding: gzip` can stay on the request.

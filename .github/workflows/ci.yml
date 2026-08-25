@@ -58,18 +58,86 @@ jobs:
       - run: cargo nextest run --workspace --all-features --profile ci
       # nextest does not run doctests, so they need a separate pass.
       - run: cargo test --workspace --doc --all-features
+      # The `ci` nextest profile writes JUnit here. Uploaded on failure too — that is the run where
+      # it is actually worth reading.
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.os }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+
+  docs:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      # Rustdoc warnings are failures for the same reason clippy warnings are: a broken intra-doc
+      # link is a link that silently is not there, and nothing else in the pipeline notices.
+      # `--no-deps` keeps the check to crates in this workspace.
+      - run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  features:
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      # The `--all-features` build in the other jobs cannot catch a crate that compiles *only*
+      # because some other crate's feature happened to be on. `--feature-powerset` is 15
+      # combinations across this workspace (five crates with one feature each, the rest with none),
+      # so the exhaustive form is no more expensive than `--each-feature`; revisit if a crate grows
+      # several independent features. `--all-targets` matters because every feature here
+      # (`pyatv-pairing/test-server` and the `test-support` features that enable it) exists to gate
+      # test scaffolding, so the test and bench targets are where the interactions live.
+      - run: cargo hack --feature-powerset --workspace check --all-targets
+
+  benches:
+    name: Benchmarks (build only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      # Built, not run: benchmark *numbers* from a shared CI runner are noise, but a benchmark that
+      # stops compiling because an API moved under it is a real break, and one nobody notices until
+      # they next try to measure something.
+      - run: cargo bench --no-run --workspace --all-features
 
   msrv:
     name: Minimum supported Rust version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Pinned deliberately: this job exists to prove the `rust-version` floor in Cargo.toml still
-      # holds, so it must not float with stable. Bump both together.
+      # Read the floor out of the manifest instead of repeating it here, so the job and
+      # `[workspace.package] rust-version` cannot drift apart. This is deliberately not
+      # `cargo msrv verify`: cargo-msrv 0.19.3 looks for `package.rust-version` and cannot see
+      # `[workspace.package] rust-version` in a virtual manifest, so it fails at the workspace root
+      # before checking anything. `cargo msrv find --path crates/<name>` is still the right tool
+      # for working out a *new* floor; verifying the declared one is a single pinned build.
+      - id: msrv
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          test -n "$version" || { echo "no rust-version in Cargo.toml" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: "1.88"
-      - run: cargo check --workspace --all-features
+          toolchain: ${{ steps.msrv.outputs.version }}
+      # `--locked` so the job checks the versions the lockfile actually pins. Without it a
+      # transitive bump could quietly raise the real floor and this job would keep passing against
+      # a resolution nobody ships.
+      - run: cargo check --workspace --all-features --locked
 
   deny:
     name: Dependency audit

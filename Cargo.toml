@@ -37,6 +37,12 @@ tokio = { version = "1.53.1", features = [
 ] }
 tracing = "0.1.44"
 
+[profile.bench]
+# Line tables in the benchmark binaries. A criterion number tells you *that* something got slower;
+# a symbolised profile (`perf record`, `samply`) tells you where, and without this the frames are
+# hex addresses. Line tables only — full debuginfo would triple the build for no extra signal.
+debug = "line-tables-only"
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"

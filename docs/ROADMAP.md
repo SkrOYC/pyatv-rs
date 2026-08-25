@@ -54,11 +54,17 @@ Delivered in a5e2202 (`pyatv_proto_airplay::{raop,audio}`): both generations, RT
 
 The RAOP sender in `pyatv-proto-airplay` (or a dedicated `pyatv-proto-raop` if it grows): RTSP ANNOUNCE/SETUP/RECORD/SET_PARAMETER/FLUSH/TEARDOWN, RTP audio packetization, timing/control UDP channels, metadata/artwork/progress, and volume. Decode input media with `symphonia`, resample with `rubato`. **Open question to resolve first:** whether current devices need ALAC encoding or accept raw PCM (L16) — pyatv's SDP template suggests PCM; confirm with a live capture before pulling in an ALAC encoder. Deliverable: `atvremote stream_file` plays local audio to a device. (`docs/research/airplay-raop-dmap.md`, `docs/research/rust-crates.md`)
 
-## Step 7 — Legacy DMAP
+## Step 7 — Legacy DMAP ✅ (hermetic; no gen 1–3 device available)
+
+Delivered in 3d17a46 (`pyatv-proto-dmap`, `pyatv_mdns::publish`): tag table, codec, DaapRequester with pyatv's retry ladder, client and facade traits, client-as-server pairing with the MD5 code pinned by known-answer vectors, and a minimal RFC 6762 responder for `_touch-remote._tcp`. Divergence: pairing GUIDs are zero-padded (pyatv's are not, and ~1 in 16 fail its own login regex). Spec: `docs/research/dmap-port-spec.md`.
+
 
 `pyatv-proto-dmap`: HTTP + Home Sharing pairing (pairing GUID), DMAP tag encoding, and long-poll push updates, for Apple TV gen 1–3 / tvOS ≤ 12. Lowest priority — it is legacy and frozen upstream — but included for parity. Deliverable: control and metadata for a legacy device. (`docs/research/airplay-raop-dmap.md`)
 
-## Step 8 — Facade completion, CLI parity, hardening
+## Step 8 — Facade completion, CLI parity, hardening (in progress)
+
+Gap analysis: `docs/research/step8-parity-gap-analysis.md`. Landed in 3d17a46: per-method relaying, takeover/release, Audio output devices and listeners, helpers. In flight: FacadePushUpdater through the trait object, CLI parity incl. `--json`, doc/feature-powerset/MSRV/bench gates, deny policy.
+
 
 Wire every protocol into `FacadeAppleTV`, finalize the `Relayer` priorities and per-capability overrides against current pyatv source, complete `atvremote` command coverage (and consider an `atvscript`-equivalent JSON mode), tighten `cargo-deny` bans to `deny`, run `cargo hack` feature-powerset checks, add `criterion` benchmarks for the hot codec/audio paths, and write user-facing docs. Deliverable: a coherent library + CLI at rough feature parity with pyatv for supported devices.
 

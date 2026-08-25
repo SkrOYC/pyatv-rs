@@ -205,7 +205,7 @@ impl BaseConfig {
     /// The main identifier for this device.
     ///
     /// Ports `pyatv/interface.py:1385-1398` (`BaseConfig.identifier`): the first identifier found
-    /// walking [`IDENTIFIER_PRIORITY`], *not* the first service in discovery order. Devices
+    /// walking `IDENTIFIER_PRIORITY`, *not* the first service in discovery order. Devices
     /// advertise a different identifier per protocol, so the priority is what makes the value
     /// stable across scans.
     #[must_use]

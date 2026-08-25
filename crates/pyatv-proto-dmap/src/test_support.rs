@@ -21,7 +21,7 @@
 //!   its own re-login test never actually re-logs in. Here the old id stops working, so the
 //!   sequence the test describes — stale session, 403, re-login, retry — really happens.
 //!
-//! Both are recorded in [`fake_state::FakeDmapState::protocol_errors`] where they are genuine
+//! Both are recorded in [`crate::test_support::fake_state::FakeDmapState::protocol_errors`] where they are genuine
 //! client mistakes, so a test can assert the client did nothing wrong rather than only that it
 //! eventually succeeded.
 #![allow(

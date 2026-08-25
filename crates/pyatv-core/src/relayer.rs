@@ -82,8 +82,8 @@ impl<T: ?Sized> std::fmt::Debug for Relayer<T> {
 impl<T: ?Sized> Relayer<T> {
     /// Create a relayer that prefers protocols in the order given, most preferred first.
     ///
-    /// Protocols absent from `priorities` can still be registered; they simply sort after every
-    /// listed protocol, in [`Protocol::ALL`] order.
+    /// A protocol absent from `priorities` cannot be registered at all — see
+    /// [`Relayer::register`].
     #[must_use]
     pub fn new(priorities: Vec<Protocol>) -> Self {
         Self {
@@ -119,28 +119,44 @@ impl<T: ?Sized> Relayer<T> {
     /// `declared` is the protocol's `SetupData::features` set and decides which methods this
     /// instance is eligible to answer — see the module documentation. Pass an empty set for a
     /// registration that should only ever be reached through [`Relayer::main_instance`].
-    pub fn register(&self, protocol: Protocol, instance: Arc<T>, declared: BTreeSet<FeatureName>) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidState`] if `protocol` is not in this relayer's priority list.
+    /// `register` (`relayer.py:78-83`) raises `RuntimeError(f"{protocol} not in priority list")`
+    /// for the same case, and for the same reason: selection only ever walks the priority list, so
+    /// an unlisted registration would be accepted and then never reachable — a silent misconfigured
+    /// facade rather than a loud one. Both lists [`crate::facade::FacadeAppleTV`] builds contain
+    /// every [`Protocol`], so this cannot fire for a facade assembled by `pyatv::connect`.
+    pub fn register(
+        &self,
+        protocol: Protocol,
+        instance: Arc<T>,
+        declared: BTreeSet<FeatureName>,
+    ) -> Result<()> {
+        if !self.priorities.contains(&protocol) {
+            return Err(Error::InvalidState(format!(
+                "{protocol:?} is not in this relayer's priority list"
+            )));
+        }
         self.write()
             .instances
             .insert(protocol, Registration { instance, declared });
+        Ok(())
     }
 
     /// Every protocol in selection order: the protocol holding a takeover first, then the
-    /// configured priorities, then any remaining protocol in [`Protocol::ALL`] order.
+    /// configured priorities.
     ///
     /// `chain(self._takeover_protocol, self._priorities)` (`relayer.py:60,68,92`). Each protocol is
     /// yielded at most once: naively chaining would repeat every prioritised protocol, which is
-    /// harmless for a `find` but visibly wrong in [`Relayer::protocols`].
+    /// harmless for a `find` but visibly wrong in [`Relayer::protocols`]. Nothing outside the
+    /// priority list can be registered, so nothing outside it needs to be searched.
     fn search_order(&self, takeover: Option<Protocol>) -> impl Iterator<Item = Protocol> + '_ {
         takeover.into_iter().chain(
             self.priorities
                 .iter()
                 .copied()
-                .chain(
-                    Protocol::ALL
-                        .into_iter()
-                        .filter(|protocol| !self.priorities.contains(protocol)),
-                )
                 .filter(move |protocol| Some(*protocol) != takeover),
         )
     }
@@ -198,8 +214,13 @@ impl<T: ?Sized> Relayer<T> {
 
     /// Every registered implementation, in priority order.
     ///
-    /// `instances` (`relayer.py:73-76`), which `FacadePushUpdater.start`/`stop` iterate so every
-    /// connected protocol's updater is started, not only the main one (`facade.py:625-634`).
+    /// `instances` (`relayer.py:73-76`) is `list(self._interfaces.values())`, i.e. *registration*
+    /// order. The difference is deliberate. Upstream's two callers —
+    /// `FacadePushUpdater.start`/`stop`, which start and stop every connected protocol's updater
+    /// rather than only the main one (`facade.py:625-634`) — do not care about the order, so
+    /// nothing is lost by strengthening it; and priority order is what
+    /// [`crate::facade::FacadeMetadata`] needs to reproduce `_find_instance`'s "first protocol that
+    /// has an answer" for the accessors carrying no [`FeatureName`].
     #[must_use]
     pub fn instances(&self) -> Vec<Arc<T>> {
         let state = self.read();
@@ -269,7 +290,9 @@ mod tests {
     }
 
     fn register(relayer: &Relayer<str>, protocol: Protocol, name: &'static str) {
-        relayer.register(protocol, Arc::from(name), BTreeSet::new());
+        relayer
+            .register(protocol, Arc::from(name), BTreeSet::new())
+            .expect("the protocol is in the priority list");
     }
 
     fn sample() -> Relayer<str> {
@@ -288,18 +311,23 @@ mod tests {
         assert_eq!(relayer.count(), 2);
     }
 
+    /// `register` refuses a protocol the priority list does not name (`relayer.py:78-83`).
+    ///
+    /// Accepting it would be worse than refusing: selection walks the priority list, so the
+    /// registration would be stored and then never reached by anything.
     #[test]
-    fn unlisted_protocols_sort_after_listed_ones() {
+    fn an_unlisted_protocol_cannot_be_registered() {
         let relayer: Relayer<str> = Relayer::new(vec![Protocol::Mrp]);
-        register(&relayer, Protocol::Companion, "companion");
-        assert_eq!(relayer.main_protocol(), Some(Protocol::Companion));
+
+        let error = relayer
+            .register(Protocol::Companion, Arc::from("companion"), BTreeSet::new())
+            .expect_err("Companion is not in the priority list");
+        assert!(matches!(error, crate::Error::InvalidState(_)), "{error}");
+        assert!(error.to_string().contains("Companion"), "{error}");
+        assert!(relayer.is_empty());
 
         register(&relayer, Protocol::Mrp, "mrp");
-        assert_eq!(relayer.main_protocol(), Some(Protocol::Mrp));
-        assert_eq!(
-            relayer.protocols(),
-            vec![Protocol::Mrp, Protocol::Companion]
-        );
+        assert_eq!(relayer.protocols(), vec![Protocol::Mrp]);
     }
 
     #[test]
@@ -377,16 +405,20 @@ mod tests {
     #[test]
     fn a_method_goes_to_the_protocol_that_declared_it() {
         let relayer: Relayer<str> = Relayer::new(vec![Protocol::AirPlay, Protocol::Raop]);
-        relayer.register(
-            Protocol::AirPlay,
-            Arc::from("airplay"),
-            declaring(&[FeatureName::PlayUrl, FeatureName::Stop]),
-        );
-        relayer.register(
-            Protocol::Raop,
-            Arc::from("raop"),
-            declaring(&[FeatureName::StreamFile, FeatureName::Stop]),
-        );
+        relayer
+            .register(
+                Protocol::AirPlay,
+                Arc::from("airplay"),
+                declaring(&[FeatureName::PlayUrl, FeatureName::Stop]),
+            )
+            .expect("the protocol is in the priority list");
+        relayer
+            .register(
+                Protocol::Raop,
+                Arc::from("raop"),
+                declaring(&[FeatureName::StreamFile, FeatureName::Stop]),
+            )
+            .expect("the protocol is in the priority list");
 
         assert_eq!(
             relayer.instance_for(FeatureName::PlayUrl).as_deref(),
@@ -411,16 +443,20 @@ mod tests {
     #[test]
     fn takeover_reorders_per_method_selection_without_widening_it() {
         let relayer: Relayer<str> = Relayer::new(vec![Protocol::Mrp, Protocol::AirPlay]);
-        relayer.register(
-            Protocol::Mrp,
-            Arc::from("mrp"),
-            declaring(&[FeatureName::Stop, FeatureName::Up]),
-        );
-        relayer.register(
-            Protocol::AirPlay,
-            Arc::from("airplay"),
-            declaring(&[FeatureName::Stop]),
-        );
+        relayer
+            .register(
+                Protocol::Mrp,
+                Arc::from("mrp"),
+                declaring(&[FeatureName::Stop, FeatureName::Up]),
+            )
+            .expect("the protocol is in the priority list");
+        relayer
+            .register(
+                Protocol::AirPlay,
+                Arc::from("airplay"),
+                declaring(&[FeatureName::Stop]),
+            )
+            .expect("the protocol is in the priority list");
 
         relayer.takeover(Protocol::AirPlay).expect("free relayer");
 
@@ -435,7 +471,9 @@ mod tests {
         );
     }
 
-    /// `instances` yields everything, in priority order (`relayer.py:73-76`).
+    /// `instances` yields everything, in priority order — deliberately stronger than upstream's
+    /// registration order, for the reason [`Relayer::instances`] documents. `sample` registers DMAP
+    /// first, so registration order would put it first here.
     #[test]
     fn instances_are_returned_in_priority_order() {
         let relayer = sample();

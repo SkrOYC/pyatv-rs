@@ -43,12 +43,10 @@ pub async fn connect(device: &FakeDmapDevice, credentials: &str) -> Arc<FacadeAp
 /// The same, with a device listener registered before the protocol connects — which is the order
 /// `pyatv::connect` uses so that a socket dropped during bring-up still reaches the caller.
 ///
-/// Also hands back DMAP's own [`PushUpdater`] alongside the facade. The push tests below use that
-/// one rather than `AppleTV::push_updater()`, because the facade's updater only forwards to a
-/// listener once `FacadePushUpdater::start_all` has attached its per-protocol shims, and that
-/// method takes `Arc<Self>` so it is unreachable through the `Arc<dyn PushUpdater>` the trait hands
-/// out. What is under test here is DMAP's long-poll loop, so this side-steps the question rather
-/// than encoding an answer to it; see the report accompanying this branch.
+/// Also hands back DMAP's own [`PushUpdater`] alongside the facade, because what is under test in
+/// this crate is DMAP's long-poll loop and nothing else: going through the facade would put its
+/// main-protocol filter between the device and the assertion for no gain. The facade path is
+/// covered where it belongs, in `crates/pyatv/tests/facade_push_updates.rs`.
 pub async fn connect_with_listener(
     device: &FakeDmapDevice,
     credentials: &str,

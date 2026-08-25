@@ -28,12 +28,14 @@
 //!   address (`f"{int(address):040d}"`, `pairing.py:302`), so a collision means two responders on
 //!   one address — and the pairing window is seconds long. Probing would add two and a half seconds
 //!   of latency to guard against a case that cannot happen.
-//! * **Conflict resolution** and **known-answer suppression** (§7.1), for the same reason.
+//! * **Conflict resolution** (§9), for the same reason.
 //! * **IPv6/`AAAA`**. pyatv's whole discovery path is IPv4, and so is this crate.
 //!
-//! What *is* implemented is the half that has to work for interop: answering queries, including
-//! RFC 6762 §6.7 legacy-unicast responses and §5.4's `QU` bit, plus §8.3 announcements and §10.1
-//! goodbyes.
+//! What *is* implemented is the half that has to work for interop, and the rules that stop a
+//! responder being a nuisance on a shared link: answering queries, including RFC 6762 §6.7
+//! legacy-unicast responses (capped TTLs, no cache-flush bit) and §5.4's `QU` bit; §7.1
+//! known-answer suppression; the §6 one-second-per-record multicast rate limit; and §8.3
+//! announcements with §10.1 goodbyes.
 //!
 //! # Layout
 //!

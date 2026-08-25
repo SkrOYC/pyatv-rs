@@ -257,10 +257,15 @@ async fn serve(
 /// One parsed request.
 #[derive(Debug)]
 pub struct FakeRequest {
+    /// Request method, e.g. `POST` or `SETUP`.
     pub method: String,
+    /// Request target, e.g. `/pair-setup`.
     pub path: String,
+    /// Protocol token of the request line, e.g. `HTTP/1.1` or `RTSP/1.0`.
     pub protocol: String,
+    /// Headers in the order they arrived, duplicates included.
     pub headers: Vec<(String, String)>,
+    /// The body, already de-chunked and decrypted if the session was encrypted.
     pub body: Vec<u8>,
 }
 

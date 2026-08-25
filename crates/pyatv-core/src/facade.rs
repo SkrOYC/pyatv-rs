@@ -16,19 +16,25 @@
 //! implement it, and the call would be unreachable.
 
 pub mod audio;
+pub mod device;
 pub mod features;
+pub mod input;
 pub mod listeners;
+pub mod metadata;
 pub mod playback;
 pub mod remote;
+pub mod setup;
 pub mod stream;
 pub mod takeover;
+
+#[cfg(test)]
+mod tests;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::Result;
 use crate::consts::Protocol;
-use crate::features::FeatureName;
 use crate::interface::{
     AppleTV, Apps, Audio, AudioListener, BoxFuture, DeviceListener, Features, Keyboard,
     KeyboardListener, Metadata, Power, PowerListener, ProtocolHandle, PushUpdater, RemoteControl,
@@ -38,10 +44,14 @@ use crate::models::{BaseService, DeviceInfo};
 use crate::relayer::Relayer;
 
 pub use audio::FacadeAudio;
+pub use device::{FacadeApps, FacadePower, FacadeUserAccounts};
 pub use features::FacadeFeatures;
+pub use input::{FacadeKeyboard, FacadeTouchGestures};
 pub use listeners::{ListenerHub, StateDispatcher};
+pub use metadata::FacadeMetadata;
 pub use playback::FacadePushUpdater;
 pub use remote::FacadeRemoteControl;
+pub use setup::SetupData;
 pub use stream::FacadeStream;
 pub use takeover::{FacadeTakeover, Interface, TakeoverGuard, TakeoverRegistry};
 
@@ -69,46 +79,6 @@ pub const POWER_PRIORITIES: [Protocol; 5] = [
     Protocol::AirPlay,
     Protocol::Raop,
 ];
-
-/// What one protocol contributes to the facade once it has connected.
-///
-/// Every capability handle is optional: DMAP has no [`Apps`], RAOP has no [`RemoteControl`], and so
-/// on. `features` is the set the protocol declares it *could* serve; live availability is resolved
-/// by asking `features_impl` at call time, and the same set decides which trait methods this
-/// registration is eligible to answer.
-#[derive(Debug, Default)]
-pub struct SetupData {
-    /// Which protocol produced this data.
-    pub protocol: Option<Protocol>,
-    /// Features this protocol declares support for.
-    pub features: BTreeSet<FeatureName>,
-    /// The protocol's own live feature reporting, consulted for anything in `features`.
-    pub features_impl: Option<Arc<dyn Features>>,
-    /// Teardown hook, awaited by [`AppleTV::close`].
-    pub handle: Option<Arc<dyn ProtocolHandle>>,
-    /// Navigation and transport control, if implemented.
-    pub remote_control: Option<Arc<dyn RemoteControl>>,
-    /// Now-playing metadata, if implemented.
-    pub metadata: Option<Arc<dyn Metadata>>,
-    /// Push updates, if implemented.
-    pub push_updater: Option<Arc<dyn PushUpdater>>,
-    /// Media streaming, if implemented.
-    pub stream: Option<Arc<dyn Stream>>,
-    /// Power control, if implemented.
-    pub power: Option<Arc<dyn Power>>,
-    /// App management, if implemented.
-    pub apps: Option<Arc<dyn Apps>>,
-    /// Volume control, if implemented.
-    pub audio: Option<Arc<dyn Audio>>,
-    /// Keyboard entry, if implemented.
-    pub keyboard: Option<Arc<dyn Keyboard>>,
-    /// Trackpad gestures, if implemented.
-    pub touch_gestures: Option<Arc<dyn TouchGestures>>,
-    /// Account switching, if implemented.
-    pub user_accounts: Option<Arc<dyn UserAccounts>>,
-    /// Device facts this protocol was able to determine.
-    pub device_info: DeviceInfo,
-}
 
 /// Unified view of one device across every connected protocol.
 #[derive(Debug)]
@@ -139,12 +109,23 @@ pub struct FacadeAppleTV {
 }
 
 /// The per-interface relaying objects a caller receives.
+///
+/// There is one per capability trait, because upstream relays *every* method of *every* interface
+/// (`facade.py:47-679`): resolving the protocol once per call is what makes a takeover visible to a
+/// handle taken before it, and what stops a higher-priority protocol answering a method it never
+/// declared.
 #[derive(Debug)]
 struct Facades {
     remote_control: Arc<FacadeRemoteControl>,
+    metadata: Arc<FacadeMetadata>,
     audio: Arc<FacadeAudio>,
     stream: Arc<FacadeStream>,
     push_updater: Arc<FacadePushUpdater>,
+    power: Arc<FacadePower>,
+    apps: Arc<FacadeApps>,
+    keyboard: Arc<FacadeKeyboard>,
+    touch_gestures: Arc<FacadeTouchGestures>,
+    user_accounts: Arc<FacadeUserAccounts>,
 }
 
 impl FacadeAppleTV {
@@ -181,12 +162,18 @@ impl FacadeAppleTV {
 
         let facades = Facades {
             remote_control: Arc::new(FacadeRemoteControl::new(Arc::clone(&remote_control))),
+            metadata: Arc::new(FacadeMetadata::new(Arc::clone(&metadata))),
             audio: Arc::new(FacadeAudio::new(Arc::clone(&audio))),
             stream: Arc::new(FacadeStream::new(
                 Arc::clone(&stream),
                 Arc::clone(&features) as Arc<dyn Features>,
             )),
             push_updater: FacadePushUpdater::new(Arc::clone(&push_updater)),
+            power: Arc::new(FacadePower::new(Arc::clone(&power))),
+            apps: Arc::new(FacadeApps::new(Arc::clone(&apps))),
+            keyboard: Arc::new(FacadeKeyboard::new(Arc::clone(&keyboard))),
+            touch_gestures: Arc::new(FacadeTouchGestures::new(Arc::clone(&touch_gestures))),
+            user_accounts: Arc::new(FacadeUserAccounts::new(Arc::clone(&user_accounts))),
         };
 
         Self {
@@ -220,11 +207,22 @@ impl FacadeAppleTV {
             return;
         };
 
+        // A registration can only be refused when `protocol` is missing from the relayer's
+        // priority list, which neither `DEFAULT_PRIORITIES` nor `POWER_PRIORITIES` allows — both
+        // name every `Protocol`. It is logged rather than propagated because it would mean this
+        // module contradicted itself, not that anything about the device went wrong.
         macro_rules! register {
             ($field:ident) => {
                 if let Some(instance) = data.$field {
-                    self.$field
-                        .register(protocol, instance, data.features.clone());
+                    if let Err(error) = self.$field.register(protocol, instance, data.features.clone())
+                    {
+                        tracing::error!(
+                            ?protocol,
+                            interface = stringify!($field),
+                            %error,
+                            "a capability could not be registered"
+                        );
+                    }
                 }
             };
         }
@@ -350,15 +348,8 @@ impl AppleTV for FacadeAppleTV {
             .then(|| Arc::clone(&self.facades.remote_control) as Arc<dyn RemoteControl>)
     }
 
-    /// The highest-priority metadata implementation, resolved afresh on every call.
-    ///
-    /// Unlike remote control, audio and streaming this is not wrapped: every protocol that
-    /// registers a [`Metadata`] implements all of it, so there is no per-method contention to
-    /// resolve, and resolving at call time is already enough for a takeover to be visible. The one
-    /// difference from upstream is that a handle stored across a takeover keeps pointing at the
-    /// protocol it was taken from.
     fn metadata(&self) -> Option<Arc<dyn Metadata>> {
-        self.metadata.main_instance()
+        (!self.metadata.is_empty()).then(|| Arc::clone(&self.facades.metadata) as Arc<dyn Metadata>)
     }
 
     fn push_updater(&self) -> Option<Arc<dyn PushUpdater>> {
@@ -371,11 +362,11 @@ impl AppleTV for FacadeAppleTV {
     }
 
     fn power(&self) -> Option<Arc<dyn Power>> {
-        self.power.main_instance()
+        (!self.power.is_empty()).then(|| Arc::clone(&self.facades.power) as Arc<dyn Power>)
     }
 
     fn apps(&self) -> Option<Arc<dyn Apps>> {
-        self.apps.main_instance()
+        (!self.apps.is_empty()).then(|| Arc::clone(&self.facades.apps) as Arc<dyn Apps>)
     }
 
     fn audio(&self) -> Option<Arc<dyn Audio>> {
@@ -383,15 +374,17 @@ impl AppleTV for FacadeAppleTV {
     }
 
     fn keyboard(&self) -> Option<Arc<dyn Keyboard>> {
-        self.keyboard.main_instance()
+        (!self.keyboard.is_empty()).then(|| Arc::clone(&self.facades.keyboard) as Arc<dyn Keyboard>)
     }
 
     fn touch_gestures(&self) -> Option<Arc<dyn TouchGestures>> {
-        self.touch_gestures.main_instance()
+        (!self.touch_gestures.is_empty())
+            .then(|| Arc::clone(&self.facades.touch_gestures) as Arc<dyn TouchGestures>)
     }
 
     fn user_accounts(&self) -> Option<Arc<dyn UserAccounts>> {
-        self.user_accounts.main_instance()
+        (!self.user_accounts.is_empty())
+            .then(|| Arc::clone(&self.facades.user_accounts) as Arc<dyn UserAccounts>)
     }
 
     fn features(&self) -> Arc<dyn Features> {
@@ -445,110 +438,5 @@ impl AppleTV for FacadeAppleTV {
             self.connection_closed();
             first_error.map_or(Ok(()), Err)
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
-
-    use super::{FacadeAppleTV, SetupData};
-    use crate::consts::Protocol;
-    use crate::features::{FeatureInfo, FeatureName, FeatureState};
-    use crate::interface::{AppleTV, Features};
-    use crate::models::BaseService;
-
-    /// A protocol whose every feature is available, so the test can see whether it was consulted.
-    #[derive(Debug)]
-    struct Available;
-
-    impl Features for Available {
-        fn get_feature(&self, _feature: FeatureName) -> FeatureInfo {
-            FeatureInfo::available()
-        }
-
-        fn all_features(&self, _include_unsupported: bool) -> Vec<(FeatureName, FeatureInfo)> {
-            Vec::new()
-        }
-    }
-
-    fn setup_data(protocol: Protocol, feature: FeatureName) -> SetupData {
-        let mut features = BTreeSet::new();
-        features.insert(feature);
-        SetupData {
-            protocol: Some(protocol),
-            features,
-            features_impl: Some(Arc::new(Available)),
-            ..SetupData::default()
-        }
-    }
-
-    fn facade() -> FacadeAppleTV {
-        FacadeAppleTV::new(BaseService::new(Protocol::Companion, 49153))
-    }
-
-    /// A feature handle taken before a protocol connects must see that protocol afterwards.
-    ///
-    /// `add_protocol` used to reach into the registry with `Arc::get_mut`, which returns `None`
-    /// while any clone of the `Arc` is alive — and `features()` hands out exactly such a clone. A
-    /// caller that read `atv.features()` once and then connected another protocol therefore had
-    /// that protocol's entire feature mapping dropped on the floor, silently, with the feature
-    /// reporting `Unsupported` for the rest of the session.
-    #[test]
-    fn features_registered_after_a_handle_was_taken_are_still_visible() {
-        let mut facade = facade();
-        let handle = facade.features();
-        assert_eq!(
-            handle.get_feature(FeatureName::AppList).state,
-            FeatureState::Unsupported
-        );
-
-        facade.add_protocol(setup_data(Protocol::Companion, FeatureName::AppList));
-
-        assert_eq!(
-            handle.get_feature(FeatureName::AppList).state,
-            FeatureState::Available,
-            "the handle taken earlier must see the new mapping"
-        );
-        assert_eq!(
-            facade.features().get_feature(FeatureName::AppList).state,
-            FeatureState::Available,
-            "and so must a freshly taken one"
-        );
-    }
-
-    /// The same for the push-updates flag, which takes the other branch of `add_protocol`.
-    #[test]
-    fn a_second_protocol_registers_even_with_handles_outstanding() {
-        let mut facade = facade();
-        facade.add_protocol(setup_data(Protocol::Companion, FeatureName::AppList));
-
-        let handle = facade.features();
-        facade.add_protocol(setup_data(Protocol::Mrp, FeatureName::Title));
-
-        assert_eq!(
-            handle.get_feature(FeatureName::Title).state,
-            FeatureState::Available
-        );
-        assert_eq!(
-            handle.get_feature(FeatureName::AppList).state,
-            FeatureState::Available
-        );
-    }
-
-    /// A facade with no protocols reports nothing and holds no handles.
-    #[test]
-    fn an_empty_facade_is_empty() {
-        let facade = facade();
-        assert!(facade.is_empty());
-        assert!(facade.connected_protocols().is_empty());
-        assert_eq!(
-            facade.features().get_feature(FeatureName::AppList).state,
-            FeatureState::Unsupported
-        );
-        assert!(facade.remote_control().is_none());
-        assert!(facade.audio().is_none());
-        assert!(facade.stream().is_none());
     }
 }

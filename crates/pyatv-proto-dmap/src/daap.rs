@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 
-use crate::http::{HttpClient, HttpRequest, Method};
+use crate::http::{HttpClient, HttpRequest, Method, is_success};
 use crate::parser::{self, DmapEntry};
 use crate::{Error, Result};
 
@@ -139,7 +139,7 @@ impl DaapRequester {
         let mut retry = true;
         loop {
             let (status, body) = self.attempt(&action).await?;
-            if (200..300).contains(&status) {
+            if is_success(status) {
                 let parsed = parser::parse(&body)?;
                 let session = parser::first_uint(&parsed, &["mlog", "mlid"]).ok_or_else(|| {
                     Error::Malformed("login response carries no mlog.mlid".to_owned())
@@ -241,7 +241,7 @@ impl DaapRequester {
         let mut retry = true;
         loop {
             let (status, body) = self.attempt(action).await?;
-            if (200..300).contains(&status) {
+            if is_success(status) {
                 return Ok(body);
             }
             if status == 500 {

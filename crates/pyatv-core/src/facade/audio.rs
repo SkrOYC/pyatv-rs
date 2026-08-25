@@ -202,11 +202,13 @@ mod tests {
             .into_iter()
             .collect();
         for (protocol, level) in levels {
-            relayer.register(
-                *protocol,
-                Arc::new(Dummy { level: *level }),
-                declared.clone(),
-            );
+            relayer
+                .register(
+                    *protocol,
+                    Arc::new(Dummy { level: *level }),
+                    declared.clone(),
+                )
+                .expect("the protocol is in the priority list");
         }
         relayer
     }

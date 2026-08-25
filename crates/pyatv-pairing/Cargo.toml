@@ -46,8 +46,19 @@ x25519-dalek = "3.0.0"
 zeroize = "1.9.0"
 
 [dev-dependencies]
+# `default-features = false` drops `plotters` and `rayon`; `cargo_bench_support` is the one feature
+# `cargo bench` actually needs. See `benches/`.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 hex = "0.4.3"
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 # Same exact pin as the normal dependency above, for the same reason.
 srp = "=0.7.0-rc.3"
+
+[[bench]]
+name = "tlv8"
+harness = false
+
+[[bench]]
+name = "chacha"
+harness = false

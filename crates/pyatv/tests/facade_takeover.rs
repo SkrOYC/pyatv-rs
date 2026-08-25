@@ -21,7 +21,7 @@ use pyatv_core::facade::{FacadeAppleTV, Interface, SetupData};
 use pyatv_core::models::BaseService;
 use pyatv_proto_airplay::test_support::fake_play::PlaybackAnswer;
 
-use support::{FakeAppleTv, until};
+use support::{FakeAppleTv, until, until_async};
 
 /// How many `playing` answers to queue: each one costs a one-second poll, and the test only needs
 /// the playback to still be running when it presses stop.
@@ -100,6 +100,77 @@ async fn stop_goes_to_airplay_during_play_url_and_to_mrp_after_it() {
     })
     .await;
     assert_eq!(pressed, "stop");
+}
+
+/// `metadata()` follows the RAOP takeover on a handle taken before the stream started.
+///
+/// RAOP claims `Audio`, `Metadata`, `PushUpdater` and `RemoteControl` for the length of a
+/// `stream_file` (`pyatv/protocols/raop/__init__.py:350-352`) so that the reported track is the one
+/// being streamed. Making that visible on an already-held handle is what
+/// `pyatv_core::facade::FacadeMetadata` is for: `metadata()` used to hand out the highest-priority
+/// protocol's own object, which is a snapshot — a caller who read it once, as `atvremote` and any
+/// long-lived application does, went on talking to MRP for the whole stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_follows_the_raop_takeover_on_a_handle_taken_earlier() {
+    let device = FakeAppleTv::start_with_raop().await;
+    device.arrange_mrp(|state| state.example_video());
+
+    let atv = device.connect().await;
+
+    // Taken before anything streams, and never re-read below.
+    let metadata = atv.metadata().expect("MRP and RAOP both register metadata");
+    let title = || {
+        let metadata = std::sync::Arc::clone(&metadata);
+        async move { metadata.playing().await.ok().and_then(|it| it.title) }
+    };
+
+    assert_eq!(
+        title().await.as_deref(),
+        Some("dummy"),
+        "MRP outranks RAOP until the takeover"
+    );
+
+    let stream = atv.stream().expect("RAOP registers a stream");
+    let streaming = tokio::spawn(async move {
+        stream
+            .stream_file(
+                &pyatv::MediaSource::Bytes(support::sine_wav(0.2)),
+                Some(&pyatv::MediaMetadata {
+                    title: Some("Taken Over".to_owned()),
+                    ..pyatv::MediaMetadata::default()
+                }),
+                false,
+            )
+            .await
+    });
+
+    until_async("the streamed track on the handle taken earlier", || async {
+        (title().await.as_deref() == Some("Taken Over")).then_some(())
+    })
+    .await;
+
+    // ...but only `playing` moves. `RaopMetadata` overrides nothing else upstream
+    // (`raop/__init__.py:181-206`), and RAOP declares none of the metadata features here, so the
+    // accessors that carry no feature still fall through to MRP rather than reporting `None` for
+    // the length of the stream.
+    assert_eq!(
+        metadata.device_id().as_deref(),
+        Some(support::DEVICE_IDENTIFIER),
+        "device_id must not vanish during a RAOP takeover"
+    );
+
+    streaming
+        .await
+        .expect("the stream task must not panic")
+        .expect("the file must stream");
+
+    // Releasing the takeover puts MRP back, on that same handle.
+    until_async("MRP metadata to come back", || async {
+        (title().await.as_deref() == Some("dummy")).then_some(())
+    })
+    .await;
+
+    atv.close().await.expect("closing must succeed");
 }
 
 /// A second protocol cannot claim an interface the first one holds, and the refusal is total.

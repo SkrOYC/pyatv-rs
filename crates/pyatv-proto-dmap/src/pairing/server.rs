@@ -8,6 +8,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -37,6 +38,17 @@ pub const PAIR_PATH: &str = "/pair";
 
 /// How much of a request head to buffer before giving up on it.
 const MAX_REQUEST: usize = 8 * 1024;
+
+/// How long one connection has to send a request and be answered.
+///
+/// This server is reachable by anything on the link for as long as a pairing session is open, and
+/// it spawns a task per connection. Without a deadline, a peer that opens a socket and then says
+/// nothing holds that task — and its buffer — until the whole session is torn down, and enough of
+/// them exhaust the process rather than the session. aiohttp applies its own request timeouts
+/// upstream, so this is the equivalent floor rather than a new restriction.
+///
+/// Ten seconds is far longer than a device needs: it makes one `GET` with no body.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the request handler needs, shared with [`super::DmapPairingHandler`].
 #[derive(Debug)]
@@ -143,9 +155,11 @@ impl PairingState {
 /// The parts of a request this server looks at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
-    /// Path with the query string removed, e.g. `/pair`.
+    /// Path with the query string removed, e.g. `/pair`. Not decoded — it is only compared against
+    /// [`PAIR_PATH`], and decoding it would let `/%70air` route.
     pub path: String,
-    /// Query parameters in wire order, still percent-encoded.
+    /// Query parameters in wire order, names and values percent-decoded (and `+` turned into a
+    /// space) exactly as `parse_qsl` does upstream.
     pub query: Vec<(String, String)>,
 }
 
@@ -172,7 +186,7 @@ impl Request {
                 .filter(|pair| !pair.is_empty())
                 .map(|pair| {
                     let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-                    (key.to_owned(), value.to_owned())
+                    (decode_component(key), decode_component(value))
                 })
                 .collect(),
         })
@@ -185,6 +199,63 @@ impl Request {
             .iter()
             .find(|(candidate, _)| candidate == key)
             .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Decode one query-string component the way the route upstream sees it.
+///
+/// aiohttp hands the handler `request.rel_url.query` (`pairing.py:312-313`), a multidict yarl
+/// builds with `parse_qsl(..., keep_blank_values=True)`. That applies `unquote_plus`: `+` becomes a
+/// space and `%XX` becomes that byte, with undecodable UTF-8 replaced rather than rejected. Reading
+/// the raw bytes instead means a device that percent-encodes anything — which it is entitled to do,
+/// and which `servicename` invites, since it is a human-readable name — gets a different answer
+/// here than it would from pyatv.
+///
+/// A `%` that is not followed by two hex digits is passed through unchanged, which is what
+/// `unquote` does rather than erroring.
+#[must_use]
+fn decode_component(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 3 <= bytes.len() => {
+                if let Some(byte) = hex_pair(bytes[index + 1], bytes[index + 2]) {
+                    out.push(byte);
+                    index += 3;
+                } else {
+                    out.push(b'%');
+                    index += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Two hex digits as one byte.
+fn hex_pair(high: u8, low: u8) -> Option<u8> {
+    Some((hex_digit(high)? << 4) | hex_digit(low)?)
+}
+
+/// One hex digit's value, in either case.
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -259,8 +330,10 @@ async fn serve(listener: TcpListener, state: Arc<PairingState>) {
                 // block the next one, and the pairing window is short enough that an abandoned
                 // task is bounded by the server's own lifetime.
                 tokio::spawn(async move {
-                    if let Err(error) = handle(stream, &state).await {
-                        tracing::debug!(%peer, %error, "pairing request failed");
+                    match tokio::time::timeout(REQUEST_TIMEOUT, handle(stream, &state)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::debug!(%peer, %error, "pairing request failed"),
+                        Err(_) => tracing::debug!(%peer, "pairing request timed out"),
                     }
                 });
             }

@@ -50,6 +50,62 @@ fn a_request_line_parses_into_a_path_and_query() {
     assert!(parsed.query("nope").is_none());
 }
 
+/// aiohttp hands the route `request.rel_url.query`, which yarl builds with `parse_qsl`, so the
+/// values the handler compares are already decoded. Reading the raw bytes instead would make a
+/// device that encodes anything get a different answer here than it would from pyatv.
+#[test]
+fn query_values_are_decoded_the_way_parse_qsl_decodes_them() {
+    let parsed = request("pairingcode=690E6FF6&servicename=Living%20Room%20%C3%85TV");
+    assert_eq!(parsed.query("servicename"), Some("Living Room \u{c5}TV"));
+
+    // `+` is a space too, which is what `unquote_plus` does.
+    assert_eq!(
+        request("servicename=Living+Room").query("servicename"),
+        Some("Living Room")
+    );
+
+    // Names are decoded as well, since `parse_qsl` decodes both halves of a pair.
+    assert_eq!(
+        request("pairing%63ode=abc").query("pairingcode"),
+        Some("abc")
+    );
+
+    // A stray `%` is passed through rather than swallowed, matching `unquote`.
+    for (raw, expected) in [
+        ("servicename=100%", "100%"),
+        ("servicename=%zz", "%zz"),
+        ("servicename=%4", "%4"),
+        ("servicename=a%2", "a%2"),
+    ] {
+        assert_eq!(request(raw).query("servicename"), Some(expected), "{raw}");
+    }
+}
+
+/// A percent-encoded pairing code has to decode to the digest, or a device that encodes it is
+/// refused a pairing it earned.
+#[test]
+fn a_percent_encoded_pairing_code_still_matches() {
+    let state = state();
+    state.set_pin(PIN_CODE);
+
+    // `%36` is `6`, the first character of the digest.
+    let encoded = format!("%36{}", &PAIRING_CODE[1..]);
+    let (status, _) =
+        split(&state.respond(&request(&format!("pairingcode={encoded}&servicename=test"))));
+
+    assert_eq!(status, 200);
+    assert!(state.has_paired());
+}
+
+/// The path is *not* decoded: `/pair` is a route, and `%70air` is a different string.
+#[test]
+fn the_path_is_matched_undecoded() {
+    let (status, _) = split(&state().respond(
+        &Request::parse("GET /%70air?pairingcode=x&servicename=y HTTP/1.1").expect("a GET"),
+    ));
+    assert_eq!(status, 404);
+}
+
 /// Upstream registers one route and one method (`web.get("/pair", ...)`, `pairing.py:232`).
 #[test]
 fn only_get_is_routed() {

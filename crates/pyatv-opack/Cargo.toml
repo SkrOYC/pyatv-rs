@@ -16,6 +16,14 @@ bytes.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# `default-features = false` drops `plotters` and `rayon`: the HTML report is useless in CI and
+# both pull a large transitive tree into a dev-only dependency. `cargo_bench_support` is the one
+# feature `cargo bench` actually needs.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 # Round-trip property tests over the wire format; version verified against crates.io and matching
 # the pin recorded in docs/research/rust-crates.md §11.
 proptest = "1.11.0"
+
+[[bench]]
+name = "opack"
+harness = false

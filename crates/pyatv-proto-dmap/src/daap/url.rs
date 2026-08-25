@@ -46,6 +46,11 @@ impl Credential {
 /// well-formed credential is accepted and sent as-is. That is upstream behaviour and a device would
 /// reject the resulting login anyway.
 ///
+/// The trailing junk is not *harmless*, though: a stored credential ending in `\r\n` would split
+/// the request line it is interpolated into. Narrowing the match here would fix that one string
+/// while leaving every other caller-supplied path unchecked, so the request bytes are validated
+/// where they are built instead — see [`crate::http::HttpClient::send`].
+///
 /// # Errors
 ///
 /// Returns [`Error::InvalidCredentials`] when the string matches neither shape, which is upstream's
@@ -144,6 +149,23 @@ mod tests {
         assert_eq!(
             classify("0x1234ABCDE56789FF").expect("valid"),
             Credential::PairingGuid
+        );
+    }
+
+    /// A credential shaped like a pairing GUID but carrying a CRLF still classifies, because the
+    /// match is a prefix match — the rejection is the HTTP layer's job, and
+    /// `a_credential_carrying_a_crlf_cannot_reach_the_wire` is the other half of this test.
+    #[test]
+    fn a_credential_carrying_a_crlf_still_classifies() {
+        const INJECTED: &str = "0x0000000000000001\r\nX-Injected: 1";
+
+        assert_eq!(
+            classify(INJECTED).expect("a prefix match is upstream's behaviour"),
+            Credential::PairingGuid
+        );
+        assert_eq!(
+            mkurl(LOGIN_CMD, INJECTED, 0, false, true).expect("valid"),
+            "login?pairing-guid=0x0000000000000001\r\nX-Injected: 1&hasFP=1"
         );
     }
 

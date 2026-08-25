@@ -16,6 +16,7 @@
 //!
 //! pyatv's RAOP sender advertises `a=rtpmap:96 L16/44100/2` — raw linear PCM, not ALAC — and no ALAC encoding appears anywhere in its RAOP code. Whether ALAC is genuinely unnecessary for parity is an open question in `docs/research/rust-crates.md` §7 that wants a live capture to settle, so no audio codec dependency is taken here yet.
 
+#![warn(missing_docs)]
 pub mod ap2;
 pub mod audio;
 pub mod auth;

@@ -1,14 +1,49 @@
 # Test runner configuration. See https://nexte.st/docs/configuration/
 
+[profile.default]
+# A test that binds a loopback socket and then waits on a peer that never arrives hangs forever;
+# without a timeout that shows up as a CI job that runs until the runner is killed, with no output
+# to explain it. Marking a test slow after 30s and killing it after four such periods turns that
+# into an ordinary failure with a backtrace. The slowest test in the suite today settles in about
+# five seconds, so the margin is wide.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
 [profile.ci]
-# Protocol tests will eventually touch real sockets and timing; one retry is not enough to
-# distinguish a flake from a failure, two is.
-retries = 2
+# Run the whole suite even after a failure. A red build should tell you everything that is wrong in
+# one pass, not just the first thing.
+fail-fast = false
 
 # Print a failing test's output as soon as it fails, and again in the final summary, so a CI log
 # does not have to be scrolled to find out what broke.
 failure-output = "immediate-final"
 
-# Run the whole suite even after a failure. A red build should tell you everything that is wrong in
-# one pass, not just the first thing.
-fail-fast = false
+# No blanket retries. A retry that turns red into green also turns a real race into an invisible
+# one, and every test in this suite except the ones below is hermetic: the fake devices bind
+# ephemeral loopback ports and the protocol state machines are driven deterministically. The two
+# genuinely network-dependent tests in the tree (`pyatv-mdns`'s multicast browse and responder
+# tests) are `#[ignore]`d and never run in CI at all. Retries are granted per binary, on evidence,
+# in the override below.
+retries = 0
+
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# Report a test that only passed on a retry as flaky in the summary rather than folding it in with
+# the clean passes — the whole point of scoping retries is to keep that visible.
+final-status-level = "flaky"
+
+# The criterion for being here: the test drives a real UDP socket *and* asserts against a
+# sub-second wall-clock deadline. `unicast_scan` sends a unicast mDNS query to a fake responder and
+# fails the scan if no answer arrives within 900 ms, which is a comfortable margin on a developer
+# machine and a coin flip on a saturated shared runner. Nothing else in the suite combines a lossy
+# transport with a deadline that tight — TCP tests are either lossless or use a 5 s settle window.
+#
+# If a different test starts flaking, add it here with the same kind of justification rather than
+# raising `retries` at the profile level.
+[[profile.ci.overrides]]
+filter = 'binary_id(=pyatv-mdns::unicast_scan)'
+retries = 2
+
+# Machine-readable results for the CI job summary and for annotating failures on a pull request.
+# nextest writes this to `target/nextest/ci/junit.xml`.
+[profile.ci.junit]
+path = "junit.xml"

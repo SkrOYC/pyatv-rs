@@ -86,15 +86,21 @@ impl PushUpdater for DmapPushUpdater {
     /// back immediately with current state rather than blocking on a revision the device has
     /// already moved past. Starting an already-active updater does nothing.
     ///
-    /// # Divergence: `initial_delay` actually takes effect
+    /// # Divergence: `initial_delay` actually takes effect, and only after an error
     ///
     /// Upstream's poller reads `if not first_call and self._initial_delay > 0`, and the only place
     /// it assigns `first_call = False` is *inside* that same block (`__init__.py:497-500`) — so
     /// `first_call` is never cleared and the delay never applies, on any iteration. That looks like
     /// a plain bug rather than an intent, since the field's own comment is "Delay before restarting
-    /// after an error". Here the delay applies from the second iteration onward, which is what the
-    /// comment describes. With the default of zero, which is what every upstream caller passes,
+    /// after an error", so here the delay is applied — and applied where that comment says, after a
+    /// failed poll and not after a successful one. Delaying after a *success* would insert latency
+    /// into the long poll that is DMAP's entire push mechanism, which is the opposite of what a
+    /// push updater is for. With the default of zero, which is what every upstream caller passes,
     /// the two behave identically.
+    ///
+    /// # Divergence: consecutive failures back off
+    ///
+    /// See [`backoff`].
     ///
     /// # Errors
     ///
@@ -136,23 +142,18 @@ impl PushUpdater for DmapPushUpdater {
 ///   [`DeviceListener::connection_lost`] and stop. The loop does *not* restart itself; the caller
 ///   has to call `start` again.
 /// * **anything else** — reset the revision to zero and report the error to the playback listener,
-///   then keep going. Resetting is what makes the next request ask for current state instead of
-///   long-polling from a revision the device has rejected, and it is what
+///   then wait (see [`backoff`]) and keep going. Resetting is what makes the next request ask for
+///   current state instead of long-polling from a revision the device has rejected, and it is what
 ///   `test_reset_revision_if_push_updates_fail` exercises
 ///   (`tests/protocols/dmap/test_dmap_functional.py:284-317`).
 async fn poll(shared: Arc<Shared>, initial_delay: Duration) {
-    let mut first_call = true;
+    let mut failures = 0u32;
 
     loop {
-        if !first_call && !initial_delay.is_zero() {
-            tracing::debug!(delay_ms = initial_delay.as_millis(), "delaying next poll");
-            tokio::time::sleep(initial_delay).await;
-        }
-        first_call = false;
-
         tracing::debug!("waiting for playstatus updates");
         match shared.apple_tv.playstatus(true).await {
             Ok(playing) => {
+                failures = 0;
                 if let Some(listener) = shared.playback_listener() {
                     listener.playstatus_update(&playing);
                 }
@@ -173,7 +174,78 @@ async fn poll(shared: Arc<Shared>, initial_delay: Duration) {
                 if let Some(listener) = shared.playback_listener() {
                     listener.playstatus_error(&error.into());
                 }
+
+                failures = failures.saturating_add(1);
+                let delay = initial_delay.max(backoff(failures));
+                tracing::debug!(
+                    failures,
+                    delay_ms = delay.as_millis(),
+                    "delaying the next poll"
+                );
+                tokio::time::sleep(delay).await;
             }
+        }
+    }
+}
+
+/// The shortest a poll may be retried after a failure.
+pub const MIN_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The longest a poll will be delayed however many times it has failed.
+pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// How long to wait after `failures` consecutive non-transport failures.
+///
+/// # Divergence: upstream has no delay at all
+///
+/// `_poller`'s error branch falls straight back into `while True` (`__init__.py:513-522`), so a
+/// device answering a `playstatusupdate` immediately and non-2xx — which is exactly what a
+/// revision the device has moved past produces, and what the fixture's own
+/// `handle_playstatus` returns for a stale revision (`tests/fake_device/dmap.py:224-226`) — is
+/// re-asked as fast as the network allows. That is a hot loop against a gen-3 Apple TV, and every
+/// pass allocates a connection, a parse and a listener notification. The default `initial_delay` of
+/// zero means nothing upstream slows it down.
+///
+/// Doubling from [`MIN_BACKOFF`] and capped at [`MAX_BACKOFF`] gives 1, 2, 4, 8, 16, 30, 30, ...
+/// seconds. The first retry is a whole second later than upstream's, which is the deliberate part:
+/// a failure that is going to clear (a revision reset, a re-login) clears within one second, and
+/// one that is not should not be retried thirty times a second. A success resets the ladder, so a
+/// device that is merely flapping never climbs it.
+#[must_use]
+pub fn backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(u32::BITS - 1);
+    MIN_BACKOFF
+        .saturating_mul(1u32.checked_shl(doublings).unwrap_or(u32::MAX))
+        .min(MAX_BACKOFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_BACKOFF, MIN_BACKOFF, backoff};
+
+    /// The ladder, and that it is bounded at both ends.
+    #[test]
+    fn the_backoff_doubles_from_one_second_and_stops_at_thirty() {
+        assert_eq!(backoff(1), MIN_BACKOFF);
+        assert_eq!(backoff(2).as_secs(), 2);
+        assert_eq!(backoff(3).as_secs(), 4);
+        assert_eq!(backoff(4).as_secs(), 8);
+        assert_eq!(backoff(5).as_secs(), 16);
+        assert_eq!(backoff(6), MAX_BACKOFF, "32 seconds is over the cap");
+
+        // A device that has been unreachable for a long time must not overflow its way back to a
+        // short delay.
+        for failures in [7u32, 32, 1_000, u32::MAX] {
+            assert_eq!(backoff(failures), MAX_BACKOFF, "{failures} failures");
+        }
+    }
+
+    /// `backoff(0)` is never reached by the loop — it counts a failure before asking — but it must
+    /// not be a zero-length sleep if it ever were.
+    #[test]
+    fn no_failure_count_produces_a_zero_delay() {
+        for failures in 0..8u32 {
+            assert!(backoff(failures) >= MIN_BACKOFF, "{failures} failures");
         }
     }
 }

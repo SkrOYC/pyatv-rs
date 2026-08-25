@@ -71,9 +71,15 @@ pub struct ListenerHub {
     tracked: Mutex<Tracked>,
 }
 
-/// Add a weakly held listener to one of the lists.
+/// Add a weakly held listener to one of the lists, dropping any that have since died.
+///
+/// A [`Weak`] whose target is gone is never removed by [`awake`] — it only skips it — so without
+/// this the list grows for the lifetime of the connection every time a caller registers a
+/// short-lived listener. Pruning on registration keeps it bounded by the number of *live*
+/// listeners without needing a second pass anywhere else.
 fn subscribe<T: ?Sized>(list: &Mutex<Vec<Weak<T>>>, listener: &Arc<T>) {
     if let Ok(mut listeners) = list.lock() {
+        listeners.retain(|entry| entry.strong_count() > 0);
         listeners.push(Arc::downgrade(listener));
     }
 }
@@ -112,7 +118,9 @@ impl ListenerHub {
     /// Tell the hub which protocol's keyboard updates to accept.
     ///
     /// Called by the facade whenever a protocol registers, with the keyboard relayer's current
-    /// main protocol; see [`Tracked::keyboard_protocol`].
+    /// main protocol. Upstream expresses the same filter as a `message_filter` on the dispatcher
+    /// subscription (`pyatv/core/facade.py:554-558`); a focus change from any other protocol is
+    /// dropped rather than reported.
     pub fn set_keyboard_protocol(&self, protocol: Option<Protocol>) {
         if let Ok(mut tracked) = self.tracked.lock() {
             tracked.keyboard_protocol = protocol;

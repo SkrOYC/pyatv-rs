@@ -17,7 +17,7 @@
 //!
 //! Being discoverable is not optional here: the device cannot call back to a port it has not been
 //! told about. The responder that publishes it is
-//! [`pyatv_mdns::publish`](pyatv_mdns::publish) — a protocol-agnostic primitive in the crate that
+//! [`pyatv_mdns::publish`] — a protocol-agnostic primitive in the crate that
 //! already owns every byte of DNS wire format in this workspace, which is where
 //! `docs/research/dmap-port-spec.md` §2.5 argues it belongs. `pyatv-mdns` is discovery
 //! infrastructure rather than a protocol crate and depends only on `pyatv-core`, so
@@ -197,10 +197,12 @@ impl DmapPairingHandler {
 
         let mut responders = Vec::with_capacity(addresses.len());
         for address in addresses {
-            // One responder per address, each answering only for the instance naming that address —
-            // upstream publishes one zeroconf service per address for the same reason, all pointing
-            // at the same port.
-            match Responder::bind(self.registration(address, port)) {
+            // One responder per address, each bound to that address and answering only for the
+            // instance naming it. Upstream publishes one zeroconf service per address for the same
+            // reason, all pointing at the same port; binding per interface is also what gets
+            // `IP_MULTICAST_IF` set, so the announcement leaves by the interface whose address it
+            // advertises rather than by whichever one the routing table prefers.
+            match Responder::bind(address, self.registration(address, port)) {
                 Ok(responder) => responders.push(responder),
                 // A failed bind on one interface must not stop the others: the device only has to
                 // find us on the one it is actually on.
@@ -216,7 +218,20 @@ impl DmapPairingHandler {
         Ok(())
     }
 
-    /// `finish` (`pairing.py:271-276`): persist, but only if the device actually paired.
+    /// `finish` (`pairing.py:87-92`): persist, but only if the device actually paired.
+    ///
+    /// # Divergence: finishing without a pairing is an error, not a silent no-op
+    ///
+    /// Upstream's whole body is `if self._has_paired:` with no `else`, so calling `finish()` after
+    /// a pairing that never happened returns successfully and writes nothing. The caller is then
+    /// holding a handler that reports success while `service.credentials` still contains whatever
+    /// it did before — for a first-time pairing, `None` — and the failure only surfaces later as
+    /// an unexplained login failure.
+    ///
+    /// [`PairingHandler::has_paired`] is public and is how a caller is meant to find this out, so
+    /// no information is lost by refusing; what changes is that the mistake is reported at the
+    /// point it is made. `atvremote`'s pairing flow checks `has_paired` first either way, so the
+    /// divergence is invisible to it.
     async fn finish_inner(&self) -> pyatv_core::Result<()> {
         if !self.state.has_paired() {
             return Err(Error::Pairing(

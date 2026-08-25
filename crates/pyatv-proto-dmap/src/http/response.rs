@@ -14,6 +14,35 @@ use crate::{Error, Result};
 /// to finish, and reading it into memory unbounded would be the bug.
 pub const MAX_HEAD_LEN: usize = 16 * 1024;
 
+/// Cap on how large a decoded response body may be.
+///
+/// Every framing this client understands is unbounded on the wire: a `Content-Length` is a
+/// device-supplied number, a chunked body is a device-supplied number of chunks, and a `ToEof` body
+/// is however much the device feels like sending. Without a cap, a device — or anything that can
+/// answer on its address — decides how much of this process's memory to consume.
+///
+/// Eight mebibytes is two orders of magnitude above the largest thing DAAP carries. A now-playing
+/// response is a few hundred bytes and `nowplayingartwork` is a few hundred kibibytes even at
+/// full resolution, so nothing legitimate comes near this and anything that does is not artwork.
+pub const MAX_BODY_LEN: usize = 8 * 1024 * 1024;
+
+/// Whether a status code is one `_do` treats as success (`daap.py:136-137`).
+///
+/// A free function rather than only a method on [`Head`] because the retry state machine in
+/// [`crate::daap`] branches on a bare status long after the head has been dropped, and two
+/// independent spellings of "2xx" is one too many.
+#[must_use]
+pub fn is_success(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
+/// The error for a body that would not fit under [`MAX_BODY_LEN`].
+pub(crate) fn body_too_large(bytes: usize) -> Error {
+    Error::Http(format!(
+        "response body of at least {bytes} bytes exceeds the {MAX_BODY_LEN}-byte cap"
+    ))
+}
+
 /// A parsed status line plus headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Head {
@@ -49,7 +78,7 @@ impl Head {
     /// (`daap.py:136-137`).
     #[must_use]
     pub fn is_success(&self) -> bool {
-        (200..300).contains(&self.status)
+        is_success(self.status)
     }
 
     /// How to read the body that follows.
@@ -182,54 +211,113 @@ fn find_head_end(buffer: &[u8]) -> Option<usize> {
         .map(|start| start + 4)
 }
 
-/// Decode a chunked body, or report that more bytes are needed.
+/// A chunked-body decoder that survives being handed a partial body.
 ///
-/// Returns the decoded body and how many bytes of `data` the chunked framing occupied. Trailers
-/// after the terminating zero-length chunk are consumed and discarded: nothing in DAAP sends them,
-/// and a caller that ignored them would leave bytes on a connection it is about to close anyway.
+/// The socket hands over whatever one `read` returned, which lands wherever it lands — halfway
+/// through a chunk-size line as readily as on a chunk boundary. A decoder that started over from
+/// byte zero on every read would re-scan and re-copy everything already decoded, making a body
+/// delivered in *n* reads cost O(n²); this one remembers how far it got and resumes there.
+///
+/// `data` is expected to be the whole chunked region, from its first byte, growing between calls.
+/// That is what [`super::HttpClient`] has — one buffer it appends to — so nothing has to be
+/// shuffled forward to keep the decoder's offsets meaningful.
+#[derive(Debug, Default)]
+pub struct ChunkedDecoder {
+    /// Chunk data decoded so far, with the framing removed.
+    body: Vec<u8>,
+    /// How many bytes of `data` have been fully consumed: always a chunk boundary.
+    consumed: usize,
+}
+
+impl ChunkedDecoder {
+    /// A decoder positioned at the start of a chunked body.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The body decoded so far.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// The decoded body, once [`Self::feed`] has reported completion.
+    #[must_use]
+    pub fn into_body(self) -> Vec<u8> {
+        self.body
+    }
+
+    /// Decode as much of `data` as has arrived.
+    ///
+    /// Returns `Some(consumed)` — how many bytes of `data` the chunked framing occupied — once the
+    /// terminating zero-length chunk and its trailer section have both arrived, and `None` while
+    /// more bytes are needed. Trailers are consumed and discarded: nothing in DAAP sends them, and
+    /// leaving them would strand bytes on a connection this client is about to close anyway.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] for a chunk size that is not hexadecimal, a chunk not terminated by
+    /// `CRLF`, or a body that would exceed [`MAX_BODY_LEN`].
+    pub fn feed(&mut self, data: &[u8]) -> Result<Option<usize>> {
+        loop {
+            let offset = self.consumed;
+            let Some(line_end) = find_crlf(&data[offset..]) else {
+                return Ok(None);
+            };
+            let header = core::str::from_utf8(&data[offset..offset + line_end])
+                .map_err(|_| Error::Http("chunk size line is not valid UTF-8".to_owned()))?;
+            // A chunk-size may carry `;ext=value` extensions (RFC 9112 §7.1.1); everything after
+            // the first semicolon is ignored.
+            let size_text = header.split(';').next().unwrap_or(header).trim();
+            let size = usize::from_str_radix(size_text, 16)
+                .map_err(|_| Error::Http(format!("unparseable chunk size: {size_text}")))?;
+            let start = offset + line_end + 2;
+
+            if size == 0 {
+                // Trailer section, ending with its own blank line.
+                let Some(end) = find_head_end_after_chunks(&data[start..]) else {
+                    return Ok(None);
+                };
+                self.consumed = start + end;
+                return Ok(Some(self.consumed));
+            }
+
+            // Checked before the chunk is read, so a device cannot make this buffer the bytes it
+            // is about to be refused for.
+            let total = self.body.len().saturating_add(size);
+            if total > MAX_BODY_LEN {
+                return Err(body_too_large(total));
+            }
+
+            let Some(chunk) = data.get(start..start + size) else {
+                return Ok(None);
+            };
+            match data.get(start + size..start + size + 2) {
+                None => return Ok(None),
+                Some(separator) if separator == b"\r\n" => {}
+                Some(_) => return Err(Error::Http("chunk is not CRLF-terminated".to_owned())),
+            }
+
+            self.body.extend_from_slice(chunk);
+            self.consumed = start + size + 2;
+        }
+    }
+}
+
+/// Decode a complete chunked body in one go.
+///
+/// Returns the decoded body and how many bytes of `data` the chunked framing occupied, or `None` if
+/// `data` does not yet hold a whole one. [`ChunkedDecoder`] is what the client uses; this is the
+/// same thing for a caller that already has every byte.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Http`] for a chunk size that is not hexadecimal, or a chunk not terminated by
-/// `CRLF`.
+/// See [`ChunkedDecoder::feed`].
 pub fn decode_chunked(data: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
-    let mut body = Vec::new();
-    let mut offset = 0usize;
-
-    loop {
-        let Some(line_end) = find_crlf(&data[offset..]) else {
-            return Ok(None);
-        };
-        let header = core::str::from_utf8(&data[offset..offset + line_end])
-            .map_err(|_| Error::Http("chunk size line is not valid UTF-8".to_owned()))?;
-        // A chunk-size may carry `;ext=value` extensions (RFC 9112 §7.1.1); everything after the
-        // first semicolon is ignored.
-        let size_text = header.split(';').next().unwrap_or(header).trim();
-        let size = usize::from_str_radix(size_text, 16)
-            .map_err(|_| Error::Http(format!("unparseable chunk size: {size_text}")))?;
-        offset += line_end + 2;
-
-        if size == 0 {
-            // Trailer section, ending with its own blank line.
-            let Some(end) = find_head_end_after_chunks(&data[offset..]) else {
-                return Ok(None);
-            };
-            return Ok(Some((body, offset + end)));
-        }
-
-        let Some(chunk) = data.get(offset..offset + size) else {
-            return Ok(None);
-        };
-        if data.get(offset + size..offset + size + 2) != Some(b"\r\n".as_slice()) {
-            if data.len() < offset + size + 2 {
-                return Ok(None);
-            }
-            return Err(Error::Http("chunk is not CRLF-terminated".to_owned()));
-        }
-
-        body.extend_from_slice(chunk);
-        offset += size + 2;
-    }
+    let mut decoder = ChunkedDecoder::new();
+    let consumed = decoder.feed(data)?;
+    Ok(consumed.map(|consumed| (decoder.into_body(), consumed)))
 }
 
 /// The end of the trailer section following the terminating chunk.

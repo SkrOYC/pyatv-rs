@@ -30,10 +30,15 @@ const TLV8: &str = "application/octet-stream";
 /// One parsed request.
 #[derive(Debug)]
 pub struct FakeRequest {
+    /// Request method, e.g. `ANNOUNCE` or `RECORD`.
     pub method: String,
+    /// Request target, e.g. `rtsp://host/stream`.
     pub path: String,
+    /// Protocol token of the request line, e.g. `RTSP/1.0`.
     pub protocol: String,
+    /// Headers in the order they arrived, duplicates included.
     pub headers: Vec<(String, String)>,
+    /// The body, already decrypted if the session was encrypted.
     pub body: Vec<u8>,
 }
 
@@ -50,11 +55,17 @@ impl FakeRequest {
 /// One response to send.
 #[derive(Debug)]
 pub struct Reply {
+    /// Status code of the response line.
     pub status: u16,
+    /// Reason phrase of the response line.
     pub reason: String,
+    /// The `CSeq` this answers, echoed back as RTSP requires.
     pub cseq: String,
+    /// `Content-Type`, omitted entirely when `None`.
     pub content_type: Option<&'static str>,
+    /// Extra headers, sent after the ones the reply builds itself.
     pub headers: Vec<(String, String)>,
+    /// The body, encrypted on the way out when the session is.
     pub body: Vec<u8>,
 }
 

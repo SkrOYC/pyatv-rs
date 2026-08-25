@@ -35,4 +35,15 @@ pyatv-proto-airplay = { workspace = true, features = ["test-support"] }
 pyatv-proto-companion = { workspace = true, features = ["test-support"] }
 pyatv-proto-dmap = { workspace = true, features = ["test-support"] }
 pyatv-proto-mrp = { workspace = true, features = ["test-support"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+# `fs` is for `helpers`' unit tests, which write a scratch file to check `is_streamable` rejects
+# it. It compiled before this line existed only because `cli/atvremote` asks for `tokio/full` and
+# Cargo unifies features across a workspace build — `cargo hack --feature-powerset` checking this
+# crate on its own is what surfaced it.
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "time",
+  "sync",
+  "fs",
+] }

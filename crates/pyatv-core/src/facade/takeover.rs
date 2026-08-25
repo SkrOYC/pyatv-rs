@@ -209,9 +209,15 @@ mod tests {
     fn registry() -> (Arc<TakeoverRegistry>, Arc<Relayer<str>>, Arc<Relayer<str>>) {
         let audio: Arc<Relayer<str>> = Arc::new(Relayer::new(vec![Protocol::Mrp, Protocol::Raop]));
         let stream: Arc<Relayer<str>> = Arc::new(Relayer::new(vec![Protocol::Mrp, Protocol::Raop]));
-        audio.register(Protocol::Mrp, Arc::from("mrp"), BTreeSet::new());
-        audio.register(Protocol::Raop, Arc::from("raop"), BTreeSet::new());
-        stream.register(Protocol::Mrp, Arc::from("mrp"), BTreeSet::new());
+        audio
+            .register(Protocol::Mrp, Arc::from("mrp"), BTreeSet::new())
+            .expect("the protocol is in the priority list");
+        audio
+            .register(Protocol::Raop, Arc::from("raop"), BTreeSet::new())
+            .expect("the protocol is in the priority list");
+        stream
+            .register(Protocol::Mrp, Arc::from("mrp"), BTreeSet::new())
+            .expect("the protocol is in the priority list");
 
         let mut registry = TakeoverRegistry::default();
         registry.insert(Interface::Audio, &audio);

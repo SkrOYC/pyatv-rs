@@ -124,6 +124,62 @@ async fn an_expired_session_is_re_logged_in_and_the_request_retried() {
     );
 }
 
+/// `_do`'s full retry ladder for a command that never stops being refused (`daap.py:143-152`).
+///
+/// The guard upstream skips on the retry is `is_login`, not `retry`, so a failing command logs in
+/// **twice** before giving up: once before the single retry, and once more on the way out. That
+/// second login is pure waste and looks like a bug, but it is observable — a device sees the
+/// request — so it is reproduced rather than tidied. This is the test that would notice if the
+/// ladder were quietly shortened to one login, or lengthened into an unbounded loop.
+#[tokio::test]
+async fn a_command_that_keeps_failing_relogs_in_twice_before_giving_up() {
+    let device = FakeDmapDevice::start().await;
+    let use_cases = device.use_cases();
+    use_cases.example_video();
+
+    let atv = connect(&device, HSGID).await;
+    let logins_after_connect = use_cases
+        .requests()
+        .iter()
+        .filter(|target| target.starts_with("/login"))
+        .count();
+    assert_eq!(logins_after_connect, 1, "connecting logs in exactly once");
+
+    // Artwork answers 403 whatever session is presented, so no amount of re-logging in helps.
+    use_cases.artwork_no_permission();
+
+    let error = atv
+        .metadata()
+        .expect("DMAP provides Metadata")
+        .artwork(None, None)
+        .await
+        .expect_err("a permanently refused request must not report success");
+    assert!(
+        matches!(error, pyatv_core::Error::Authentication(ref message) if message == "failed to login: 403"),
+        "expected upstream's authentication failure, got {error:?}"
+    );
+
+    let requests = use_cases.requests();
+    let logins = requests
+        .iter()
+        .filter(|target| target.starts_with("/login"))
+        .count();
+    let artwork = requests
+        .iter()
+        .filter(|target| target.starts_with("/ctrl-int/1/nowplayingartwork"))
+        .count();
+
+    assert_eq!(
+        logins, 3,
+        "one login to connect plus two rungs of the ladder, requests were {requests:?}"
+    );
+    assert_eq!(
+        artwork, 2,
+        "the request itself is tried once and retried once, requests were {requests:?}"
+    );
+    use_cases.assert_no_protocol_errors();
+}
+
 // ---- Metadata (`test_dmap_functional.py:92-94,118-132`) ----
 
 /// `test_metadata_artwork_size` (`:118-132`): the requested dimensions reach the device.

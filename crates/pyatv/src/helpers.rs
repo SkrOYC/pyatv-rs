@@ -1,4 +1,4 @@
-//! Small conveniences that sit on top of [`scan`](crate::scan) and [`connect`](crate::connect).
+//! Small conveniences that sit on top of [`scan`](crate::scan()) and [`connect`](crate::connect()).
 //!
 //! Port of `pyatv/helpers.py`, a public top-level module upstream. Nothing here is required to use
 //! the library — every function is a few lines over the three entry points — but they are part of
@@ -83,7 +83,7 @@ pub async fn is_streamable(path: impl AsRef<std::path::Path>) -> bool {
 ///
 /// # Errors
 ///
-/// Returns whatever [`crate::scan`], [`crate::connect`] or `handler` reported. A failure inside
+/// Returns whatever [`crate::scan()`], [`crate::connect()`] or `handler` reported. A failure inside
 /// `handler` is propagated *after* the device has been closed.
 ///
 /// # Examples

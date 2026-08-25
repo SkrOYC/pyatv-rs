@@ -11,12 +11,20 @@
 //! with working `AirPlay` but unpaired Companion should still give you video streaming. The whole
 //! call only fails when nothing connected at all.
 //!
+//! # What `connect` deliberately does not do
+//!
+//! It does not start push updates. Upstream's does not either (`pyatv/__init__.py:101-159`): a
+//! caller subscribes and starts them itself, with
+//! `atv.push_updater().set_listener(&mine)` followed by `start(0)`, and that is the whole
+//! sequence — [`pyatv_core::facade::FacadePushUpdater`] subscribes each protocol on `start`, so
+//! nothing else is needed.
+//!
 //! # One protocol can contribute more than one registration
 //!
 //! `setup()` is a generator upstream, and `AirPlay`'s yields twice: once for `AirPlay` itself and
 //! once, tagged `Protocol::MRP`, for the remote-control tunnel it hosts
-//! (`pyatv/protocols/airplay/__init__.py:303-387`). That is why [`setup_protocol`] returns a
-//! `Vec<SetupData>` rather than one.
+//! (`pyatv/protocols/airplay/__init__.py:303-387`). That is why this module's `setup_protocol`
+//! returns a `Vec<SetupData>` rather than one.
 //!
 //! # What is wired up today
 //!

@@ -26,6 +26,7 @@
 //!
 //! The one thing `prost` cannot do is proto2 extensions, which is exactly how MRP nests every concrete message inside the `ProtocolMessage` envelope. [`protobuf::extensions`] supplies that layer: a generated typed handle per extension, reading and writing the field directly on the serialised envelope. `docs/research/mrp-protobuf-spike.md` records the two toolchains that were measured and why this shape was chosen. The consequence for callers is [`message::MrpMessage`], which carries the envelope and the serialised extension together because a bare `ProtocolMessage` is lossy.
 
+#![warn(missing_docs)]
 pub mod auth;
 pub mod error;
 pub mod facade;

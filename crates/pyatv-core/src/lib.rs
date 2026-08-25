@@ -8,6 +8,7 @@
 //!
 //! Two modules exist here for a layering reason rather than a conceptual one. [`device_info`] and [`airplay`] hold pure functions that turn mDNS TXT records into typed facts — which model this is, which tvOS version it runs, whether the service wants a password, whether it speaks `AirPlay` 1 or 2. Upstream files them under `pyatv/support/` and `pyatv/protocols/airplay/`, but `pyatv-mdns` needs them at scan time and is not allowed to depend on a protocol crate, so they live in core where both discovery and the protocol crates can reach them.
 
+#![warn(missing_docs)]
 pub mod airplay;
 pub mod consts;
 pub mod device_info;

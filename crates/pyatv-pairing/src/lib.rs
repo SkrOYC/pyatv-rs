@@ -8,6 +8,7 @@
 //!
 //! Nothing in this crate performs I/O: it is a set of sans-io state machines and codecs that the protocol crates drive. That keeps the pairing logic testable against captured byte vectors with no runtime involved, which is the only practical way to validate a reverse-engineered protocol.
 
+#![warn(missing_docs)]
 pub mod chacha;
 pub mod credentials;
 pub mod error;

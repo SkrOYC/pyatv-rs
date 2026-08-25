@@ -26,10 +26,6 @@ pub enum Error {
         length: usize,
     },
 
-    /// The device answered with a non-success HTTP status.
-    #[error("device returned HTTP {0}")]
-    HttpStatus(u16),
-
     /// The device's HTTP response could not be decoded.
     #[error("bad HTTP response: {0}")]
     Http(String),
@@ -86,7 +82,9 @@ impl From<Error> for pyatv_core::Error {
             }
             Error::InvalidCredentials(credentials) => Self::InvalidCredentials(credentials),
             // Everything left is "the device said something we could not use": a malformed
-            // payload, an out-of-table enum value, a bad HTTP framing, or a plain non-2xx status.
+            // payload, an out-of-table enum value, or a response this client could not frame.
+            // A non-2xx status is not among them — it never reaches a caller as a status, because
+            // `_do` turns it into `NotSupported` or `Authentication` first (`daap.py:130-152`).
             other => Self::InvalidResponse(other.to_string()),
         }
     }

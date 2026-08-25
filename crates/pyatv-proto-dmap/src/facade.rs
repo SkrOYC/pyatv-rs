@@ -57,7 +57,7 @@ pub struct DmapSetupOptions {
     pub peer: SocketAddr,
     /// The service being connected, for its credentials.
     pub service: BaseService,
-    /// `core.config.identifier`, which [`DmapMetadata::device_id`] reports.
+    /// `core.config.identifier`, which [`DmapMetadata`] reports as its `device_id`.
     pub identifier: Option<String>,
     /// Which of [`SERVICE_TYPES`] the scan saw TXT records for, for [`device_facts`].
     pub service_types: Vec<String>,

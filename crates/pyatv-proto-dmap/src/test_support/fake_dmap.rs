@@ -12,6 +12,7 @@
 //! (`crate::parser::tests`), which is what makes the sharing safe.
 
 pub mod http;
+mod verify;
 
 use std::io;
 use std::net::SocketAddr;
@@ -22,6 +23,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 use self::http::{Request, read_request, response as http_response};
+use self::verify::{verify_headers, verify_login_id, verify_prompt_id, verify_session};
 use super::fake_state::{FakeDmapState, FakeDmapUseCases};
 use crate::parser;
 use crate::tags::{container_tag, string_tag, uint8_tag, uint32_tag};
@@ -40,6 +42,12 @@ pub const EXPECTED_HEADERS: [(&str, &str); 7] = [
     ("User-Agent", "Remote/1021"),
     ("Viewer-Only-Client", "1"),
 ];
+
+/// The `Content-Type` a `POST` must carry, and a `GET` must not (`daap.py:123-124`).
+///
+/// Stated independently of [`crate::daap::POST_CONTENT_TYPE`] for the same reason as
+/// [`EXPECTED_HEADERS`].
+pub const EXPECTED_POST_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 
 /// The playback buttons that are their own endpoint (`dmap.py:127-139`).
 pub const PLAYBACK_BUTTONS: [&str; 8] = [
@@ -268,6 +276,7 @@ fn handle_playback_button(request: &Request, state: &mut FakeDmapState) -> Vec<u
     if let Some(denied) = verify_session(request, state) {
         return denied;
     }
+    verify_prompt_id(request, state);
 
     state.last_button_pressed = Some(request.last_segment().to_owned());
     state.buttons_press_count = state.buttons_press_count.saturating_add(1);
@@ -279,6 +288,7 @@ fn handle_remote_button(request: &Request, state: &mut FakeDmapState) -> Vec<u8>
     if let Some(denied) = verify_session(request, state) {
         return denied;
     }
+    verify_prompt_id(request, state);
 
     let button = parser::parse(&request.body)
         .ok()
@@ -354,60 +364,4 @@ fn handle_set_property(request: &Request, state: &mut FakeDmapState) -> Vec<u8> 
     }
 
     http_response(200, &[])
-}
-
-/// `_verify_headers` (`dmap.py:299-305`), collecting instead of asserting.
-fn verify_headers(request: &Request, state: &mut FakeDmapState) {
-    for (name, expected) in EXPECTED_HEADERS {
-        match request.header(name) {
-            Some(value) if value == expected => {}
-            Some(value) => state.protocol_errors.push(format!(
-                "{} {}: header {name} was {value:?}, expected {expected:?}",
-                request.method, request.path
-            )),
-            None => state.protocol_errors.push(format!(
-                "{} {}: header {name} is missing",
-                request.method, request.path
-            )),
-        }
-    }
-}
-
-/// `_verify_auth_parameters(check_login_id=True)` (`dmap.py:315-324`).
-fn verify_login_id(request: &Request, state: &mut FakeDmapState) {
-    let expected_hsgid = state.hsgid.clone();
-    let expected_guid = state.pairing_guid.clone();
-
-    match (request.query("hsgid"), request.query("pairing-guid")) {
-        (Some(hsgid), _) if hsgid == expected_hsgid => {}
-        (Some(hsgid), _) => state
-            .protocol_errors
-            .push(format!("hsgid {hsgid:?} does not match {expected_hsgid:?}")),
-        (None, Some(guid)) if guid == expected_guid => {}
-        (None, Some(guid)) => state.protocol_errors.push(format!(
-            "pairing-guid {guid:?} does not match {expected_guid:?}"
-        )),
-        (None, None) => state
-            .protocol_errors
-            .push("neither hsgid nor pairing-guid was sent".to_owned()),
-    }
-}
-
-/// `_verify_auth_parameters(check_session=True)` (`dmap.py:326-329`), answering rather than
-/// asserting.
-///
-/// Returns the response to send when the session is wrong, or `None` to carry on. See the module
-/// documentation on [`super`] for why this is a 403 and not a panic.
-fn verify_session(request: &Request, state: &mut FakeDmapState) -> Option<Vec<u8>> {
-    match (request.number("session-id"), state.session) {
-        (Some(sent), Some(current)) if sent == i64::from(current) => None,
-        (Some(_), _) => Some(http_response(403, &[])),
-        (None, _) => {
-            state.protocol_errors.push(format!(
-                "{} {} was sent without a session-id",
-                request.method, request.path
-            ));
-            Some(http_response(403, &[]))
-        }
-    }
 }

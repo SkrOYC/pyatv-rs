@@ -19,13 +19,23 @@ The development environment is defined by **devenv** (`devenv.nix`). The toolcha
 
 ## The quality gate — non-negotiable
 
-Before considering any change complete, the following must all pass (there is a `check` script in the devenv that runs the first three):
+Before considering any change complete, the following must all pass. The devenv `check` script runs all five, and `ci` is the same script, so the two cannot drift:
 
 ```
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --all-features          # or: cargo test --workspace --all-features
 cargo test --workspace --doc --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+```
+
+Three more checks run in CI and have their own devenv scripts, because they are slower and cover different axes. Run them when you touch dependencies, feature flags, or a public API:
+
+```
+check-features   # cargo hack --feature-powerset --workspace check --all-targets
+check-msrv       # the pinned rust-version floor from [workspace.package]; needs rustup
+cargo deny check # licences, advisories, duplicate versions, source registries
+cargo bench --no-run --workspace --all-features   # benches must keep compiling
 ```
 
 `--all-features` matters for **single-crate runs**, not for the workspace run. `pyatv-pairing`'s `test-server` feature gates its reference HAP accessory and with it every end-to-end and negative-path pairing test, so `cargo test -p pyatv-pairing` without the flag silently skips them (130 + 2 + 8 tests instead of 130 + 15 + 8 + 5 + 2). A `--workspace` run picks the feature up either way, because `pyatv-proto-companion` dev-depends on `pyatv-pairing` with `features = ["test-server"]` and Cargo unifies features across the workspace — `cargo test --workspace` and `cargo test --workspace --all-features` currently run the same 794 tests. Keep the flag in the gate anyway: it is what makes the guarantee independent of one crate's dev-dependency list.

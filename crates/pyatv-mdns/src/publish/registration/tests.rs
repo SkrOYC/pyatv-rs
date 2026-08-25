@@ -202,6 +202,176 @@ fn a_legacy_unicast_response_echoes_the_query() {
     }
 }
 
+/// RFC 6762 §6.7 and §10.2: a legacy-unicast response must not carry the cache-flush bit on *any*
+/// record, however unique that record is. The querier is a plain DNS resolver and would read the
+/// class as `0x8001`, an unknown class, rather than as `IN` with a flag on it.
+#[test]
+fn a_legacy_unicast_response_never_sets_the_cache_flush_bit() {
+    let registration = registration();
+    let query = DnsMessage {
+        questions: vec![
+            question(SERVICE_TYPE, QueryType::PTR),
+            question(&registration.instance_name(), QueryType::ANY),
+            question(HOST, QueryType::A),
+        ],
+        ..DnsMessage::new(0x35FF)
+    };
+
+    let legacy = registration
+        .respond(&query, true)
+        .expect("our own service type is answered");
+    for record in legacy.answers.iter().chain(&legacy.resources) {
+        assert_eq!(
+            record.qclass, CLASS_IN,
+            "{record:?} must be plain IN in a legacy response"
+        );
+    }
+
+    // The multicast form of the same query still sets it on the three unique record types, or
+    // stale entries would never be evicted from a real mDNS cache.
+    let multicast = registration
+        .respond(&query, false)
+        .expect("our own service type is answered");
+    let flushing: Vec<QueryType> = multicast
+        .answers
+        .iter()
+        .chain(&multicast.resources)
+        .filter(|record| record.qclass & CACHE_FLUSH != 0)
+        .map(|record| record.qtype)
+        .collect();
+    assert_eq!(flushing, vec![QueryType::SRV, QueryType::TXT, QueryType::A]);
+}
+
+/// RFC 6762 §7.1: a record the querier already holds, with at least half its TTL left, is not
+/// re-sent.
+#[test]
+fn a_known_answer_with_a_healthy_ttl_is_suppressed() {
+    let registration = registration();
+    let query = |known: Vec<crate::dns::DnsResource>| DnsMessage {
+        questions: vec![question(SERVICE_TYPE, QueryType::PTR)],
+        answers: known,
+        ..DnsMessage::new(1)
+    };
+
+    // The querier has the PTR with its full TTL: nothing left to answer, so no response at all.
+    assert!(
+        registration
+            .respond(&query(vec![registration.ptr_record(SERVICE_TTL)]), false)
+            .is_none(),
+        "a fully cached answer leaves nothing to say"
+    );
+
+    // Exactly half is still "at least half".
+    assert!(
+        registration
+            .respond(
+                &query(vec![registration.ptr_record(SERVICE_TTL / 2)]),
+                false
+            )
+            .is_none()
+    );
+
+    // A hair under half is not, so the record is refreshed.
+    let response = registration
+        .respond(
+            &query(vec![registration.ptr_record(SERVICE_TTL / 2 - 1)]),
+            false,
+        )
+        .expect("an ageing known answer is refreshed");
+    assert_eq!(response.answers.len(), 1);
+    assert_eq!(response.answers[0].ttl, SERVICE_TTL);
+}
+
+/// Suppression matches on the record, not on the name: someone else's `PTR` for our service type,
+/// or ours with different data, suppresses nothing.
+#[test]
+fn suppression_needs_the_same_record_not_just_the_same_name() {
+    let registration = registration();
+    let mut different = registration.ptr_record(SERVICE_TTL);
+    different.rd = RecordData::Ptr("someone-else._touch-remote._tcp.local".to_owned());
+
+    let response = registration
+        .respond(
+            &DnsMessage {
+                questions: vec![question(SERVICE_TYPE, QueryType::PTR)],
+                answers: vec![different],
+                ..DnsMessage::new(1)
+            },
+            false,
+        )
+        .expect("a different instance's PTR is not our known answer");
+    assert_eq!(response.answers.len(), 1);
+}
+
+/// The cache-flush bit is not part of a record's identity, so a querier echoing back what it
+/// received — bit and all — still suppresses.
+#[test]
+fn suppression_ignores_the_cache_flush_bit() {
+    let registration = registration();
+    let mut known = registration.ptr_record(SERVICE_TTL);
+    known.qclass |= CACHE_FLUSH;
+
+    assert!(
+        registration
+            .respond(
+                &DnsMessage {
+                    questions: vec![question(SERVICE_TYPE, QueryType::PTR)],
+                    answers: vec![known],
+                    ..DnsMessage::new(1)
+                },
+                false,
+            )
+            .is_none()
+    );
+}
+
+/// A legacy resolver does not do known-answer suppression, and an answer section in its query must
+/// not be read as one.
+#[test]
+fn a_legacy_query_is_answered_even_when_it_carries_the_answer() {
+    let registration = registration();
+
+    let response = registration
+        .respond(
+            &DnsMessage {
+                questions: vec![question(SERVICE_TYPE, QueryType::PTR)],
+                answers: vec![registration.ptr_record(SERVICE_TTL)],
+                ..DnsMessage::new(0x35FF)
+            },
+            true,
+        )
+        .expect("a legacy query is always answered");
+    assert_eq!(response.answers.len(), 1);
+}
+
+/// The exact multicast response bytes for a fixed query — the counterpart of the legacy-path
+/// byte-for-byte test over in the responder's own tests.
+#[test]
+fn the_multicast_response_bytes_are_stable() {
+    let registration = ServiceRegistration::new(SERVICE_TYPE, INSTANCE, HOST, 49_152)
+        .with_address(Ipv4Addr::new(10, 0, 10, 1));
+
+    let query = DnsMessage {
+        questions: vec![question(HOST, QueryType::A)],
+        ..DnsMessage::new(0x0001)
+    };
+    let wire = registration
+        .respond(&query, false)
+        .expect("our own host name is answered")
+        .pack();
+
+    assert_eq!(
+        wire,
+        vec![
+            // Header: ID zero (RFC 6762 §18.1), QR|AA, no questions, one answer.
+            0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Answer: pyatv-rs.local A IN|cache-flush, TTL 120, 10.0.10.1.
+            0x08, b'p', b'y', b'a', b't', b'v', b'-', b'r', b's', 0x05, b'l', b'o', b'c', b'a',
+            b'l', 0x00, 0x00, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04, 10, 0, 10, 1,
+        ],
+    );
+}
+
 /// A response is never answered, only queries are — otherwise two responders would loop forever.
 #[test]
 fn a_response_is_never_responded_to() {

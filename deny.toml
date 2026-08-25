@@ -51,9 +51,14 @@ exceptions = [
 ]
 
 [bans]
-# Duplicate versions are a warning, not an error: the crypto stack co-resolves cleanly today, and a
-# transitive duplicate somewhere else should not block a build. Revisit if the count grows.
-multiple-versions = "warn"
+# Duplicate versions are an error, with every duplicate that exists today enumerated in `skip`
+# below. The point of the flip is regression pressure: the five known duplicates are all inside the
+# protobuf build toolchain or the tail of the syn 2 -> syn 3 migration, i.e. things that resolve
+# themselves as upstream catches up, whereas a *new* duplicate arriving in the runtime graph is
+# something a reviewer should have to look at deliberately. Every entry below names the crate that
+# pulls it, so that when the pulling crate is bumped the entry can be deleted and the build will
+# say so if it was still needed.
+multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 
@@ -64,7 +69,26 @@ deny = [
   { name = "openssl", use-instead = "rustls" },
   { name = "openssl-sys", use-instead = "rustls" },
 ]
-skip = []
+# Exactly the duplicates present as of this commit, each pinned to the *stale* version so that a
+# third version of any of them still fails. None of these reach a shipped binary's runtime graph:
+# every one is a build-dependency of `pyatv-proto-mrp` (protobuf codegen) or a proc-macro.
+skip = [
+  # petgraph 0.8.3 (via prost-build 0.14.4, the build-dependency that generates the MRP protobuf
+  # types) still wants hashbrown 0.15; indexmap 2.14 — reached through the same petgraph and
+  # through plist — has moved to 0.17.
+  { crate = "hashbrown@0.15.5", reason = "petgraph 0.8.3 <- prost-build 0.14.4, a build-dependency of pyatv-proto-mrp" },
+  # protox-parse 0.9.0 lags one minor behind prost-reflect 0.16.5, and both are pulled by protox
+  # 0.9.1 — also a build-dependency of pyatv-proto-mrp. The three logos crates are one dependency
+  # wearing three hats (facade, derive macro, codegen backend), so they always duplicate together.
+  { crate = "logos@0.15.1", reason = "protox-parse 0.9.0 <- protox 0.9.1, a build-dependency of pyatv-proto-mrp" },
+  { crate = "logos-codegen@0.15.1", reason = "protox-parse 0.9.0 <- protox 0.9.1, a build-dependency of pyatv-proto-mrp" },
+  { crate = "logos-derive@0.15.1", reason = "protox-parse 0.9.0 <- protox 0.9.1, a build-dependency of pyatv-proto-mrp" },
+  # The syn 2 -> syn 3 transition. serde_derive, thiserror-impl, tokio-macros and clap_derive have
+  # all moved to syn 3.0.4; curve25519-dalek-derive, prost-build/prost-derive, protox's logos
+  # backends, miette-derive, prettyplease, tracing-attributes and rubato's `visibility` have not.
+  # Delete this entry once the laggards catch up — the build will tell you if it was premature.
+  { crate = "syn@2.0.119", reason = "proc-macro crates that have not yet migrated to syn 3: curve25519-dalek-derive, prost-derive, logos-codegen, miette-derive, prettyplease, tracing-attributes, visibility" },
+]
 skip-tree = []
 
 [sources]

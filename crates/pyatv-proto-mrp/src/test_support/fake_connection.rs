@@ -71,6 +71,7 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Wrap an accepted socket, subscribing it to the device's push stream.
     pub fn new(
         stream: TcpStream,
         state: Arc<FakeDeviceState>,

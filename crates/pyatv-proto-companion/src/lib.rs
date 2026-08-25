@@ -31,6 +31,7 @@
 //!   have.
 //! - A zero-length payload is never sealed, even mid-session.
 
+#![warn(missing_docs)]
 pub mod api;
 pub mod auth;
 pub mod codec;

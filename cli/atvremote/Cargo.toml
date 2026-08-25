@@ -15,6 +15,17 @@ workspace = true
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
 pyatv = { version = "0.1.0", path = "../../crates/pyatv" }
+serde_json = "1.0.151"
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+# The hermetic Companion device, so `tests/atvremote.rs` can run the real binary end to end without
+# hardware or a network. Companion alone is enough: it is the protocol that serves apps, accounts,
+# power, volume, buttons and the on-screen keyboard, which between them cover every output shape the
+# CLI has to render. `pyatv-pairing` is here for its `PIN_CODE` constant and `pyatv-core` for the
+# config types the harness builds.
+pyatv-core.workspace = true
+pyatv-pairing = { workspace = true, features = ["test-server"] }
+pyatv-proto-companion = { workspace = true, features = ["test-support"] }

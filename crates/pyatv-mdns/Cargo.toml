@@ -19,3 +19,12 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 unicode-normalization = "0.1.25"
+
+[dev-dependencies]
+# `default-features = false` drops `plotters` and `rayon`; `cargo_bench_support` is the one feature
+# `cargo bench` actually needs. See `benches/dns.rs`.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "dns"
+harness = false

@@ -4,14 +4,17 @@
 //! not relay per call. Two behaviours come straight from upstream and are easy to get wrong:
 //!
 //! * `start`/`stop` iterate **every** registered instance (`facade.py:625-634`), so a lower-priority
-//!   protocol's updater is running and warm when a takeover makes it the main one.
+//!   protocol's updater is running and warm when a takeover makes it the main one. `start` is also
+//!   where upstream subscribes — `instance.listener = self` — and `stop` where it unsubscribes
+//!   again, which is why both of those happen inside [`PushUpdater::start`] and
+//!   [`PushUpdater::stop`] here rather than in some setup step a caller has to know about.
 //! * `playstatus_update`/`playstatus_error` forward **only** the main instance's events
 //!   (`facade.py:636-644`), so a caller never sees two protocols racing to describe the same
 //!   device.
 //!
 //! Upstream can compare `updater == self.main_instance` because the callback carries the updater.
-//! [`crate::interface::PlaybackListener`] does not, so a per-protocol [`Shim`] is registered with
-//! each instance instead and remembers which protocol it belongs to.
+//! [`crate::interface::PlaybackListener`] does not, so a per-protocol shim is registered with each
+//! instance instead and remembers which protocol it belongs to.
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -57,23 +60,34 @@ impl PlaybackListener for Shim {
 #[derive(Debug)]
 pub struct FacadePushUpdater {
     relayer: Arc<Relayer<dyn PushUpdater>>,
+    /// A weak handle to this very object, so a shim can be built from `&self`.
+    ///
+    /// Every shim needs a back-reference to ask "am I still the main protocol?" at delivery time,
+    /// and only an `Arc` can give one. Subscribing therefore used to need an `Arc<Self>` receiver,
+    /// which [`PushUpdater`] cannot have and no caller reaching this object through
+    /// [`crate::interface::AppleTV::push_updater`] could ever produce — so nothing was ever
+    /// subscribed and no callback was ever delivered. Keeping the [`Weak`] from
+    /// [`Arc::new_cyclic`] removes the need for the receiver entirely.
+    this: Weak<Self>,
     listener: Mutex<Option<Weak<dyn PlaybackListener>>>,
     /// The shims registered with the protocol updaters.
     ///
     /// They have to be owned here: [`PushUpdater::set_listener`] holds its listener weakly, so a
-    /// shim nobody keeps alive is unsubscribed the instant it is registered.
+    /// shim nobody keeps alive is unsubscribed the instant it is registered. Dropping them is
+    /// therefore also how [`PushUpdater::stop`] performs upstream's `instance.listener = None`.
     shims: Mutex<Vec<Arc<Shim>>>,
 }
 
 impl FacadePushUpdater {
     /// Fan out over `relayer`.
     ///
-    /// Returns an `Arc` because each [`Shim`] holds a [`Weak`] back to the facade, which is how it
-    /// asks "am I still the main protocol?" at delivery time rather than at registration time.
+    /// Returns an `Arc` because the shims registered with each protocol hold a [`Weak`] back to
+    /// this object; see the `this` field.
     #[must_use]
     pub fn new(relayer: Arc<Relayer<dyn PushUpdater>>) -> Arc<Self> {
-        Arc::new_cyclic(|_| Self {
+        Arc::new_cyclic(|this| Self {
             relayer,
+            this: this.clone(),
             listener: Mutex::new(None),
             shims: Mutex::new(Vec::new()),
         })
@@ -86,11 +100,11 @@ impl FacadePushUpdater {
             .and_then(|slot| slot.as_ref().and_then(Weak::upgrade))
     }
 
-    /// Register a shim with every protocol updater that does not already have one.
+    /// Subscribe one shim to every registered protocol updater, replacing any earlier set.
     ///
     /// `for instance in self.instances: instance.listener = self` (`facade.py:625-627`), except
     /// that each instance gets its own shim so the protocol it belongs to is recoverable.
-    fn attach(self: &Arc<Self>) {
+    fn attach(&self) {
         let Ok(mut shims) = self.shims.lock() else {
             return;
         };
@@ -101,33 +115,18 @@ impl FacadePushUpdater {
             };
             let shim = Arc::new(Shim {
                 protocol,
-                facade: Arc::downgrade(self),
+                facade: self.this.clone(),
             });
             instance.set_listener(&(Arc::clone(&shim) as Arc<dyn PlaybackListener>));
             shims.push(shim);
         }
     }
 
-    /// Start every registered updater.
-    ///
-    /// The trait's [`PushUpdater::start`] cannot do this, because attaching the shims needs an
-    /// `Arc<Self>` and the trait method only has `&self`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first failure any protocol's `start` reported, after having tried all of them —
-    /// one protocol refusing to start must not leave the others un-started.
-    pub async fn start_all(self: &Arc<Self>, initial_delay_ms: u64) -> Result<()> {
-        self.attach();
-
-        let mut first_error = None;
-        for instance in self.relayer.instances() {
-            if let Err(error) = instance.start(initial_delay_ms).await {
-                tracing::debug!(%error, "a push updater did not start");
-                first_error.get_or_insert(error);
-            }
+    /// Unsubscribe from every protocol updater, which is `instance.listener = None`.
+    fn detach(&self) {
+        if let Ok(mut shims) = self.shims.lock() {
+            shims.clear();
         }
-        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -145,13 +144,20 @@ impl PushUpdater for FacadePushUpdater {
         }
     }
 
-    /// Start every registered updater, without re-attaching the shims.
+    /// Subscribe to and then start every registered updater (`facade.py:620-627`).
     ///
-    /// [`FacadePushUpdater::start_all`] is the full version; this exists because the trait is
-    /// object-safe and cannot take `Arc<Self>`. Callers reaching the facade through
-    /// [`crate::interface::AppleTV::push_updater`] get an updater whose shims were attached when
-    /// the facade handed it out, so both paths behave the same.
+    /// Subscribing here rather than at construction time is what makes
+    /// `atv.push_updater().set_listener(&mine)` followed by `start(0)` deliver callbacks with no
+    /// further step, and it is also upstream's own ordering: a protocol that registered after the
+    /// last `start` is picked up by the next one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failure any protocol's `start` reported, after having tried all of them —
+    /// one protocol refusing to start must not leave the others un-started.
     fn start(&self, initial_delay_ms: u64) -> BoxFuture<'_, Result<()>> {
+        self.attach();
+
         Box::pin(async move {
             let mut first_error = None;
             for instance in self.relayer.instances() {
@@ -164,8 +170,9 @@ impl PushUpdater for FacadePushUpdater {
         })
     }
 
-    /// Stop every registered updater (`facade.py:629-634`).
+    /// Unsubscribe from and then stop every registered updater (`facade.py:629-634`).
     fn stop(&self) {
+        self.detach();
         for instance in self.relayer.instances() {
             instance.stop();
         }
@@ -254,21 +261,25 @@ mod tests {
             Arc::new(Relayer::new(DEFAULT_PRIORITIES.to_vec()));
         let mrp = Arc::new(Dummy::default());
         let dmap = Arc::new(Dummy::default());
-        relayer.register(
-            Protocol::Mrp,
-            Arc::clone(&mrp) as Arc<dyn PushUpdater>,
-            BTreeSet::new(),
-        );
-        relayer.register(
-            Protocol::Dmap,
-            Arc::clone(&dmap) as Arc<dyn PushUpdater>,
-            BTreeSet::new(),
-        );
+        relayer
+            .register(
+                Protocol::Mrp,
+                Arc::clone(&mrp) as Arc<dyn PushUpdater>,
+                BTreeSet::new(),
+            )
+            .expect("the protocol is in the priority list");
+        relayer
+            .register(
+                Protocol::Dmap,
+                Arc::clone(&dmap) as Arc<dyn PushUpdater>,
+                BTreeSet::new(),
+            )
+            .expect("the protocol is in the priority list");
 
         let facade = FacadePushUpdater::new(Arc::clone(&relayer));
         let saving = Arc::new(Saving::default());
         facade.set_listener(&(Arc::clone(&saving) as Arc<dyn PlaybackListener>));
-        facade.start_all(0).await.expect("both start");
+        facade.start(0).await.expect("both start");
 
         assert!(mrp.active() && dmap.active(), "every instance is started");
 
@@ -293,5 +304,50 @@ mod tests {
 
         facade.stop();
         assert!(!mrp.active() && !dmap.active(), "and every instance stops");
+    }
+
+    /// The regression this module's `this` field exists for: everything a library caller can reach
+    /// is `&dyn PushUpdater`, and subscribing used to need an `Arc<Self>` receiver they had no way
+    /// to name — so `set_listener` + `start` compiled, connected, and delivered nothing.
+    #[tokio::test]
+    async fn the_trait_object_path_delivers_updates() {
+        let relayer: Arc<Relayer<dyn PushUpdater>> =
+            Arc::new(Relayer::new(DEFAULT_PRIORITIES.to_vec()));
+        let mrp = Arc::new(Dummy::default());
+        relayer
+            .register(
+                Protocol::Mrp,
+                Arc::clone(&mrp) as Arc<dyn PushUpdater>,
+                BTreeSet::new(),
+            )
+            .expect("the protocol is in the priority list");
+
+        let updater = FacadePushUpdater::new(relayer) as Arc<dyn PushUpdater>;
+        let saving = Arc::new(Saving::default());
+        updater.set_listener(&(Arc::clone(&saving) as Arc<dyn PlaybackListener>));
+        updater.start(0).await.expect("MRP starts");
+
+        mrp.post("through-the-trait");
+        assert_eq!(
+            *saving.titles.lock().expect("uncontended"),
+            vec!["through-the-trait"]
+        );
+
+        // `stop` is upstream's `instance.listener = None`, so a late update is dropped...
+        updater.stop();
+        mrp.post("after-stop");
+        assert_eq!(
+            saving.titles.lock().expect("uncontended").len(),
+            1,
+            "a stopped updater must not forward anything"
+        );
+
+        // ...and starting again re-subscribes rather than staying deaf.
+        updater.start(0).await.expect("MRP restarts");
+        mrp.post("after-restart");
+        assert_eq!(
+            *saving.titles.lock().expect("uncontended"),
+            vec!["through-the-trait", "after-restart"]
+        );
     }
 }

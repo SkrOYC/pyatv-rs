@@ -31,6 +31,13 @@ pub use wire::{Field, Scanner, WireType};
               not ours to restyle. Deliberately narrower than `clippy::all`, which it does not \
               trip, so a real correctness lint on generated code would still be a build failure."
 )]
+#[allow(
+    missing_docs,
+    reason = "prost-build emits no doc comments for a corpus whose .proto files carry none, which \
+              is 1103 undocumented items copied verbatim from pyatv. The crate-level \
+              `warn(missing_docs)` is what this exempts, and it still applies to every \
+              hand-written item outside this module."
+)]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/mrp_protobuf.rs"));
 }

@@ -248,3 +248,160 @@ fn the_peer_is_whatever_the_srv_record_said() {
     let client = HttpClient::new("192.0.2.10:3689".parse().expect("valid address"));
     assert_eq!(client.peer().port(), 3689);
 }
+
+// ---- Request splitting ----
+
+/// A client aimed at TEST-NET-1, which nothing answers: any test using it asserts that the request
+/// was refused *before* a socket was opened, because otherwise it would hang for `CONNECT_TIMEOUT`.
+fn unreachable_client() -> HttpClient {
+    HttpClient::new("192.0.2.10:3689".parse().expect("valid address"))
+}
+
+/// The credential from the review: `classify` accepts it as a pairing GUID because the match is
+/// anchored only at the start, `mkurl` interpolates it, and unchecked it would end the request line
+/// and let the rest of the string become headers of the attacker's choosing.
+#[test]
+fn a_credential_carrying_a_crlf_cannot_reach_the_wire() {
+    const INJECTED: &str = "0x0000000000000001\r\nX-Injected: 1";
+
+    // The credential parser still accepts it — that parity with `re.match` is deliberate.
+    let url = crate::daap::url::mkurl(crate::daap::url::LOGIN_CMD, INJECTED, 0, false, true)
+        .expect("a prefix match classifies");
+    assert!(url.contains("\r\n"), "the URL really does carry the CRLF");
+
+    let error = unreachable_client()
+        .encode(&get(&url, &[]))
+        .expect_err("a request line cannot carry a CRLF");
+    assert!(
+        error.to_string().contains("request path contains"),
+        "{error}"
+    );
+}
+
+/// Every byte HTTP forbids in a request target, not just the two that split a request.
+#[test]
+fn a_request_target_rejects_every_non_visible_byte() {
+    let client = unreachable_client();
+
+    for path in [
+        "login?x=\r\nX: 1",
+        "login?x=\ry",
+        "login?x=\ny",
+        "login?x=a b",
+        "login?x=\0",
+        "login?x=\u{7f}",
+        "login?x=caf\u{e9}",
+    ] {
+        assert!(
+            client.encode(&get(path, &[])).is_err(),
+            "{path:?} should be refused"
+        );
+    }
+
+    // Everything DAAP actually sends is visible ASCII and must still go through.
+    for path in [
+        "login?pairing-guid=0x0000000000000001&hasFP=1",
+        "ctrl-int/1/playstatusupdate?session-id=55555&revision-number=0",
+        "ctrl-int/1/setproperty?dacp.playingtime=45000&session-id=55555",
+        "ctrl-int/1/nowplayingartwork?mw=123&mh=456&session-id=55555",
+    ] {
+        assert!(
+            client.encode(&get(path, &[])).is_ok(),
+            "{path:?} should be accepted"
+        );
+    }
+}
+
+/// A caller-supplied header is the same hole one field further down.
+#[test]
+fn a_header_cannot_split_the_request_either() {
+    let client = unreachable_client();
+
+    for (name, value) in [
+        ("User-Agent", "Remote/1021\r\nX-Injected: 1"),
+        ("User-Agent", "Remote/1021\r"),
+        ("User-Agent", "Remote/1021\n"),
+        ("User-Agent", "Remote\u{0}1021"),
+        ("User-Agent\r\nX-Injected: 1", "Remote/1021"),
+        ("User Agent", "Remote/1021"),
+        ("User:Agent", "Remote/1021"),
+        ("", "Remote/1021"),
+    ] {
+        assert!(
+            client.encode(&get("login", &[(name, value)])).is_err(),
+            "{name:?}: {value:?} should be refused"
+        );
+    }
+
+    // The seven real DAAP headers must all still be encodable.
+    let headers = crate::daap::DMAP_HEADERS;
+    assert!(client.encode(&get("login", &headers)).is_ok());
+}
+
+// ---- Body cap ----
+
+/// A device — or anything answering on its address — must not be able to name a body size that
+/// this client will try to hold in memory.
+#[tokio::test]
+async fn a_content_length_over_the_cap_is_refused_before_any_body_is_read() {
+    let declared = super::MAX_BODY_LEN + 1;
+    let (client, _server) =
+        serve_once(format!("HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\n\r\n").into_bytes())
+            .await;
+
+    let error = client
+        .send(&get("whatever", &[]))
+        .await
+        .expect_err("an oversized body must be refused");
+    assert!(error.to_string().contains("exceeds"), "{error}");
+}
+
+/// The same cap on a body that never declares a length at all.
+#[tokio::test]
+async fn a_body_delimited_by_eof_is_capped_too() {
+    let mut reply = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+    reply.resize(reply.len() + super::MAX_BODY_LEN + 1024, b'x');
+
+    let (client, _server) = serve_once(reply).await;
+    let error = client
+        .send(&get("whatever", &[]))
+        .await
+        .expect_err("an unbounded body must be refused");
+    assert!(error.to_string().contains("exceeds"), "{error}");
+}
+
+/// A chunked body reassembled across several reads, with the split landing inside a chunk rather
+/// than on a boundary — the case a decoder that restarts from byte zero gets right by accident and
+/// an incremental one has to get right on purpose.
+#[tokio::test]
+async fn a_chunked_body_split_mid_chunk_across_reads_is_reassembled() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("loopback bind");
+    let address = listener.local_addr().expect("bound");
+
+    let _server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("one connection");
+        let mut discard = [0u8; 4096];
+        let _ = stream.read(&mut discard).await;
+
+        // Three writes, each cutting a chunk in half.
+        for piece in [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chun".as_slice(),
+            b"ked\r\n\r\n4\r\nWi".as_slice(),
+            b"ki\r\n5\r\npe".as_slice(),
+            b"dia\r\n0\r\n\r\n".as_slice(),
+        ] {
+            stream.write_all(piece).await.expect("write");
+            stream.flush().await.expect("flush");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        stream.shutdown().await.expect("shutdown");
+    });
+
+    let response = HttpClient::new(address)
+        .send(&get("whatever", &[]))
+        .await
+        .expect("succeeds");
+    assert_eq!(response.body, b"Wikipedia");
+}

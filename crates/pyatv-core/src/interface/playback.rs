@@ -14,7 +14,13 @@ use crate::models::{App, ArtworkInfo, MediaMetadata, MediaSource, Playing};
 /// [`crate::Error::ConnectionLost`] if the transport dropped mid-request.
 pub trait Metadata: Send + Sync + std::fmt::Debug {
     /// Stable identifier of the device this metadata came from.
-    fn device_id(&self) -> Option<&str>;
+    ///
+    /// Owned rather than borrowed. Upstream's `device_id` is a plain `Optional[str]` property
+    /// (`pyatv/interface.py:610-613`) and every implementation returns a short identifier copied
+    /// out of the config, so the allocation is negligible — whereas a borrow cannot be relayed:
+    /// [`crate::facade::FacadeMetadata`] resolves which protocol answers on each call and would
+    /// have to return a reference into an `Arc` it only holds for the duration of that call.
+    fn device_id(&self) -> Option<String>;
 
     /// A snapshot of the current playback state.
     fn playing(&self) -> BoxFuture<'_, Result<Playing>>;
@@ -36,7 +42,7 @@ pub trait Metadata: Send + Sync + std::fmt::Debug {
 
 /// Receives push-based playback updates.
 ///
-/// Implemented by the caller and registered with [`PushUpdater::add_listener`].
+/// Implemented by the caller and registered with [`PushUpdater::set_listener`].
 pub trait PlaybackListener: Send + Sync + std::fmt::Debug {
     /// A new playback state arrived.
     fn playstatus_update(&self, playing: &Playing);

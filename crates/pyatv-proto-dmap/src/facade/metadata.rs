@@ -117,8 +117,8 @@ impl DmapMetadata {
 
 impl Metadata for DmapMetadata {
     /// `device_id` (`__init__.py:404-407`): whatever `core.config.identifier` was at setup.
-    fn device_id(&self) -> Option<&str> {
-        self.identifier.as_deref()
+    fn device_id(&self) -> Option<String> {
+        self.identifier.clone()
     }
 
     /// `playing` (`__init__.py:443-445`): a fresh `playstatusupdate` from revision zero.

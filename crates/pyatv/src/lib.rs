@@ -1,6 +1,6 @@
 //! Pure-Rust client for Apple TV and AirPlay devices.
 //!
-//! This is the crate applications depend on. It owns the three entry points pyatv exposes — [`scan`], [`pair`] and [`connect`] — and is the only place in the workspace that knows about every protocol at once. Everything else is either protocol-agnostic (`pyatv-core`) or knows about exactly one protocol.
+//! This is the crate applications depend on. It owns the three entry points pyatv exposes — [`scan()`], [`pair()`] and [`connect()`] — and is the only place in the workspace that knows about every protocol at once. Everything else is either protocol-agnostic (`pyatv-core`) or knows about exactly one protocol.
 //!
 //! ```text
 //! scan()    -> discovery finds devices and their services
@@ -10,10 +10,11 @@
 //!
 //! The layering is deliberately one-directional: `pyatv-core` defines the traits, the protocol crates implement them, and this crate wires the implementations into `pyatv_core::facade::FacadeAppleTV`. No protocol crate depends on another, and none of them depend on this one, so a protocol can be developed and tested in isolation.
 //!
-//! That rule is also why [`tunnel`] exists here rather than in either crate it joins. On tvOS 15 and later an Apple TV stops advertising `_mediaremotetv._tcp` altogether and MRP is reachable only inside an AirPlay 2 data-stream channel — so somebody has to name both `pyatv-proto-airplay`'s channel and `pyatv-proto-mrp`'s transport in one place, and this is the only crate allowed to.
+//! That rule is also why the [`tunnel`] module exists here rather than in either crate it joins. On tvOS 15 and later an Apple TV stops advertising `_mediaremotetv._tcp` altogether and MRP is reachable only inside an AirPlay 2 data-stream channel — so somebody has to name both `pyatv-proto-airplay`'s channel and `pyatv-proto-mrp`'s transport in one place, and this is the only crate allowed to.
 //!
 //! See `docs/research/pyatv-architecture.md` for the upstream design this reproduces.
 
+#![warn(missing_docs)]
 pub mod connect;
 pub mod helpers;
 pub mod pair;

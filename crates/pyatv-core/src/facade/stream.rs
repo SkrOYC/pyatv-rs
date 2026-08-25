@@ -160,26 +160,30 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let relayer: Arc<Relayer<dyn Stream>> = Arc::new(Relayer::new(DEFAULT_PRIORITIES.to_vec()));
 
-        relayer.register(
-            Protocol::AirPlay,
-            Arc::new(Recorder {
-                name: "airplay",
-                calls: Arc::clone(&calls),
-            }),
-            [FeatureName::PlayUrl, FeatureName::Stop]
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-        );
-        relayer.register(
-            Protocol::Raop,
-            Arc::new(Recorder {
-                name: "raop",
-                calls: Arc::clone(&calls),
-            }),
-            [FeatureName::StreamFile, FeatureName::Volume]
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-        );
+        relayer
+            .register(
+                Protocol::AirPlay,
+                Arc::new(Recorder {
+                    name: "airplay",
+                    calls: Arc::clone(&calls),
+                }),
+                [FeatureName::PlayUrl, FeatureName::Stop]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+            )
+            .expect("the protocol is in the priority list");
+        relayer
+            .register(
+                Protocol::Raop,
+                Arc::new(Recorder {
+                    name: "raop",
+                    calls: Arc::clone(&calls),
+                }),
+                [FeatureName::StreamFile, FeatureName::Volume]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+            )
+            .expect("the protocol is in the priority list");
 
         (
             FacadeStream::new(relayer, Arc::new(OneFeature(available))),
@@ -229,14 +233,16 @@ mod tests {
     async fn an_undeclared_method_is_not_supported() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let relayer: Arc<Relayer<dyn Stream>> = Arc::new(Relayer::new(DEFAULT_PRIORITIES.to_vec()));
-        relayer.register(
-            Protocol::AirPlay,
-            Arc::new(Recorder {
-                name: "airplay",
-                calls: Arc::clone(&calls),
-            }),
-            [FeatureName::PlayUrl].into_iter().collect::<BTreeSet<_>>(),
-        );
+        relayer
+            .register(
+                Protocol::AirPlay,
+                Arc::new(Recorder {
+                    name: "airplay",
+                    calls: Arc::clone(&calls),
+                }),
+                [FeatureName::PlayUrl].into_iter().collect::<BTreeSet<_>>(),
+            )
+            .expect("the protocol is in the priority list");
         let stream = FacadeStream::new(relayer, Arc::new(OneFeature(None)));
 
         let error = stream
