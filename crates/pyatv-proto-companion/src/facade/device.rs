@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pyatv_core::interface::{Apps, Audio, BoxFuture, Power, UserAccounts, not_supported};
-use pyatv_core::{App, Error, PowerState, Result, UserAccount};
+use pyatv_core::{App, Error, OutputDevice, PowerState, Result, UserAccount};
 use pyatv_opack::Value;
 
 use crate::api::commands::HidCommand;
@@ -249,7 +249,14 @@ impl Audio for CompanionAudio {
         self.api.observed().volume
     }
 
-    fn set_volume(&self, level: f32) -> BoxFuture<'_, Result<()>> {
+    /// `output_device` is ignored: Companion has no way to address one speaker in a group, and
+    /// upstream's `CompanionAudio.set_volume` likewise takes the argument and never reads it
+    /// (`__init__.py:461-470`).
+    fn set_volume(
+        &self,
+        level: f32,
+        _output_device: Option<&OutputDevice>,
+    ) -> BoxFuture<'_, Result<()>> {
         let api = Arc::clone(&self.api);
         self.gated(async move { api.set_volume(level).await })
     }
@@ -272,7 +279,7 @@ impl Audio for CompanionAudio {
     }
 
     /// Not implemented by Companion: `AirPlay` 2 owns output-device grouping.
-    fn output_devices(&self) -> Vec<String> {
+    fn output_devices(&self) -> Vec<OutputDevice> {
         Vec::new()
     }
 

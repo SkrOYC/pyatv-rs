@@ -126,7 +126,7 @@ pub fn lookup_os_from_identifier(identifier: &str) -> OperatingSystem {
 ///
 /// Note that this disagrees with [`super::DeviceInfo::operating_system`] on two models: here
 /// `Gen2`/`Gen3` are [`OperatingSystem::Legacy`] (which is correct — they ran Apple TV Software,
-/// not tvOS), while `DeviceInfo` reports them as [`OperatingSystem::TvOS`]. Both behaviours are
+/// not tvOS), while `DeviceInfo` reports them as [`OperatingSystem::TvOs`]. Both behaviours are
 /// upstream's and both are asserted by upstream's own tests, so both are reproduced.
 #[must_use]
 pub fn lookup_os_from_model(model: DeviceModel) -> OperatingSystem {

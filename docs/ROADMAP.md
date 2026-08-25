@@ -33,18 +33,24 @@ Delivered on `feat/companion`. Live-verified against the Apple TV 4K (tvOS 27): 
 
 `pyatv-opack` (serializer/deserializer with aggressive round-trip tests) plus `pyatv-proto-companion`: the 4-byte frame header, OPACK payloads, Companion's distinct 12-byte-counter ChaCha20 nonce layout, and the Companion services (app launch/list, keyboard, touch gestures, power, media). Companion is chosen before MRP because it does not require the AirPlay tunnel and exercises pairing + OPACK + the facade wiring in one comparatively self-contained protocol. Deliverable: `atvremote` can launch apps and send remote-control input via Companion. (`docs/research/mrp-companion.md`)
 
-## Step 4 — AirPlay 2 control channel + MRP tunnel + MRP (in progress, branch `feat/airplay-mrp-tunnel`)
+## Step 4 — AirPlay 2 control channel + MRP tunnel + MRP ✅
 
-Reordered from the original plan: on tvOS 15+ MRP exists only inside the AirPlay 2 remote-control tunnel, and the live device (tvOS 27) confirmed that the tunnel authenticates with the Companion pairing's HAP credentials (no AirPlay PIN needed; transient refused) — `docs/research/airplay-tunnel-auth-experiment-2026-08-24.md`. So the AirPlay control session, event channel and data-stream channel land here together with the MRP protocol, and Step 5 keeps only play_url and the RAOP prerequisites. Spec of record: `docs/research/airplay-control-mrp-tunnel-port-spec.md`. Landed: the AirPlay side (`Ap2Session`, `EventChannel`, `DataStreamChannel`, live bring-up verified to the data socket).
+Reordered from the original plan: on tvOS 15+ MRP exists only inside the AirPlay 2 remote-control tunnel, and the live device (tvOS 27) confirmed that the tunnel authenticates with the Companion pairing's HAP credentials (no AirPlay PIN needed; transient refused) — `docs/research/airplay-tunnel-auth-experiment-2026-08-24.md`. So the AirPlay control session, event channel and data-stream channel land here together with the MRP protocol, and Step 5 keeps only play_url and the RAOP prerequisites. Spec of record: `docs/research/airplay-control-mrp-tunnel-port-spec.md`. Delivered on `feat/airplay-mrp-tunnel` (commits 7dc4625..a5e2202) and **live-verified**: `atvremote playing` returns the device's current item over AirPlay → data stream → MRP, `push_updates` holds the tunnel with keepalives, `device_info` gains the build number. Real-hardware findings: tvOS 27 sends ~8.9 KB HAP blocks (L11), pyatv's vendored AudioRoute.proto is wrong for tvOS 27 (L12), volume availability never arrives over the tunnel (L13).
 
 
 `pyatv-proto-mrp`: vendor pyatv's `.proto` files, spike prost/protox against the proto2 extension layout (fall back to `rust-protobuf` if extensions don't compile), implement the varint-length-prefixed protobuf framing and the MRP state machine behind the `MrpTransport` trait, first over **direct TCP** (older devices), then over the **AirPlay 2 data-stream tunnel** for tvOS 15+. This is the richest metadata/now-playing source and the default top-priority protocol in the facade. Deliverable: live now-playing metadata and push updates. (`docs/research/mrp-companion.md`)
 
-## Step 5 — AirPlay control + play_url
+## Step 5 — AirPlay play_url ✅ (hermetic; live run pending a human at the TV)
+
+Delivered in a5e2202 (`pyatv_proto_airplay::stream`): AirPlay 1 and 2 flows with pyatv-extracted golden bodies and socket-level tests. `crates/pyatv-proto-airplay/examples/airplay_play_url_probe.rs` is the live check — it plays video on the device, so it has not been run autonomously. Spec: `docs/research/airplay-playurl-raop-port-spec.md`.
+
 
 `pyatv-proto-airplay`: the custom RTSP/HTTP-on-one-socket codec, the auth flavors (legacy device-auth, HAP transient, HAP normal — gated by the mDNS feature/status flags), the event and data-stream channels, and `play_url` streaming of a URL to the device. This phase also delivers the AirPlay side of the MRP tunnel that Step 4 rides on, so there is a dependency/ordering nuance: the tunnel transport itself belongs here even though MRP messages ride it. Deliverable: `atvremote play_url` works; AirPlay-tunneled MRP is available to modern devices. (`docs/research/airplay-raop-dmap.md`)
 
-## Step 6 — RAOP audio streaming
+## Step 6 — RAOP audio streaming ✅ (hermetic; live run pending a human at the TV)
+
+Delivered in a5e2202 (`pyatv_proto_airplay::{raop,audio}`): both generations, RTP/AEAD/sync/timing packets pinned by 16 pyatv-generated KATs, symphonia + rubato decode to 44.1 kHz s16 stereo, raw PCM as pyatv sends (the ALAC question in L3 is closed: pyatv never reads `cn` and ships no encoder). `examples/raop_stream_probe.rs` requires `PROBE_CONFIRM=yes` because it plays audio and changes volume.
+
 
 The RAOP sender in `pyatv-proto-airplay` (or a dedicated `pyatv-proto-raop` if it grows): RTSP ANNOUNCE/SETUP/RECORD/SET_PARAMETER/FLUSH/TEARDOWN, RTP audio packetization, timing/control UDP channels, metadata/artwork/progress, and volume. Decode input media with `symphonia`, resample with `rubato`. **Open question to resolve first:** whether current devices need ALAC encoding or accept raw PCM (L16) — pyatv's SDP template suggests PCM; confirm with a live capture before pulling in an ALAC encoder. Deliverable: `atvremote stream_file` plays local audio to a device. (`docs/research/airplay-raop-dmap.md`, `docs/research/rust-crates.md`)
 

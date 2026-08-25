@@ -22,20 +22,22 @@
 //!
 //! Companion, `AirPlay`, RAOP and MRP — the last over its own socket when the device still
 //! advertises `_mediaremotetv._tcp`, and otherwise through the `AirPlay` tunnel, which is the only
-//! way in on tvOS 15 and later. DMAP is recognised and skipped with a debug log until its own
-//! `setup()` lands; see `docs/ROADMAP.md`.
+//! way in on tvOS 15 and later — plus DMAP for Apple TV generations 1 to 3.
 
 mod mrp;
 
 use std::sync::Arc;
 
-use pyatv_core::facade::{DEFAULT_PRIORITIES, FacadeAppleTV, ListenerHub, SetupData};
+use pyatv_core::facade::{
+    DEFAULT_PRIORITIES, FacadeAppleTV, ListenerHub, SetupData, StateDispatcher,
+};
 use pyatv_core::interface::{AppleTV, DeviceListener, PowerListener};
 use pyatv_core::storage::{Settings, Storage};
 use pyatv_core::{BaseConfig, BaseService, Error, Protocol, Result};
 use pyatv_proto_airplay::raop::{RaopSetupOptions, setup as raop_setup};
 use pyatv_proto_airplay::{AirPlaySetupOptions, setup as airplay_setup};
 use pyatv_proto_companion::facade::{CompanionSetupOptions, setup as companion_setup};
+use pyatv_proto_dmap::facade::{self as dmap, DmapSetupOptions, setup as dmap_setup};
 
 /// Connect to a device over every enabled protocol.
 ///
@@ -184,6 +186,7 @@ async fn setup_protocol(
                 info: settings.info.clone(),
                 listener: Some(Arc::clone(listeners) as Arc<dyn DeviceListener>),
                 power_listener: Some(Arc::clone(listeners) as Arc<dyn PowerListener>),
+                state_dispatcher: Some(Arc::clone(listeners) as Arc<dyn StateDispatcher>),
             };
             Ok(companion_setup(options)
                 .await
@@ -199,6 +202,10 @@ async fn setup_protocol(
             let mut registrations = vec![airplay_setup(&AirPlaySetupOptions {
                 service: service.clone(),
                 address: config.address,
+                // `partial(atv.takeover, proto)` (`pyatv/__init__.py:138`): `play_url` claims
+                // `RemoteControl` for the duration of a playback, so `stop()` reaches the AirPlay
+                // stream rather than MRP while a URL is playing.
+                takeover: Some(facade.takeover_handle(Protocol::AirPlay)),
                 // `parse_credentials(service.credentials)` upstream (`__init__.py:84`); this port
                 // also accepts another service's HAP pairing, for the reason
                 // `pyatv_proto_airplay::setup::play_credentials` documents.
@@ -250,15 +257,47 @@ async fn setup_protocol(
                         tracing::debug!(%error, "unusable RAOP credentials, streaming unpaired");
                     })
                     .unwrap_or_default(),
+                protocol_version: settings.protocols.raop.protocol_version,
+                // `core.takeover(Audio, Metadata, PushUpdater, RemoteControl)` around
+                // `stream_file` (`raop/__init__.py:350-352`), so `playing()` describes the track
+                // being streamed and `stop()` ends the stream.
+                takeover: Some(facade.takeover_handle(Protocol::Raop)),
+                state_dispatcher: Some(Arc::clone(listeners) as Arc<dyn StateDispatcher>),
             })])
         }
-        // TODO(step-5): wire DMAP setup() when it lands. Skipping keeps a device with one working
-        // protocol usable instead of failing the whole connect.
-        other @ Protocol::Dmap => {
-            tracing::debug!(protocol = ?other, "skipping a protocol this build cannot connect yet");
-            Ok(Vec::new())
+        Protocol::Dmap => {
+            // `_device_info` re-reads the TXT records per service type after connecting
+            // (`pyatv/protocols/dmap/__init__.py:696-704`), so the setup is told which of DMAP's
+            // three service types this device actually answered under. `_hscp._tcp.local` is the
+            // one that changes the answer: it means desktop Music, not an Apple TV.
+            let service_types = dmap_service_types(config);
+            Ok(vec![
+                dmap_setup(DmapSetupOptions {
+                    peer: std::net::SocketAddr::new(config.address, service.port),
+                    service: service.clone(),
+                    identifier: config.identifier().map(str::to_owned),
+                    service_types,
+                    listener: Some(Arc::clone(listeners) as Arc<dyn DeviceListener>),
+                })
+                .await
+                .map_err(pyatv_core::Error::from)?,
+            ])
         }
     }
+}
+
+/// Which of DMAP's three DNS-SD service types this device was seen under.
+///
+/// `for service_type in scan().keys(): properties = config.properties.get(service_type)`
+/// (`pyatv/protocols/dmap/__init__.py:696-704`). A manually configured service has no TXT records
+/// at all, so the list comes back empty and DMAP claims nothing about the hardware — which is
+/// upstream's behaviour too, and better than asserting a legacy OS on no evidence.
+fn dmap_service_types(config: &BaseConfig) -> Vec<String> {
+    dmap::SERVICE_TYPES
+        .into_iter()
+        .filter(|service_type| config.has_properties(service_type))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Copy stored credentials, passwords and identifiers onto the config's services.

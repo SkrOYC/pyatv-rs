@@ -282,7 +282,7 @@ impl NameCompressor {
 ///
 /// * [`DnsError::UnexpectedEof`] if the name runs past the end of the message.
 /// * [`DnsError::OffsetOutOfBounds`] if a compression pointer addresses a byte outside the message.
-/// * [`DnsError::CompressionLoop`] if pointers chain more than [`MAX_POINTER_JUMPS`] times. pyatv
+/// * [`DnsError::CompressionLoop`] if pointers chain more than `MAX_POINTER_JUMPS` times. pyatv
 ///   would loop forever here.
 /// * [`DnsError::ReservedLabelType`] for the `01` and `10` label-type flags, which RFC 1035 section
 ///   4.1.4 reserves. pyatv asserts on these, which is a crash on malformed input.

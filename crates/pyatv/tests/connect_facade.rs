@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use pyatv::{DeviceListener, DeviceState, FeatureName, FeatureState, InputAction, PowerState};
 use pyatv_core::consts::Protocol;
 
-use support::{FakeAppleTv, until};
+use support::{FakeAppleTv, until, until_async};
 
 /// A listener that only counts, so a test can assert on what did *not* happen.
 #[derive(Debug, Default)]
@@ -329,5 +329,100 @@ async fn a_device_initiated_close_tears_the_airplay_session_down() {
         airplay_state.feedbacks.load(Ordering::SeqCst),
         feedbacks,
         "the AirPlay keepalive must stop when the device ends the session"
+    );
+}
+
+/// Streaming and video-playing coexist on one device, each reaching the right protocol.
+///
+/// This is the case per-trait relaying gets wrong. `AirPlay` and RAOP both register a `Stream`;
+/// `AirPlay` outranks RAOP (`pyatv/core/facade.py:37-43`) and implements only `play_url`, RAOP only
+/// `stream_file` — so a facade that picks one instance for the whole trait makes `stream_file`
+/// unreachable on every device that advertises both, which is every modern Apple TV. Upstream
+/// resolves it per method in `Relayer._find_instance` (`pyatv/core/relayer.py:96-115`).
+///
+/// The third assertion is the RAOP takeover (`pyatv/protocols/raop/__init__.py:350-352`): while the
+/// stream runs, `metadata()` must describe the track being streamed rather than whatever MRP was
+/// showing before.
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_file_reaches_raop_while_play_url_reaches_airplay() {
+    let device = FakeAppleTv::start_with_raop().await;
+    device.arrange_mrp(|state| state.example_video());
+
+    let atv = device.connect().await;
+    let raop_state = device
+        .raop
+        .as_ref()
+        .expect("the harness started a RAOP receiver")
+        .state();
+
+    assert_eq!(
+        atv.features().get_feature(FeatureName::StreamFile).state,
+        FeatureState::Available,
+        "RAOP must declare StreamFile or the relayer has nowhere to send it"
+    );
+
+    let stream = atv.stream().expect("a stream is registered");
+
+    // ---- stream_file: RAOP, despite AirPlay outranking it ----
+    let source = pyatv::MediaSource::Bytes(support::sine_wav(0.2));
+    let metadata = pyatv::MediaMetadata {
+        title: Some("Ported Track".to_owned()),
+        artist: Some("pyatv-rs".to_owned()),
+        ..pyatv::MediaMetadata::default()
+    };
+
+    let streaming = {
+        let stream = Arc::clone(&stream);
+        let metadata = metadata.clone();
+        tokio::spawn(async move { stream.stream_file(&source, Some(&metadata), false).await })
+    };
+
+    // While the stream is running the RAOP takeover holds Metadata, so `playing()` describes the
+    // track being streamed — not MRP's "dummy" video.
+    let title = until_async("the streamed track to be reported", || async {
+        let playing = atv.metadata()?.playing().await.ok()?;
+        (playing.title.as_deref() == Some("Ported Track")).then_some(playing.title)
+    })
+    .await;
+    assert_eq!(title.as_deref(), Some("Ported Track"));
+
+    streaming
+        .await
+        .expect("the stream task must not panic")
+        .expect("the file must stream");
+
+    assert_eq!(
+        raop_state.records.load(Ordering::SeqCst),
+        1,
+        "the RAOP receiver must have accepted exactly one RECORD"
+    );
+    assert_eq!(raop_state.teardowns.load(Ordering::SeqCst), 1);
+
+    // Once the stream has finished the takeover is released and MRP answers again.
+    until_async("MRP metadata to come back", || async {
+        let playing = atv.metadata()?.playing().await.ok()?;
+        (playing.title.as_deref() == Some("dummy")).then_some(())
+    })
+    .await;
+
+    // ---- play_url: AirPlay, on the same handle ----
+    device
+        .airplay
+        .state()
+        .play
+        .queue([
+            pyatv_proto_airplay::test_support::fake_play::PlaybackAnswer::playing(0.1),
+            pyatv_proto_airplay::test_support::fake_play::PlaybackAnswer::idle(),
+        ])
+        .await;
+
+    stream
+        .play_url("http://example.invalid/v.mp4")
+        .await
+        .expect("AirPlay must accept the play");
+    assert_eq!(
+        device.airplay.state().play.plays.load(Ordering::SeqCst),
+        1,
+        "the AirPlay receiver must have seen the /play"
     );
 }

@@ -22,6 +22,7 @@ use pyatv_core::{BaseConfig, Error, Protocol, Result};
 use pyatv_proto_airplay::{AirPlayPairingHandler, AirPlayPairingOptions};
 use pyatv_proto_companion::auth::PairSetupOptionsCompanion;
 use pyatv_proto_companion::{CompanionPairingHandler, CompanionPairingOptions};
+use pyatv_proto_dmap::{DmapPairingHandler, DmapPairingOptions};
 use pyatv_proto_mrp::{MrpPairingHandler, MrpPairingOptions};
 
 /// Begin pairing with one protocol on a device.
@@ -131,8 +132,28 @@ pub async fn pair(
                 storage,
             )))
         }
-        // TODO(step-5): dispatch DMAP, whose inverted client-as-server flow is
-        // `pyatv_proto_dmap::pairing`.
-        Protocol::Dmap => Err(Error::UnsupportedProtocol(protocol)),
+        Protocol::Dmap => {
+            // The inverted flow: this process binds an HTTP server, publishes
+            // `_touch-remote._tcp.local`, and waits for the Apple TV to call back with an MD5 of
+            // the PIN. `device_provides_pin()` is therefore `false` and `pin()` means "this is the
+            // code I am showing the user", not "this is the code the device showed me".
+            tracing::debug!("creating DMAP pairing handler");
+
+            Ok(Box::new(DmapPairingHandler::new(
+                DmapPairingOptions {
+                    service: service.clone(),
+                    device_identifier,
+                    // `core.settings.info.name` (`pyatv/protocols/dmap/pairing.py:230`): the name
+                    // the device lists this remote under.
+                    name: settings.info.name.clone(),
+                    // `kwargs.get("pairing_guid")` and `kwargs.get("addresses")` exist upstream so
+                    // tests can be deterministic; `pyatv.pair()` itself never passes them, so the
+                    // GUID is random and every private address is advertised.
+                    pairing_guid: None,
+                    addresses: None,
+                },
+                storage,
+            )))
+        }
     }
 }

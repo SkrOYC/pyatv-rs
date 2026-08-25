@@ -1,5 +1,31 @@
 //! AirPlay and RAOP errors.
 
+/// Why an audio source could not be turned into the PCM a stream needs.
+///
+/// The two want different answers from a caller, which is why they are not one string. pyatv makes
+/// no such distinction — it lets `miniaudio`'s and `requests`' own exceptions escape `open_source`
+/// (`pyatv/protocols/raop/audio_source.py:727-739`) — so the split is this port's, and it exists
+/// because [`crate::Error`]'s conversion into [`pyatv_core::Error`] has to choose a variant and
+/// "this build cannot decode Opus" and "that URL 404s" are not the same answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AudioFailure {
+    /// The bytes are not audio this build can decode, or the format the receiver negotiated cannot
+    /// be produced from them.
+    ///
+    /// Retrying is pointless: a different file, a different build, or a different receiver is the
+    /// only recovery. Becomes [`pyatv_core::Error::NotSupported`].
+    Format,
+
+    /// The source could not be obtained or held: a path that is not there, a host that does not
+    /// resolve, a server that answered an error, a stream too large to decode into memory.
+    ///
+    /// Nothing is wrong with this build's decoders; the input never arrived. Becomes
+    /// [`pyatv_core::Error::Command`], because it is the `stream_file` call that failed rather
+    /// than a capability that is missing.
+    Source,
+}
+
 /// Something went wrong on an AirPlay or RAOP connection.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -71,9 +97,14 @@ pub enum Error {
     /// pyatv lets `miniaudio`'s own exceptions escape `open_source`
     /// (`pyatv/protocols/raop/audio_source.py:727-739`); this port names the failure instead, since
     /// "the file is not audio this build can decode" and "the device refused the stream" want
-    /// different answers from a caller.
-    #[error("audio source error: {0}")]
-    Audio(String),
+    /// different answers from a caller. [`AudioFailure`] is which of the two it was.
+    #[error("audio source error: {message}")]
+    Audio {
+        /// Whether the input was undecodable or simply never arrived.
+        kind: AudioFailure,
+        /// What happened, already rendered.
+        message: String,
+    },
 
     /// An operation was attempted in a state that does not allow it.
     ///
@@ -85,6 +116,26 @@ pub enum Error {
     /// Underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl Error {
+    /// An [`Error::Audio`] for input this build cannot decode or conform.
+    #[must_use]
+    pub fn audio_format(message: impl Into<String>) -> Self {
+        Self::Audio {
+            kind: AudioFailure::Format,
+            message: message.into(),
+        }
+    }
+
+    /// An [`Error::Audio`] for input that could not be obtained or held.
+    #[must_use]
+    pub fn audio_source(message: impl Into<String>) -> Self {
+        Self::Audio {
+            kind: AudioFailure::Source,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<Error> for pyatv_core::Error {
@@ -101,8 +152,16 @@ impl From<Error> for pyatv_core::Error {
             Error::NotStarted(_) | Error::UnsupportedAuthentication { .. } => {
                 Self::Pairing(rendered)
             }
-            Error::NoEncryptionKeys(_) | Error::Audio(_) => Self::NotSupported(rendered),
-            Error::InvalidState(_) => Self::Command {
+            Error::NoEncryptionKeys(_)
+            | Error::Audio {
+                kind: AudioFailure::Format,
+                ..
+            } => Self::NotSupported(rendered),
+            Error::InvalidState(_)
+            | Error::Audio {
+                kind: AudioFailure::Source,
+                ..
+            } => Self::Command {
                 command: "stream_file".to_owned(),
                 reason: rendered,
             },

@@ -58,8 +58,8 @@ fn pairing_data(response: &MrpMessage) -> Result<Vec<u8>> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Pairing`] if the device refuses the credentials or its signature does not
-/// verify, and [`Error::Timeout`] if it does not answer.
+/// Returns [`crate::Error::Pairing`] if the device refuses the credentials or its signature does not
+/// verify, and [`crate::Error::Timeout`] if it does not answer.
 pub async fn verify_credentials(
     protocol: &MrpProtocol,
     credentials: HapCredentials,
@@ -98,7 +98,7 @@ impl MrpPairSetupProcedure {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Pairing`] if the device refuses to start pairing, or [`Error::Timeout`] if
+    /// Returns [`crate::Error::Pairing`] if the device refuses to start pairing, or [`crate::Error::Timeout`] if
     /// it does not answer.
     pub async fn start(protocol: &MrpProtocol) -> Result<Self> {
         protocol.exchange_device_info().await?;
@@ -122,8 +122,8 @@ impl MrpPairSetupProcedure {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Pairing`] if the PIN is wrong or the device's proof does not verify, and
-    /// [`Error::Timeout`] if it stops answering.
+    /// Returns [`crate::Error::Pairing`] if the PIN is wrong or the device's proof does not verify, and
+    /// [`crate::Error::Timeout`] if it stops answering.
     pub async fn finish(mut self, protocol: &MrpProtocol, pin: u32) -> Result<HapCredentials> {
         self.setup.set_pin(pin);
 

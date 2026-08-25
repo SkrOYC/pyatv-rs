@@ -89,6 +89,16 @@ pub trait Keyboard: Send + Sync + std::fmt::Debug {
     fn text_clear(&self) -> BoxFuture<'_, Result<()>>;
 }
 
+/// Notified when the on-screen keyboard gains or loses focus.
+///
+/// Ports `pyatv.interface.KeyboardListener` (`pyatv/interface.py:1236-1244`), whose one method is
+/// `focusstate_update(old_state, new_state)`. Registered through
+/// [`crate::interface::AppleTV::add_keyboard_listener`] and held weakly.
+pub trait KeyboardListener: Send + Sync + std::fmt::Debug {
+    /// Focus moved from `old_state` to `new_state`.
+    fn focusstate_update(&self, old_state: KeyboardFocusState, new_state: KeyboardFocusState);
+}
+
 /// Trackpad-style gestures for the virtual remote surface.
 ///
 /// # Errors

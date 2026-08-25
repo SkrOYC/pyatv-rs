@@ -1,11 +1,10 @@
 //! Now-playing metadata, push updates and media streaming.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::Result;
 use crate::interface::BoxFuture;
-use crate::models::{App, ArtworkInfo, Playing};
+use crate::models::{App, ArtworkInfo, MediaMetadata, MediaSource, Playing};
 
 /// Pull-based access to what the device is playing.
 ///
@@ -78,8 +77,18 @@ pub trait Stream: Send + Sync + std::fmt::Debug {
     /// Play a video URL via `AirPlay`.
     fn play_url(&self, url: &str) -> BoxFuture<'_, Result<()>>;
 
-    /// Stream an audio file to the device over RAOP.
-    fn stream_file(&self, path: &Path) -> BoxFuture<'_, Result<()>>;
+    /// Stream audio to the device over RAOP.
+    ///
+    /// `stream_file(file, /, metadata=None, override_missing_metadata=False)`
+    /// (`pyatv/interface.py:886-901`). `metadata` replaces whatever the source carries;
+    /// `override_missing_metadata` turns that into a merge in which the caller's fields win and the
+    /// source's fill the gaps (`pyatv/protocols/raop/__init__.py:370-378`).
+    fn stream_file(
+        &self,
+        source: &MediaSource,
+        metadata: Option<&MediaMetadata>,
+        override_missing_metadata: bool,
+    ) -> BoxFuture<'_, Result<()>>;
 
     /// Stop any stream this handle started.
     fn close(&self);

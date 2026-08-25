@@ -6,6 +6,7 @@
 //! which is where the output-device list and this device's own UID come from.
 
 use pyatv_core::interface::BoxFuture;
+use pyatv_core::models::OutputDevice;
 
 use crate::Result;
 use crate::message::MrpMessage;
@@ -13,17 +14,14 @@ use crate::protobuf::{
     DeviceInfoMessage, VolumeControlAvailabilityMessage, extensions, volume_capabilities,
 };
 use crate::state::MrpState;
-
-/// One member of the playback group.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutputDevice {
-    /// Display name.
-    pub name: String,
-    /// Stable identifier, which is what [`pyatv_core::interface::Audio`] exposes.
-    pub identifier: String,
-}
+use crate::state::notify::Notification;
 
 /// Everything `MrpAudio` tracks.
+///
+/// The playback group is [`OutputDevice`], the public model, rather than a protocol-private type:
+/// upstream's `MrpAudio._output_devices` is a `List[interface.OutputDevice]` too
+/// (`__init__.py:760,913-925`), and it is what both `Audio::output_devices` and the facade's
+/// change detection consume.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VolumeState {
     /// `volumeControlAvailable` from the last availability message.
@@ -139,13 +137,21 @@ impl MrpState {
         let inner = message.inner(&extensions::VOLUME_DID_CHANGE_MESSAGE)?;
         let level = round_to_tenth(inner.volume.unwrap_or_default() * 100.0);
 
-        if inner.output_device_uid.unwrap_or_default() == self.device_uid().unwrap_or_default() {
+        let output_device_uid = inner.output_device_uid.unwrap_or_default();
+        if output_device_uid == self.device_uid().unwrap_or_default() {
             if let Ok(mut volume) = self.volume.lock() {
                 volume.level = level;
             }
             tracing::debug!(level, "MRP volume changed");
+            self.post(Notification::Volume(level));
         } else {
             tracing::debug!(level, "MRP volume changed for another output device");
+            // `UpdatedState.OutputDeviceVolume` (`__init__.py:848-851`): a level for someone
+            // else's speaker is still reported, just under a different state.
+            self.post(Notification::OutputDeviceVolume {
+                identifier: output_device_uid,
+                volume: level,
+            });
         }
 
         self.volume_changed.notify_waiters();
@@ -197,22 +203,23 @@ impl MrpState {
         if info.is_group_leader.unwrap_or_default()
             && !info.is_proxy_group_player.unwrap_or_default()
         {
-            devices.push(OutputDevice {
-                name: info.name.clone(),
-                identifier: info.unique_identifier.clone().unwrap_or_default(),
-            });
+            devices.push(
+                OutputDevice::new(info.unique_identifier.clone().unwrap_or_default())
+                    .with_name(info.name.clone()),
+            );
         }
         for device in &info.grouped_devices {
-            devices.push(OutputDevice {
-                name: device.name.clone(),
-                identifier: device.device_uid.clone().unwrap_or_default(),
-            });
+            devices.push(
+                OutputDevice::new(device.device_uid.clone().unwrap_or_default())
+                    .with_name(device.name.clone()),
+            );
         }
 
         if let Ok(mut volume) = self.volume.lock() {
-            volume.output_devices = devices;
+            volume.output_devices.clone_from(&devices);
         }
         self.output_devices_changed.notify_waiters();
+        self.post(Notification::OutputDevices(devices));
     }
 
     /// Shared by both capability messages (`_update_volume_controls`, `__init__.py:818-830`).

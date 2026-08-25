@@ -335,6 +335,69 @@ def volume_vectors():
     }
 
 
+def volume_body_vectors():
+    """The exact ``SET_PARAMETER`` body pyatv puts on the wire for a volume.
+
+    ``StreamClient.set_volume`` calls ``set_parameter("volume", str(volume))``
+    (``stream_client.py:370-373``) and ``RtspSession.set_parameter`` formats the
+    body as ``f"{parameter}: {value}"`` (``rtsp.py:194-200``). Both halves are
+    reproduced here through pyatv's own code path, so the vector pins the
+    decimal rendering as well as the separator: ``str`` of a Python float always
+    carries a decimal point, which Rust's ``Display`` for ``f32`` does not.
+    """
+
+    def body(parameter: str, value) -> str:
+        # `RtspSession.set_parameter`'s body expression, verbatim.
+        return f"{parameter}: {value}"
+
+    return [
+        {
+            "percent": percent,
+            "dbfs": pct_to_dbfs(percent),
+            "value": str(pct_to_dbfs(percent)),
+            "body": body("volume", str(pct_to_dbfs(percent))),
+        }
+        # 0 is the mute sentinel, 100 the top of the range, and 60/50/25 are
+        # upstream's own functional-test values. 1 and 33 exercise the
+        # non-integral renderings.
+        for percent in [0.0, 1.0, 25.0, 33.0, 50.0, 60.0, 100.0]
+    ]
+
+
+def pacing_vectors():
+    """``Statistics.expected_frame_count`` at fixed elapsed times.
+
+    ``int((monotonic_ns() - self.start_time_ns) / (10**9 / self.sample_rate))``
+    (``stream_client.py:635-638``). The inner division is a *float* division and
+    the truncation happens once at the end; an integer divisor is 0.0032% small
+    at 44100 Hz and drifts a frame ahead every seven seconds or so. These
+    vectors pin the float form.
+    """
+
+    def expected(elapsed_ns: int, sample_rate: int) -> int:
+        return int(elapsed_ns / (10**9 / sample_rate))
+
+    cases = []
+    for sample_rate in [44100, 48000]:
+        for elapsed_ns in [
+            0,
+            1_000_000,  # 1 ms
+            22_675,  # just under one frame at 44100 Hz
+            22_676,  # just over it
+            1_000_000_000,  # exactly one second
+            7_000_000_000,  # where an integer divisor is a whole frame out
+            3_600_000_000_000,  # an hour
+        ]:
+            cases.append(
+                {
+                    "elapsed_ns": elapsed_ns,
+                    "sample_rate": sample_rate,
+                    "expected_frame_count": expected(elapsed_ns, sample_rate),
+                }
+            )
+    return cases
+
+
 def announce_vectors():
     return [
         {
@@ -427,6 +490,8 @@ def main() -> None:
                 "encryption": encryption_vectors(),
                 "metadata": metadata_vectors(),
                 "volume": volume_vectors(),
+                "volume_body": volume_body_vectors(),
+                "pacing": pacing_vectors(),
                 "announce": announce_vectors(),
                 "digest": digest_vectors(),
             },

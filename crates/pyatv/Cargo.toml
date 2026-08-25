@@ -25,11 +25,14 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+hound = "3.5.1"
 # The hermetic devices each protocol crate ships behind its own `test-support` feature. This is the
-# one place where all three stand up at once, which is what makes the relayer priorities and the
-# AirPlay-to-MRP tunnel testable end to end without hardware.
+# one place where several stand up at once, which is what makes the relayer priorities and the
+# AirPlay-to-MRP tunnel testable end to end without hardware. DMAP is here for the opposite reason:
+# it never coexists with the others on real hardware, so its test stands one up alone.
 pyatv-pairing = { workspace = true, features = ["test-server"] }
 pyatv-proto-airplay = { workspace = true, features = ["test-support"] }
 pyatv-proto-companion = { workspace = true, features = ["test-support"] }
+pyatv-proto-dmap = { workspace = true, features = ["test-support"] }
 pyatv-proto-mrp = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync"] }

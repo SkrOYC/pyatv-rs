@@ -7,6 +7,8 @@
 
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
+
 use crate::Result;
 use crate::audio::AudioSource;
 use crate::raop::connection::with_connection;
@@ -103,16 +105,18 @@ impl StreamClient {
         audio: &AudioSender,
         first: bool,
     ) -> Result<u32> {
+        // Everything the header needs comes out of one snapshot. The `ssrc` is in there
+        // deliberately: reading it off the live `RtspSession` instead would make the pacing loop
+        // take the RTSP connection lock once per packet, contending with the `/feedback` task and
+        // with any concurrent `set_volume` for a value that has not changed since `initialize`.
         let (packet_size, frame_size, rtpseq, rtptime, ssrc, complete) = {
             let context = self.context.snapshot();
-            let ssrc =
-                with_connection(&self.connection, async |rtsp, _| Ok(rtsp.session_id())).await?;
             (
                 context.packet_size(),
                 context.frame_size(),
                 context.rtpseq,
                 context.rtptime(),
-                ssrc,
+                context.ssrc,
                 context.padding_complete(),
             )
         };
@@ -134,7 +138,7 @@ impl StreamClient {
 
         let sent_frames = u32::try_from(frames.len() / frame_size.max(1)).unwrap_or(0);
         let header = AudioPacketHeader::new(first, rtpseq, rtptime, ssrc);
-        let packet = self.protocol.audio_packet(&header, &frames)?;
+        let packet = Bytes::from(self.protocol.audio_packet(&header, &frames)?);
 
         audio.send(&packet).await?;
         if let Some(control) = self.control.as_ref() {

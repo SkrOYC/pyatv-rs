@@ -12,7 +12,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use pyatv::{AppleTV, BaseConfig, FeatureName, FeatureState, PlaybackListener, Protocol};
+use pyatv::{
+    AppleTV, BaseConfig, FeatureName, FeatureState, MediaSource, PlaybackListener, Protocol,
+};
 
 use crate::cli::{Cli, Command};
 use crate::commands::output;
@@ -214,7 +216,7 @@ async fn volume(cli: &Cli, level: Option<f32>) -> Result<()> {
             .ok_or_else(|| output::unsupported("volume", "RAOP, Companion or MRP"))?;
 
         if let Some(level) = level {
-            audio.set_volume(level).await.map_err(Into::into)
+            audio.set_volume(level, None).await.map_err(Into::into)
         } else {
             println!("{}", output::float(audio.volume()));
             Ok(())
@@ -336,7 +338,8 @@ async fn play_url(cli: &Cli, url: &str) -> Result<()> {
 ///
 /// The path is passed through whole. A string that spells a URL is fetched rather than opened, and
 /// that decision belongs to the protocol crate — `_is_url` (`audio_source.py:731-735`) is what
-/// makes it upstream too.
+/// makes it upstream too. A single `-` means standard input, exactly as upstream's dispatcher
+/// special-cases it (`atvremote.py:961-964`).
 async fn stream_file(cli: &Cli, path: &Path) -> Result<()> {
     let path = path.to_owned();
     with_device(cli, async |atv| {
@@ -348,8 +351,9 @@ async fn stream_file(cli: &Cli, path: &Path) -> Result<()> {
             bail!("this device does not support stream_file");
         }
 
-        println!("Streaming {}", path.display());
-        let streaming = stream.stream_file(&path);
+        let (source, label) = read_source(&path)?;
+        println!("Streaming {label}");
+        let streaming = stream.stream_file(&source, None, false);
         tokio::pin!(streaming);
 
         tokio::select! {
@@ -368,6 +372,32 @@ async fn stream_file(cli: &Cli, path: &Path) -> Result<()> {
         Ok(())
     })
     .await
+}
+
+/// Turn the `stream_file` argument into a source, reading standard input for `-`.
+///
+/// `if command == "stream_file" and args[0] == "-": args = [sys.stdin.buffer, ...]`
+/// (`atvremote.py:961-964`). Upstream hands the file object straight to the decoder and reads it
+/// lazily; here standard input is drained into memory first, because
+/// [`pyatv::MediaSource`](pyatv::MediaSource) is a value rather than a reader — and because the
+/// decoder needs the whole stream anyway to work out its duration.
+///
+/// The second element is what to print, since `-` has no path to show.
+fn read_source(path: &Path) -> Result<(MediaSource, String)> {
+    if path == Path::new("-") {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut bytes)
+            .context("reading audio from standard input")?;
+        return Ok((MediaSource::Bytes(bytes), "standard input".to_owned()));
+    }
+
+    let label = path.display().to_string();
+    // A `Path` that spells a URL is classified the way upstream classifies the string.
+    let source = path.to_str().map_or_else(
+        || MediaSource::from_path(path),
+        MediaSource::from_str_source,
+    );
+    Ok((source, label))
 }
 
 /// Save the current artwork.

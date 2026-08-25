@@ -23,12 +23,14 @@
 
 use std::net::SocketAddr;
 
+use crate::Result;
 use crate::codec::{BPLIST_CONTENT_TYPE, CONTENT_TYPE, RTSP_1_0, Response, USER_AGENT};
 use crate::http::{HttpConnection, RequestSpec};
-use crate::{Error, Result};
 
+pub mod bodies;
 pub mod digest;
 
+pub use bodies::{AnnounceFormat, announce_sdp, decode_plist, encode_plist};
 pub use digest::{DigestInfo, digest_response};
 
 /// RTSP methods pyatv sends. Not a subset of the HTTP verbs, which is one reason a generic HTTP
@@ -66,37 +68,15 @@ pub const INFO_PATH: &str = "/info";
 /// Path the two-second keepalive is posted to (`pyatv/support/rtsp.py:246-248`).
 pub const FEEDBACK_PATH: &str = "/feedback";
 
-/// Encode a property list as the binary plist AirPlay bodies use.
-///
-/// `plistlib.dumps(body, fmt=FMT_BINARY)` (`pyatv/support/rtsp.py:287-289`).
-///
-/// # Errors
-///
-/// Returns [`Error::Plist`] if the value cannot be serialised.
-pub fn encode_plist(value: &plist::Value) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    plist::to_writer_binary(&mut out, value).map_err(|error| Error::Plist(error.to_string()))?;
-    Ok(out)
-}
-
-/// Decode a binary property list body.
-///
-/// `decode_bplist_from_body` (`pyatv/support/http.py:221-232`).
-///
-/// # Errors
-///
-/// Returns [`Error::Plist`] if `body` is not a property list.
-pub fn decode_plist(body: &[u8]) -> Result<plist::Value> {
-    plist::from_bytes(body).map_err(|error| Error::Plist(error.to_string()))
-}
-
 /// An RTSP session over one connection.
 ///
 /// The three identifiers are drawn once per session and repeated on every request. They are
 /// AirPlay-1-lineage DACP values with no role in the remote-control tunnel, but a receiver sees
 /// them on every exchange, so they are sent exactly as upstream shapes them
 /// (`pyatv/support/rtsp.py:86-89`).
-#[derive(Debug)]
+///
+/// [`Debug`] is written by hand so the [`DigestInfo`] it may hold cannot leak a device password;
+/// see the impl.
 pub struct RtspSession {
     session_id: u32,
     dacp_id: String,
@@ -144,6 +124,25 @@ impl Default for Exchange<'_> {
             allow_error: false,
             protocol: RTSP_1_0,
         }
+    }
+}
+
+impl std::fmt::Debug for RtspSession {
+    /// Hand-written to keep the device password out of logs.
+    ///
+    /// [`DigestInfo`] redacts the password itself, but this session is what actually appears in
+    /// `tracing` events and error paths, so it reports only *whether* a challenge has been
+    /// answered rather than embedding the credential struct at all. Nothing is lost: the realm and
+    /// nonce are recoverable from the exchange that set them.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RtspSession")
+            .field("session_id", &self.session_id)
+            .field("dacp_id", &self.dacp_id)
+            .field("active_remote", &self.active_remote)
+            .field("cseq", &self.cseq)
+            .field("authenticated", &self.digest.is_some())
+            .finish()
     }
 }
 
@@ -219,8 +218,8 @@ impl RtspSession {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Status`] for a non-success status unless `allow_error` is set,
-    /// [`Error::Plist`] if `body` cannot be serialised, and [`Error::Io`] on a transport failure.
+    /// Returns [`crate::Error::Status`] for a non-success status unless `allow_error` is set,
+    /// [`crate::Error::Plist`] if `body` cannot be serialised, and [`crate::Error::Io`] on a transport failure.
     pub async fn exchange(
         &mut self,
         http: &mut HttpConnection,
@@ -260,8 +259,8 @@ impl RtspSession {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Status`] for a non-success status unless
-    /// [`Exchange::allow_error`] is set, and [`Error::Io`] on a transport failure.
+    /// Returns [`crate::Error::Status`] for a non-success status unless
+    /// [`Exchange::allow_error`] is set, and [`crate::Error::Io`] on a transport failure.
     pub async fn send(
         &mut self,
         http: &mut HttpConnection,
@@ -328,8 +327,8 @@ impl RtspSession {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Plist`] if a `200` response's body is not a property list, or
-    /// [`Error::Io`] on a transport failure.
+    /// Returns [`crate::Error::Plist`] if a `200` response's body is not a property list, or
+    /// [`crate::Error::Io`] on a transport failure.
     pub async fn info(&mut self, http: &mut HttpConnection) -> Result<plist::Value> {
         let response = self
             .exchange(http, method::GET, Some(INFO_PATH), None, true)
@@ -351,7 +350,7 @@ impl RtspSession {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Status`] if the device refuses the request, and [`Error::Plist`] if either
+    /// Returns [`crate::Error::Status`] if the device refuses the request, and [`crate::Error::Plist`] if either
     /// body fails to encode or decode.
     pub async fn setup(
         &mut self,
@@ -374,7 +373,7 @@ impl RtspSession {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Status`] if the device refuses the request and [`Error::Io`] on a transport
+    /// Returns [`crate::Error::Status`] if the device refuses the request and [`crate::Error::Io`] on a transport
     /// failure.
     pub async fn record(&mut self, http: &mut HttpConnection) -> Result<Response> {
         self.exchange(http, method::RECORD, None, None, false).await
@@ -389,8 +388,8 @@ impl RtspSession {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Status`] for a non-success status unless `allow_error` is set, and
-    /// [`Error::Io`] on a transport failure.
+    /// Returns [`crate::Error::Status`] for a non-success status unless `allow_error` is set, and
+    /// [`crate::Error::Io`] on a transport failure.
     pub async fn feedback(
         &mut self,
         http: &mut HttpConnection,
@@ -407,62 +406,11 @@ impl Default for RtspSession {
     }
 }
 
-/// The parameters an `ANNOUNCE` SDP body is built from.
-///
-/// Only these three are substituted into pyatv's `ANNOUNCE_PAYLOAD` template; the codec, payload
-/// type and frames
-/// per packet are literals in it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AnnounceFormat {
-    /// Bits per channel, i.e. `8 * bytes_per_channel`.
-    pub bits_per_channel: u32,
-    /// Channel count.
-    pub channels: u32,
-    /// Sample rate in Hz.
-    pub sample_rate: u32,
-}
-
-/// Build the SDP body for an `ANNOUNCE` request.
-///
-/// `ANNOUNCE_PAYLOAD` (`pyatv/support/rtsp.py:25-35`), reproduced line for line including the
-/// trailing CRLF on the last line. Note that the codec named in `rtpmap` is `L16` — raw 16-bit
-/// linear PCM — even though the `fmtp` line follows ALAC's conventional field layout, and that the
-/// `96 L16/44100/2` and `352` tokens are hardcoded upstream rather than templated on
-/// [`AnnounceFormat`]: only `bits_per_channel`, `channels` and `sample_rate` are substituted,
-/// which is why a receiver asking for something other than 44100/2 gets an internally inconsistent
-/// body. That inconsistency is upstream's and is reproduced (`docs/research/rust-crates.md` §7,
-/// `airplay-playurl-raop-port-spec.md` §11).
-#[must_use]
-pub fn announce_sdp(
-    session_id: u32,
-    local_ip: &str,
-    remote_ip: &str,
-    format: AnnounceFormat,
-) -> String {
-    let AnnounceFormat {
-        bits_per_channel,
-        channels,
-        sample_rate,
-    } = format;
-
-    format!(
-        "v=0\r\n\
-         o=iTunes {session_id} 0 IN IP4 {local_ip}\r\n\
-         s=iTunes\r\n\
-         c=IN IP4 {remote_ip}\r\n\
-         t=0 0\r\n\
-         m=audio 0 RTP/AVP 96\r\n\
-         a=rtpmap:96 L16/44100/2\r\n\
-         a=fmtp:96 {FRAMES_PER_PACKET} 0 {bits_per_channel} 40 10 14 {channels} 255 0 0 \
-         {sample_rate}\r\n"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
 
-    use super::{RtspSession, decode_plist, encode_plist};
+    use super::RtspSession;
 
     fn local() -> SocketAddr {
         "10.0.0.2:54321".parse().expect("valid socket address")
@@ -507,24 +455,20 @@ mod tests {
         );
     }
 
-    /// Bodies go out as `bplist00`, not XML — the receiver rejects the XML form.
+    /// The session is logged on ordinary paths, so an armed digest must not carry the password
+    /// into a `{:?}`.
     #[test]
-    fn plist_bodies_round_trip_as_binary() {
-        let mut dictionary = plist::Dictionary::new();
-        dictionary.insert(
-            "isRemoteControlOnly".to_owned(),
-            plist::Value::Boolean(true),
+    fn the_debug_rendering_hides_the_password() {
+        let mut session = RtspSession::with_identifiers(7, 0xABCD, 42);
+        session.set_digest(super::DigestInfo::new("raop", "hunter2", "abc123"));
+
+        let rendered = format!("{session:?}");
+
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("authenticated: true"), "{rendered}");
+        assert!(
+            format!("{:?}", RtspSession::with_identifiers(7, 0xABCD, 42))
+                .contains("authenticated: false")
         );
-        let value = plist::Value::Dictionary(dictionary);
-
-        let encoded = encode_plist(&value).expect("encodes");
-        assert!(encoded.starts_with(b"bplist00"));
-        assert_eq!(decode_plist(&encoded).expect("decodes"), value);
-    }
-
-    /// A body that is not a property list is a decode error, not a panic.
-    #[test]
-    fn a_non_plist_body_is_an_error() {
-        assert!(decode_plist(b"not a plist").is_err());
     }
 }

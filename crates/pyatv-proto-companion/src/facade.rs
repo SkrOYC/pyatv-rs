@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use pyatv_core::facade::SetupData;
+use pyatv_core::facade::StateDispatcher;
 use pyatv_core::interface::{BoxFuture, DeviceListener, Features, PowerListener, ProtocolHandle};
 use pyatv_core::storage::InfoSettings;
 use pyatv_core::{
@@ -221,6 +222,9 @@ pub struct CompanionSetupOptions {
     /// `SystemStatus`/`TVSystemStatus` — so this is where upstream's `PowerListener` chain starts
     /// (`__init__.py:253-278`).
     pub power_listener: Option<Arc<dyn PowerListener>>,
+    /// Where volume and keyboard-focus changes are reported (`core.state_dispatcher`,
+    /// `__init__.py:451,512`).
+    pub state_dispatcher: Option<Arc<dyn StateDispatcher>>,
 }
 
 /// Connect Companion and describe what it contributes.
@@ -232,8 +236,8 @@ pub struct CompanionSetupOptions {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Connect`] if the device is unreachable, [`Error::Pairing`] if it refuses the
-/// stored credentials, and [`Error::InvalidCredentials`] if the stored string does not parse.
+/// Returns [`Error::Connect`] if the device is unreachable, and [`Error::Pairing`] if the stored
+/// credentials string does not parse or the device refuses it.
 ///
 /// Returns `Ok(None)` — not an error — when the service has no credentials at all, which is
 /// upstream's guard clause and means "this device has no Companion protocol", not "Companion
@@ -259,6 +263,7 @@ pub async fn setup(options: CompanionSetupOptions) -> Result<Option<SetupData>> 
             &info,
             options.listener,
             options.power_listener,
+            options.state_dispatcher,
         )
         .await?,
     );

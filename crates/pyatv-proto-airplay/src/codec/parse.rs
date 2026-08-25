@@ -20,6 +20,18 @@ use crate::{Error, Result};
 /// End of the header block.
 const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 
+/// The largest `Content-Length` this parser will wait for.
+///
+/// 8 MiB. Nothing AirPlay sends comes close: a binary plist reply is kilobytes, an MRP protobuf
+/// frame is smaller still, and the biggest body in the whole stack is a piece of cover artwork —
+/// which this crate *sends* rather than receives, and which no receiver returns. A header is a
+/// promise from the peer about how many bytes are coming; without a ceiling, a single unread
+/// `Content-Length: 4294967295` makes the connection's read buffer grow to four gigabytes while
+/// the parser politely waits for a body that will never arrive. pyatv has the same exposure
+/// (`pyatv/support/http.py:122-131` reads the value straight into a slice bound) and this port
+/// deliberately does not.
+pub const MAX_BODY_LEN: usize = 8 * 1024 * 1024;
+
 /// Parse one message from the front of `input`.
 ///
 /// Returns the frame and how many bytes of `input` it consumed, or `Ok(None)` if `input` does not
@@ -28,7 +40,8 @@ const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 /// # Errors
 ///
 /// Returns [`Error::Malformed`] if the header block is not UTF-8, if the start line matches neither
-/// the request nor the response shape, or if `Content-Length` is not a number.
+/// the request nor the response shape, if `Content-Length` is not a number, or if it names a body
+/// larger than [`MAX_BODY_LEN`].
 pub fn parse_frame(input: &[u8]) -> Result<Option<(Frame, usize)>> {
     let Some(boundary) = find_subslice(input, HEADER_TERMINATOR) else {
         return Ok(None);
@@ -49,7 +62,13 @@ pub fn parse_frame(input: &[u8]) -> Result<Option<(Frame, usize)>> {
         .collect::<Result<Vec<_>>>()?;
 
     let content_length = content_length(&headers)?;
-    let Some(body) = input.get(body_start..body_start + content_length) else {
+    // `body_start + content_length` overflows for a `Content-Length` near `usize::MAX`, which a
+    // peer can simply state. The cap in `content_length` already refuses that, but the addition is
+    // checked anyway so the two guards do not depend on each other.
+    let body_end = body_start
+        .checked_add(content_length)
+        .ok_or_else(|| Error::Malformed("Content-Length overflows the buffer".to_owned()))?;
+    let Some(body) = input.get(body_start..body_end) else {
         return Ok(None);
     };
     let body = Bytes::copy_from_slice(body);
@@ -79,7 +98,7 @@ pub fn parse_frame(input: &[u8]) -> Result<Option<(Frame, usize)>> {
         }),
     };
 
-    Ok(Some((frame, body_start + content_length)))
+    Ok(Some((frame, body_end)))
 }
 
 /// The two shapes a start line can take.
@@ -145,6 +164,10 @@ fn parse_header(line: &str) -> Result<(String, String)> {
 }
 
 /// Read `Content-Length`, defaulting to zero when absent (`pyatv/support/http.py:122`).
+///
+/// A value larger than [`MAX_BODY_LEN`] is an error rather than a body to wait for; see that
+/// constant for why. A value that does not fit a `usize` at all takes the same path, since
+/// `parse::<usize>` refuses it.
 fn content_length(headers: &[(String, String)]) -> Result<usize> {
     let Some((_, value)) = headers
         .iter()
@@ -153,10 +176,18 @@ fn content_length(headers: &[(String, String)]) -> Result<usize> {
         return Ok(0);
     };
 
-    value
+    let length: usize = value
         .trim()
         .parse()
-        .map_err(|_| Error::Malformed(format!("bad Content-Length: {value}")))
+        .map_err(|_| Error::Malformed(format!("bad Content-Length: {value}")))?;
+
+    if length > MAX_BODY_LEN {
+        return Err(Error::Malformed(format!(
+            "Content-Length {length} exceeds the {MAX_BODY_LEN} byte limit"
+        )));
+    }
+
+    Ok(length)
 }
 
 /// Index of the first occurrence of `needle` in `haystack`.

@@ -31,6 +31,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use pyatv_core::facade::StateDispatcher;
 use pyatv_core::interface::{DeviceListener, PowerListener};
 use pyatv_opack::{Value, opack};
 use pyatv_pairing::HapCredentials;
@@ -108,11 +109,12 @@ impl CompanionApi {
         info: &SystemInfo,
         listener: Option<Arc<dyn DeviceListener>>,
         power_listener: Option<Arc<dyn PowerListener>>,
+        state_dispatcher: Option<Arc<dyn StateDispatcher>>,
     ) -> Result<Self> {
         let (mut protocol, events) = verify(peer, credentials).await?;
         let session = begin_session(&mut protocol, info).await?;
 
-        let state = Arc::new(ApiState::with_power_listener(power_listener));
+        let state = Arc::new(ApiState::with_listeners(power_listener, state_dispatcher));
         // `_tiStart`'s response is upstream's initial focus signal; see `session::Session`.
         state.set_focus(focus_from_payload(&session.text_input));
 

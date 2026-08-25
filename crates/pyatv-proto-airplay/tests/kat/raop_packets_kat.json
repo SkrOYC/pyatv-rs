@@ -129,6 +129,78 @@
       "title": null
     }
   ],
+  "pacing": [
+    {
+      "elapsed_ns": 0,
+      "expected_frame_count": 0,
+      "sample_rate": 44100
+    },
+    {
+      "elapsed_ns": 1000000,
+      "expected_frame_count": 44,
+      "sample_rate": 44100
+    },
+    {
+      "elapsed_ns": 22675,
+      "expected_frame_count": 0,
+      "sample_rate": 44100
+    },
+    {
+      "elapsed_ns": 22676,
+      "expected_frame_count": 1,
+      "sample_rate": 44100
+    },
+    {
+      "elapsed_ns": 1000000000,
+      "expected_frame_count": 44100,
+      "sample_rate": 44100
+    },
+    {
+      "elapsed_ns": 7000000000,
+      "expected_frame_count": 308700,
+      "sample_rate": 44100
+    },
+    {
+      "elapsed_ns": 3600000000000,
+      "expected_frame_count": 158760000,
+      "sample_rate": 44100
+    },
+    {
+      "elapsed_ns": 0,
+      "expected_frame_count": 0,
+      "sample_rate": 48000
+    },
+    {
+      "elapsed_ns": 1000000,
+      "expected_frame_count": 48,
+      "sample_rate": 48000
+    },
+    {
+      "elapsed_ns": 22675,
+      "expected_frame_count": 1,
+      "sample_rate": 48000
+    },
+    {
+      "elapsed_ns": 22676,
+      "expected_frame_count": 1,
+      "sample_rate": 48000
+    },
+    {
+      "elapsed_ns": 1000000000,
+      "expected_frame_count": 48000,
+      "sample_rate": 48000
+    },
+    {
+      "elapsed_ns": 7000000000,
+      "expected_frame_count": 336000,
+      "sample_rate": 48000
+    },
+    {
+      "elapsed_ns": 3600000000000,
+      "expected_frame_count": 172800000,
+      "sample_rate": 48000
+    }
+  ],
   "retransmit_request": [
     {
       "encoded": "80550001002a0003",
@@ -370,5 +442,49 @@
         "percent": 100.0
       }
     ]
-  }
+  },
+  "volume_body": [
+    {
+      "body": "volume: -144.0",
+      "dbfs": -144.0,
+      "percent": 0.0,
+      "value": "-144.0"
+    },
+    {
+      "body": "volume: -29.7",
+      "dbfs": -29.7,
+      "percent": 1.0,
+      "value": "-29.7"
+    },
+    {
+      "body": "volume: -22.5",
+      "dbfs": -22.5,
+      "percent": 25.0,
+      "value": "-22.5"
+    },
+    {
+      "body": "volume: -20.1",
+      "dbfs": -20.1,
+      "percent": 33.0,
+      "value": "-20.1"
+    },
+    {
+      "body": "volume: -15.0",
+      "dbfs": -15.0,
+      "percent": 50.0,
+      "value": "-15.0"
+    },
+    {
+      "body": "volume: -12.0",
+      "dbfs": -12.0,
+      "percent": 60.0,
+      "value": "-12.0"
+    },
+    {
+      "body": "volume: 0.0",
+      "dbfs": 0.0,
+      "percent": 100.0,
+      "value": "0.0"
+    }
+  ]
 }

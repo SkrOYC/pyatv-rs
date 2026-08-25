@@ -17,15 +17,15 @@
 //!
 //! * [`query`] — [`create_service_queries`], the question sets pyatv puts on the wire.
 //! * [`parser`] — [`ServiceParser`], the sans-io accumulator that turns records into services.
-//! * [`unicast`] — [`unicast()`], one socket aimed at one known host.
-//! * [`multicast`] — [`multicast()`], the group browse across every local interface.
+//! * [`mod@unicast`] — [`unicast()`], one socket aimed at one known host.
+//! * [`mod@multicast`] — [`multicast()`], the group browse across every local interface.
 //!
 //! # IPv4 only
 //!
 //! pyatv's discovery path is IPv4 throughout: `QueryType` has no `AAAA` member, the parser reads
 //! only `A` records, the multicast group is hardcoded to `224.0.0.251`, and interface enumeration
 //! filters to IPv4. This port matches that. [`crate::dns`] *decodes* `AAAA` records, but nothing
-//! here consumes them, and [`multicast()`] takes an [`Ipv4Addr`](std::net::Ipv4Addr) rather than an
+//! here consumes them, and [`multicast()`] takes an [`Ipv4Addr`] rather than an
 //! [`IpAddr`](std::net::IpAddr) to make that non-negotiable at the type level.
 //!
 //! # Logging

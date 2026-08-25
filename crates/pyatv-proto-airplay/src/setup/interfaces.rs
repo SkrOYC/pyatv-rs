@@ -5,13 +5,14 @@
 //! *own* contributions — the tunnelled MRP session registers a separate, much larger set under
 //! `Protocol::MRP`, and the facade's relayer decides which answers a given call.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pyatv_core::airplay::AirPlayFlags;
 use pyatv_core::consts::InputAction;
+use pyatv_core::facade::{FacadeTakeover, Interface};
 use pyatv_core::features::{FeatureInfo, FeatureName, FeatureState};
 use pyatv_core::interface::{BoxFuture, Features, RemoteControl, Stream};
+use pyatv_core::models::{MediaMetadata, MediaSource};
 use tokio::sync::Notify;
 
 use crate::stream::{AirPlayPlayer, PlayOptions};
@@ -78,6 +79,12 @@ pub struct AirPlayStream {
     /// Upstream's equivalent is `self._play_task`, which is likewise `None` between calls
     /// (`__init__.py:86,138`).
     playing: Arc<Mutex<Option<Arc<Notify>>>>,
+    /// How this stream claims [`RemoteControl`] for the duration of a playback.
+    ///
+    /// `self.core.takeover` (`__init__.py:125`). `None` for a stream built outside a facade — a
+    /// test, or the `airplay_tunnel_probe` example — in which case there is nothing to claim from
+    /// and `play_url` simply runs without it.
+    takeover: Option<FacadeTakeover>,
 }
 
 impl AirPlayStream {
@@ -87,7 +94,15 @@ impl AirPlayStream {
         Self {
             options: Some(options),
             playing: Arc::default(),
+            takeover: None,
         }
+    }
+
+    /// The same, claiming [`RemoteControl`] from `takeover` while a playback runs.
+    #[must_use]
+    pub fn with_takeover(mut self, takeover: Option<FacadeTakeover>) -> Self {
+        self.takeover = takeover;
+        self
     }
 
     /// A stream with nowhere to play to, which reports every call unsupported.
@@ -124,9 +139,25 @@ impl AirPlayStream {
             ));
         };
 
-        // The exclusive `core.takeover(RemoteControl)` upstream holds for the whole call
-        // (`__init__.py:122,134`) is the facade's to grant, not this crate's: it has to lock out
-        // *other protocols'* remote controls, and nothing here can see them.
+        // `takeover_release = self.core.takeover(RemoteControl)` (`__init__.py:125`), released by
+        // the `finally` at `__init__.py:139` — here, by dropping the guard on the way out of this
+        // function, on every path including an early `?`. For as long as a URL is playing,
+        // `stop()` has to reach *this* stream rather than MRP's remote control, because closing
+        // the play connection is the only way an AirPlay playback ends.
+        //
+        // A refused claim is logged rather than fatal: someone else holding the remote control
+        // means the playback is still perfectly playable, just not stoppable through the facade,
+        // and upstream would raise `InvalidStateError` out of `play_url` for it.
+        let _takeover = match self.takeover.as_ref() {
+            Some(takeover) => takeover
+                .claim(&[Interface::RemoteControl])
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "playing without the remote control takeover");
+                })
+                .ok(),
+            None => None,
+        };
+
         let mut player = AirPlayPlayer::connect(options).await?;
 
         let stop = Arc::new(Notify::new());
@@ -172,11 +203,19 @@ impl Stream for AirPlayStream {
         Box::pin(async move { self.play_url_at(&url, 0.0).await })
     }
 
-    fn stream_file(&self, path: &Path) -> BoxFuture<'_, pyatv_core::Result<()>> {
-        let path = path.display().to_string();
+    /// Never reached through the facade — `AirPlay` does not declare `StreamFile`, so
+    /// [`pyatv_core::facade::FacadeStream`] routes the call to RAOP. Kept explicit for a caller
+    /// holding this registration directly.
+    fn stream_file(
+        &self,
+        source: &MediaSource,
+        _metadata: Option<&MediaMetadata>,
+        _override_missing_metadata: bool,
+    ) -> BoxFuture<'_, pyatv_core::Result<()>> {
+        let source = format!("{source:?}");
         Box::pin(async move {
             Err(pyatv_core::Error::NotSupported(format!(
-                "AirPlay cannot stream {path}; RAOP does that"
+                "AirPlay cannot stream {source}; RAOP does that"
             )))
         })
     }

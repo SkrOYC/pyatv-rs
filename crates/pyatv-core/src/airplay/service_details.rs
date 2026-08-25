@@ -115,7 +115,7 @@ pub fn get_pairing_requirement(service: &BaseService) -> PairingRequirement {
 ///
 /// 1. `acl` (Access Control List) set to `"1"` means the device restricts pairing to members of the
 ///    same home, which pyatv does not implement → [`PairingRequirement::Disabled`].
-/// 2. The model matches [`UNSUPPORTED_MODEL_PREFIXES`] → [`PairingRequirement::Unsupported`].
+/// 2. The model matches `UNSUPPORTED_MODEL_PREFIXES` → [`PairingRequirement::Unsupported`].
 /// 3. Otherwise, whatever [`get_pairing_requirement`] says.
 pub fn update_service_details(service: &mut BaseService) {
     service.requires_password = is_password_required(service);

@@ -31,9 +31,9 @@ message SendHIDEventMessage {
   // There is a bit of magic in the raw data that's just not decoded yet, but
   // that doesn't matter. Just use this and it will work:
   //
-  //  438922cf080200000000000000000000010000000000000002000000200000000300000001000000000000<data>0000000000000001000000
+  //  438922cf080200000000000000000000010000000000000002000000200000000300000001000000000000`<data>`0000000000000001000000
   //
-  // <data> corresponds to the values above, e.g. 0001008B0001. The first 8
+  // `<data>` corresponds to the values above, e.g. 0001008B0001. The first 8
   // bytes is a timestamp (mach AbsoluteTime). It's a bit tricky to derive but
   // tvOS seems to accept old timestamps here. So it's probably fine to send
   // anything.

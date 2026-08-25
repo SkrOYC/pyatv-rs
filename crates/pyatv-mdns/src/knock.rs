@@ -79,7 +79,7 @@ const EHOSTDOWN: i32 = i32::MIN;
 
 /// Knock on every port in `ports` on `address`, concurrently, once each.
 ///
-/// Each port gets its own connect timeout of `timeout` minus [`KNOCK_TIMEOUT_BUFFER`]. Returns once
+/// Each port gets its own connect timeout of `timeout` minus `KNOCK_TIMEOUT_BUFFER`. Returns once
 /// every knock has finished, or immediately once one reports that the *host* is unreachable.
 ///
 /// # One knock per call

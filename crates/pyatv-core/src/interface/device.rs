@@ -4,7 +4,7 @@ use crate::Result;
 use crate::consts::PowerState;
 use crate::features::{FeatureInfo, FeatureName};
 use crate::interface::BoxFuture;
-use crate::models::{App, UserAccount};
+use crate::models::{App, OutputDevice, UserAccount};
 
 /// Power control.
 ///
@@ -44,21 +44,62 @@ pub trait Apps: Send + Sync + std::fmt::Debug {
 pub trait Audio: Send + Sync + std::fmt::Debug {
     /// Current volume as a percentage in `0.0..=100.0`.
     fn volume(&self) -> f32;
+
     /// Set the volume as a percentage in `0.0..=100.0`.
-    fn set_volume(&self, level: f32) -> BoxFuture<'_, Result<()>>;
+    ///
+    /// `set_volume(level, output_device=None)` (`pyatv/interface.py:1180-1188`). With
+    /// `output_device` set the level is applied to that one speaker in the playback group rather
+    /// than to the group as a whole; only MRP implements the targeted form
+    /// (`pyatv/protocols/mrp/__init__.py:868-885`), and every other protocol ignores the argument
+    /// the way upstream's do.
+    fn set_volume(
+        &self,
+        level: f32,
+        output_device: Option<&OutputDevice>,
+    ) -> BoxFuture<'_, Result<()>>;
+
     /// Step the volume up by the device's own increment.
     fn volume_up(&self) -> BoxFuture<'_, Result<()>>;
     /// Step the volume down by the device's own increment.
     fn volume_down(&self) -> BoxFuture<'_, Result<()>>;
 
-    /// Identifiers of the output devices currently in the playback group.
-    fn output_devices(&self) -> Vec<String>;
+    /// The output devices currently in the playback group.
+    ///
+    /// `output_devices` (`interface.py:1214-1218`) returns `List[OutputDevice]`, so a caller sees
+    /// each speaker's display name and last known volume rather than an identifier alone.
+    fn output_devices(&self) -> Vec<OutputDevice>;
     /// Add devices to the playback group.
     fn add_output_devices(&self, identifiers: &[String]) -> BoxFuture<'_, Result<()>>;
     /// Remove devices from the playback group.
     fn remove_output_devices(&self, identifiers: &[String]) -> BoxFuture<'_, Result<()>>;
     /// Replace the playback group membership outright.
     fn set_output_devices(&self, identifiers: &[String]) -> BoxFuture<'_, Result<()>>;
+}
+
+/// Notified when the volume or the playback group changes.
+///
+/// Ports `pyatv.interface.AudioListener` (`pyatv/interface.py:1139-1159`). Registered through
+/// [`crate::interface::AppleTV::add_audio_listener`] and held weakly, as every other listener here
+/// is.
+///
+/// Every method has a default no-op body so a caller that only cares about one of the three does
+/// not have to write the others; upstream's are `@abstractmethod`, but Python callers routinely
+/// subclass and override one, and there is no equivalent of that in Rust without defaults.
+pub trait AudioListener: Send + Sync + std::fmt::Debug {
+    /// The device's own volume changed.
+    fn volume_update(&self, old_level: f32, new_level: f32) {
+        let _ = (old_level, new_level);
+    }
+
+    /// One output device's volume changed.
+    fn volume_device_update(&self, output_device: &OutputDevice, old_level: f32, new_level: f32) {
+        let _ = (output_device, old_level, new_level);
+    }
+
+    /// The playback group's membership changed.
+    fn outputdevices_update(&self, old_devices: &[OutputDevice], new_devices: &[OutputDevice]) {
+        let _ = (old_devices, new_devices);
+    }
 }
 
 /// User account enumeration and switching.

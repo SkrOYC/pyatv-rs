@@ -12,7 +12,7 @@ use pyatv_proto_companion::test_support as support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pyatv_core::facade::{FacadeAppleTV, SetupData};
+use pyatv_core::facade::{FacadeAppleTV, SetupData, StateDispatcher};
 use pyatv_core::interface::{AppleTV, DeviceListener, PowerListener};
 use pyatv_core::storage::InfoSettings;
 use pyatv_core::{
@@ -51,7 +51,8 @@ async fn connect(device: &FakeCompanionDevice) -> Arc<dyn AppleTV> {
         service,
         info: InfoSettings::default(),
         listener: Some(Arc::clone(&listeners) as Arc<dyn DeviceListener>),
-        power_listener: Some(listeners as Arc<dyn PowerListener>),
+        power_listener: Some(Arc::clone(&listeners) as Arc<dyn PowerListener>),
+        state_dispatcher: Some(listeners as Arc<dyn StateDispatcher>),
     })
     .await
     .expect("setup must succeed")
@@ -456,7 +457,7 @@ async fn set_volume_sends_a_fraction_and_reads_back_a_percentage() {
     tokio::time::sleep(SETTLE).await;
 
     audio
-        .set_volume(42.0)
+        .set_volume(42.0, None)
         .await
         .expect("set_volume must succeed");
 
@@ -731,6 +732,7 @@ async fn companions_own_all_features_filters_on_state() {
         info: InfoSettings::default(),
         listener: None,
         power_listener: None,
+        state_dispatcher: None,
     })
     .await
     .expect("setup must succeed")
@@ -957,6 +959,7 @@ async fn setup_declines_without_credentials() {
         info: InfoSettings::default(),
         listener: None,
         power_listener: None,
+        state_dispatcher: None,
     })
     .await
     .expect("declining is not an error");

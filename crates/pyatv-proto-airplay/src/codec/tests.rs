@@ -2,7 +2,7 @@
 
 use bytes::BytesMut;
 
-use super::{Frame, Request, Response, encode_frame, parse_frame};
+use super::{Frame, MAX_BODY_LEN, Request, Response, encode_frame, parse_frame};
 
 fn request(method: &str, uri: &str, headers: &[(&str, &str)], body: &[u8]) -> Request {
     Request {
@@ -186,4 +186,32 @@ fn a_start_line_matching_neither_shape_is_an_error() {
 #[test]
 fn a_non_numeric_content_length_is_an_error() {
     assert!(parse_frame(b"HTTP/1.1 200 OK\r\nContent-Length: soon\r\n\r\n").is_err());
+}
+
+/// `u64::MAX` as a `Content-Length` would overflow `body_start + content_length` on a 64-bit
+/// target and does not fit a `usize` at all; either way it is an error rather than a panic or a
+/// wrapped, far-too-small body slice.
+#[test]
+fn a_content_length_that_cannot_fit_a_usize_is_an_error() {
+    let error = parse_frame(b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n")
+        .expect_err("refused");
+
+    assert!(error.to_string().contains("Content-Length"), "{error}");
+}
+
+/// A body one byte past the cap is refused; the cap itself is accepted, so the guard cannot be
+/// off by one in the direction that breaks a legitimate message.
+#[test]
+fn a_content_length_over_the_cap_is_an_error() {
+    let over = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+        MAX_BODY_LEN + 1
+    );
+    let error = parse_frame(over.as_bytes()).expect_err("refused");
+    assert!(error.to_string().contains("exceeds"), "{error}");
+
+    // At the cap the message is merely incomplete — the parser waits for the body rather than
+    // refusing it.
+    let at = format!("HTTP/1.1 200 OK\r\nContent-Length: {MAX_BODY_LEN}\r\n\r\n");
+    assert!(parse_frame(at.as_bytes()).expect("valid").is_none());
 }

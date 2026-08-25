@@ -50,6 +50,15 @@ pub struct StreamContext {
     /// The `Session` header value the receiver assigned. Zero on the AirPlay 2 path, which never
     /// learns one — and which therefore really does send `Session: 0`.
     pub rtsp_session: u32,
+    /// The RTP synchronisation source every audio packet header carries.
+    ///
+    /// `self.rtsp.session_id` (`stream_client.py:586`) — the *client's* random session identifier,
+    /// drawn once by [`crate::rtsp::RtspSession::new`] and constant for the whole connection.
+    /// Upstream reads it off the live `RtspSession` on every packet; this port copies it in here
+    /// once at [`crate::raop::stream::StreamClient::initialize`] time instead, so the pacing loop
+    /// never has to take the RTSP connection lock to build a header. Same value, no contention
+    /// with the `/feedback` task or a concurrent volume change.
+    pub ssrc: u32,
     /// Last known volume in dBFS, or `None` if nothing has set one.
     pub volume: Option<f32>,
 }
@@ -68,6 +77,7 @@ impl Default for StreamContext {
             control_port: 0,
             timing_port: 0,
             rtsp_session: 0,
+            ssrc: 0,
             volume: None,
         }
     }
@@ -80,8 +90,8 @@ impl StreamContext {
     /// RTP clock anchored to the current NTP time, and the padding counter cleared. Called once at
     /// the start of `send_audio` and once again at teardown, so it runs twice per session.
     ///
-    /// `volume` and the negotiated ports deliberately survive: upstream's `reset` does not touch
-    /// them either, which is what lets a volume set before streaming apply once it starts.
+    /// `volume`, `ssrc` and the negotiated ports deliberately survive: upstream's `reset` does not
+    /// touch them either, which is what lets a volume set before streaming apply once it starts.
     pub fn reset(&mut self) {
         self.rtpseq = rand::random();
         self.start_ts = timing::ntp2ts(timing::ntp_now(), self.audio.sample_rate);
@@ -283,6 +293,7 @@ mod tests {
             server_port: 6000,
             control_port: 6001,
             rtsp_session: 1,
+            ssrc: 0xDEAD_BEEF,
             volume: Some(-15.0),
             padding_sent: 100,
             ..StreamContext::default()
@@ -293,6 +304,7 @@ mod tests {
         assert_eq!(context.server_port, 6000);
         assert_eq!(context.control_port, 6001);
         assert_eq!(context.rtsp_session, 1);
+        assert_eq!(context.ssrc, 0xDEAD_BEEF);
         assert_eq!(context.volume, Some(-15.0));
         assert_eq!(context.padding_sent, 0);
         assert!(context.start_ts > 0);

@@ -82,6 +82,21 @@ async fn an_airplay_2_play_runs_to_the_end_of_the_media() {
             "/setProperty?reverseEndTime",
         ]
     );
+
+    // `/rate` is not appended after the four: upstream sends it *between* the second and the third
+    // `setProperty` (`airplayv2.py:246-272`, where the `POST` sits at line 252 in the middle of the
+    // block). The counter above only proves it was sent at all, so the interleaving is pinned here.
+    let calls = state.play.calls.lock().await;
+    assert_eq!(
+        calls.iter().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "/setProperty?isInterestedInDateRange",
+            "/setProperty?actionAtItemEnd",
+            "/rate?value=1.000000",
+            "/setProperty?forwardEndTime",
+            "/setProperty?reverseEndTime",
+        ]
+    );
 }
 
 /// `test_play_video` on `AirPlay` 1 — one `POST /play` and nothing else on the wire.
@@ -248,10 +263,17 @@ async fn stopping_ends_the_call_without_a_request() {
         .queue((0..200).map(|_| PlaybackAnswer::playing(600.0)))
         .await;
 
+    // The stop is raised once the poll loop has demonstrably started, not after a fixed delay: a
+    // sleep long enough to be reliable on a loaded machine is a sleep this suite pays on every run,
+    // and a short one makes the `polls > 0` assertion below a race. Waiting on the receiver's own
+    // counter is both instant and certain.
     let stop = Arc::new(Notify::new());
     let signal = Arc::clone(&stop);
+    let polling = Arc::clone(&state);
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        while polling.play.polls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         signal.notify_one();
     });
 

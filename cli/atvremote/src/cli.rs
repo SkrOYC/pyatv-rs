@@ -159,7 +159,7 @@ pub enum Command {
 
     /// Stream an audio file over RAOP.
     StreamFile {
-        /// Path to the audio file.
+        /// Path to the audio file, an `http(s)://` URL, or `-` for standard input.
         path: PathBuf,
     },
 

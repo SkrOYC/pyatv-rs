@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pyatv_core::interface::{Audio, BoxFuture};
+use pyatv_core::models::OutputDevice;
 use pyatv_core::{Error as CoreError, Result as CoreResult};
 
 use crate::facade::remote::send_hid_key;
@@ -41,7 +42,7 @@ impl MrpAudio {
         Self { protocol }
     }
 
-    /// `set_volume` against this device's own output UID (`__init__.py:868-885`).
+    /// `set_volume` against this device's own output UID (`__init__.py:868-879`).
     ///
     /// The wait is skipped when the device only supports relative control, or when the cached level
     /// already matches — upstream's `if self.is_volume_absolute and self._volume != level`.
@@ -58,6 +59,28 @@ impl MrpAudio {
             .await?;
 
         if volume.absolute && (volume.level - level).abs() > f32::EPSILON {
+            tokio::time::timeout(CONFIRM_TIMEOUT, confirmed)
+                .await
+                .map_err(|_| Error::Timeout("SET_VOLUME_MESSAGE".to_owned()))?;
+        }
+        Ok(())
+    }
+
+    /// `set_volume` against one speaker in the group (`__init__.py:880-885`).
+    ///
+    /// The `else` branch of upstream's `set_volume`: the message is addressed to the caller's
+    /// device rather than to ours, and the confirmation wait is gated on *that* device's last known
+    /// level — with no `is_volume_absolute` check, because the capability flags describe this
+    /// device and say nothing about someone else's speaker.
+    async fn set_device_level(&self, device: &OutputDevice, level: f32) -> Result<()> {
+        let state = self.protocol.state();
+
+        let confirmed = state.volume_changed();
+        self.protocol
+            .send(messages::set_volume(&device.identifier, level / 100.0)?)
+            .await?;
+
+        if (device.volume - level).abs() > f32::EPSILON {
             tokio::time::timeout(CONFIRM_TIMEOUT, confirmed)
                 .await
                 .map_err(|_| Error::Timeout("SET_VOLUME_MESSAGE".to_owned()))?;
@@ -140,8 +163,19 @@ impl Audio for MrpAudio {
         self.protocol.state().volume().level
     }
 
-    fn set_volume(&self, level: f32) -> BoxFuture<'_, CoreResult<()>> {
-        Box::pin(async move { self.set_level(level).await.map_err(Into::into) })
+    fn set_volume(
+        &self,
+        level: f32,
+        output_device: Option<&OutputDevice>,
+    ) -> BoxFuture<'_, CoreResult<()>> {
+        let output_device = output_device.cloned();
+        Box::pin(async move {
+            match output_device {
+                Some(device) => self.set_device_level(&device, level).await,
+                None => self.set_level(level).await,
+            }
+            .map_err(Into::into)
+        })
     }
 
     fn volume_up(&self) -> BoxFuture<'_, CoreResult<()>> {
@@ -152,8 +186,8 @@ impl Audio for MrpAudio {
         Box::pin(async move { self.step(false).await.map_err(Into::into) })
     }
 
-    fn output_devices(&self) -> Vec<String> {
-        self.protocol.state().volume().identifiers()
+    fn output_devices(&self) -> Vec<OutputDevice> {
+        self.protocol.state().volume().output_devices
     }
 
     fn add_output_devices(&self, identifiers: &[String]) -> BoxFuture<'_, CoreResult<()>> {

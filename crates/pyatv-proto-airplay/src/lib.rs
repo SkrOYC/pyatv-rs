@@ -36,7 +36,7 @@ pub use ap2::{
 };
 pub use auth::{PairSetupProcedure, PairVerifyProcedure, extract_credentials, verify_connection};
 pub use codec::{AirPlayCodec, Frame};
-pub use error::Error;
+pub use error::{AudioFailure, Error};
 pub use http::HttpConnection;
 pub use pairing::{AirPlayPairingHandler, AirPlayPairingOptions};
 pub use rtsp::RtspSession;

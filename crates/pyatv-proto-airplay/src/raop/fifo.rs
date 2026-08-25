@@ -11,8 +11,20 @@
 //!
 //! Individual removal does not exist at all: `__delitem__` raises `NotImplementedError`, so
 //! packets leave only by eviction or [`PacketFifo::clear`].
+//!
+//! # Why a map and a queue rather than one queue
+//!
+//! Upstream's `_items` is a Python `dict`, so `seqno in self.packet_backlog` is a hash lookup.
+//! A single `VecDeque<(u16, _)>` reproduces the insertion order but turns every lookup into a
+//! linear scan of up to [`PACKET_BACKLOG_SIZE`] entries — and the *only* caller is a retransmit
+//! responder driven by unauthenticated datagrams, so a burst of requests would cost
+//! `lost_packets * 1000` comparisons each. The pair here keeps upstream's two properties and
+//! restores its complexity: the [`std::collections::HashMap`] answers lookups in constant time and
+//! the [`VecDeque`] of keys preserves insertion order for eviction.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+
+use bytes::Bytes;
 
 /// How many packets are kept for retransmission.
 ///
@@ -23,7 +35,10 @@ pub const PACKET_BACKLOG_SIZE: usize = 1000;
 /// An insertion-ordered, bounded map from RTP sequence number to the packet that was sent.
 #[derive(Debug)]
 pub struct PacketFifo {
-    items: VecDeque<(u16, Vec<u8>)>,
+    /// The packets themselves, looked up in constant time.
+    items: HashMap<u16, Bytes>,
+    /// The same keys in insertion order, so eviction can find the oldest one.
+    order: VecDeque<u16>,
     upper_limit: usize,
 }
 
@@ -31,8 +46,10 @@ impl PacketFifo {
     /// A backlog holding at most `upper_limit` packets.
     #[must_use]
     pub fn new(upper_limit: usize) -> Self {
+        let capacity = upper_limit.min(PACKET_BACKLOG_SIZE);
         Self {
-            items: VecDeque::with_capacity(upper_limit.min(PACKET_BACKLOG_SIZE)),
+            items: HashMap::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
             upper_limit,
         }
     }
@@ -55,8 +72,8 @@ impl PacketFifo {
     /// `ValueError`. A caller has no recovery for that beyond noticing it, and a stream should
     /// never produce it: the sequence number advances once per packet and the backlog holds far
     /// fewer than a wrap's worth.
-    pub fn insert(&mut self, seqno: u16, packet: Vec<u8>) -> bool {
-        if self.items.iter().any(|(index, _)| *index == seqno) {
+    pub fn insert(&mut self, seqno: u16, packet: impl Into<Bytes>) -> bool {
+        if self.items.contains_key(&seqno) {
             tracing::debug!(
                 seqno,
                 "refusing to overwrite a packet already in the backlog"
@@ -64,20 +81,28 @@ impl PacketFifo {
             return false;
         }
 
-        if self.items.len() + 1 > self.upper_limit {
-            let _ = self.items.pop_front();
+        // A zero limit would otherwise store a packet it can never evict.
+        if self.upper_limit == 0 {
+            return false;
         }
-        self.items.push_back((seqno, packet));
+        if self.items.len() + 1 > self.upper_limit
+            && let Some(oldest) = self.order.pop_front()
+        {
+            let _ = self.items.remove(&oldest);
+        }
+
+        self.order.push_back(seqno);
+        let _ = self.items.insert(seqno, packet.into());
         true
     }
 
     /// Look a packet up by sequence number.
+    ///
+    /// The returned [`Bytes`] shares the stored buffer, so answering a retransmission request
+    /// costs a reference-count bump rather than a copy of the packet.
     #[must_use]
-    pub fn get(&self, seqno: u16) -> Option<&[u8]> {
-        self.items
-            .iter()
-            .find(|(index, _)| *index == seqno)
-            .map(|(_, packet)| packet.as_slice())
+    pub fn get(&self, seqno: u16) -> Option<Bytes> {
+        self.items.get(&seqno).cloned()
     }
 
     /// Drop every packet.
@@ -86,6 +111,7 @@ impl PacketFifo {
     /// (big!)" (`stream_client.py:462`). The backlog does not survive across sessions.
     pub fn clear(&mut self) {
         self.items.clear();
+        self.order.clear();
     }
 }
 
@@ -99,13 +125,18 @@ impl Default for PacketFifo {
 mod tests {
     use super::{PACKET_BACKLOG_SIZE, PacketFifo};
 
+    /// Compare a stored packet against the bytes it was inserted with.
+    fn stored(fifo: &PacketFifo, seqno: u16) -> Option<Vec<u8>> {
+        fifo.get(seqno).map(|packet| packet.to_vec())
+    }
+
     #[test]
     fn packets_come_back_out_by_sequence_number() {
         let mut fifo = PacketFifo::new(4);
 
         assert!(fifo.insert(7, vec![1, 2, 3]));
-        assert_eq!(fifo.get(7), Some(&[1, 2, 3][..]));
-        assert_eq!(fifo.get(8), None);
+        assert_eq!(stored(&fifo, 7), Some(vec![1, 2, 3]));
+        assert_eq!(stored(&fifo, 8), None);
         assert_eq!(fifo.len(), 1);
     }
 
@@ -119,9 +150,13 @@ mod tests {
         fifo.insert(65_535, vec![0xBB]);
         fifo.insert(0, vec![0xCC]);
 
-        assert_eq!(fifo.get(65_534), None, "the first inserted was evicted");
-        assert_eq!(fifo.get(65_535), Some(&[0xBB][..]));
-        assert_eq!(fifo.get(0), Some(&[0xCC][..]));
+        assert_eq!(
+            stored(&fifo, 65_534),
+            None,
+            "the first inserted was evicted"
+        );
+        assert_eq!(stored(&fifo, 65_535), Some(vec![0xBB]));
+        assert_eq!(stored(&fifo, 0), Some(vec![0xCC]));
         assert_eq!(fifo.len(), 2);
     }
 
@@ -132,7 +167,7 @@ mod tests {
 
         assert!(fifo.insert(1, vec![0xAA]));
         assert!(!fifo.insert(1, vec![0xBB]));
-        assert_eq!(fifo.get(1), Some(&[0xAA][..]));
+        assert_eq!(stored(&fifo, 1), Some(vec![0xAA]));
         assert_eq!(fifo.len(), 1);
     }
 
@@ -144,7 +179,7 @@ mod tests {
         fifo.clear();
 
         assert!(fifo.is_empty());
-        assert_eq!(fifo.get(1), None);
+        assert_eq!(stored(&fifo, 1), None);
     }
 
     #[test]
@@ -156,7 +191,35 @@ mod tests {
         }
 
         assert_eq!(fifo.len(), PACKET_BACKLOG_SIZE);
-        assert_eq!(fifo.get(9), None);
-        assert_eq!(fifo.get(10), Some(&[0][..]));
+        assert_eq!(stored(&fifo, 9), None);
+        assert_eq!(stored(&fifo, 10), Some(vec![0]));
+    }
+
+    /// The order queue and the map must stay the same size, or eviction would either leak entries
+    /// or drop live ones. Filling well past the limit and re-checking both is the cheapest way to
+    /// pin that.
+    #[test]
+    fn eviction_keeps_the_map_and_the_order_queue_in_step() {
+        let mut fifo = PacketFifo::new(3);
+
+        for seqno in 0..50u16 {
+            assert!(fifo.insert(seqno, vec![0xEE]));
+        }
+
+        assert_eq!(fifo.len(), 3);
+        assert_eq!(fifo.order.len(), fifo.items.len());
+        assert_eq!(stored(&fifo, 46), None);
+        for seqno in 47..50u16 {
+            assert_eq!(stored(&fifo, seqno), Some(vec![0xEE]), "{seqno}");
+        }
+    }
+
+    /// A degenerate limit stores nothing rather than growing without bound.
+    #[test]
+    fn a_zero_limit_stores_nothing() {
+        let mut fifo = PacketFifo::new(0);
+
+        assert!(!fifo.insert(1, vec![0xAA]));
+        assert!(fifo.is_empty());
     }
 }

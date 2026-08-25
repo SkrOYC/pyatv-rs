@@ -162,7 +162,7 @@ impl HapSrpClient {
     /// Consume the accessory's M2 (`salt` and `B`) and produce the client proof `M1` for M3.
     ///
     /// `B` is normalised to `srptools`' minimal big-endian form before anything else touches it,
-    /// because that is the encoding pyatv hashes into `M1` — see [`crate::srp_encoding`]. Values
+    /// because that is the encoding pyatv hashes into `M1` — see `crate::srp_encoding`. Values
     /// wider than [`MODULUS_LEN`] are rejected outright rather than handed to `srp`, which would
     /// panic on them.
     ///

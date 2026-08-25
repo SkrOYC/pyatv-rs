@@ -21,6 +21,38 @@ pub const MAX_PACKETS_COMPENSATE: u32 = 3;
 /// packet timing and never drops a packet.
 pub const SLOW_WARNING_THRESHOLD: u32 = 5;
 
+/// How many frames should have been sent after `elapsed`, at `sample_rate`.
+///
+/// `int((monotonic_ns() - self.start_time_ns) / (10**9 / self.sample_rate))`
+/// (`stream_client.py:637`). The divisor is a **float** division in Python — `10**9 / 44100` is
+/// `22675.736961451247`, not `22675` — and the whole expression is then truncated once, at the
+/// end. Doing the division in integers instead makes the divisor 0.0032 % too small, so the
+/// expected count creeps ahead of the real one by about one frame per 310 000: roughly one extra
+/// frame every seven seconds of playback at 44.1 kHz, which is enough to trigger compensation
+/// packets on a stream that is perfectly on time. Hence `f64` throughout, matching upstream bit
+/// for bit over any realistic session length.
+///
+/// Split out as a free function so it can be pinned against pyatv's own arithmetic with a fixed
+/// elapsed time rather than a real clock.
+#[must_use]
+pub fn expected_frames(elapsed: std::time::Duration, sample_rate: u32) -> u64 {
+    let nanos_per_frame = 1e9 / f64::from(sample_rate.max(1));
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "elapsed nanoseconds stay far inside f64's exact-integer range for any session"
+    )]
+    let elapsed_nanos = elapsed.as_nanos() as f64;
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the quotient of two non-negative values, truncated exactly as Python's int() is"
+    )]
+    let frames = (elapsed_nanos / nanos_per_frame) as u64;
+    frames
+}
+
 /// Frames sent and time elapsed for one streaming session.
 #[derive(Debug)]
 pub struct Statistics {
@@ -53,14 +85,11 @@ impl Statistics {
 
     /// How many frames *should* have been sent by now for the stream to be in real time.
     ///
-    /// `int((monotonic_ns() - start_time_ns) / (10**9 / sample_rate))` (`stream_client.py:637`),
-    /// recomputed on every read rather than cached.
+    /// [`expected_frames`] against the session clock, recomputed on every read rather than cached
+    /// (`stream_client.py:635-638`).
     #[must_use]
     pub fn expected_frame_count(&self) -> u64 {
-        let elapsed_nanos = self.start.elapsed().as_nanos();
-        let nanos_per_frame = u128::from(1_000_000_000u64 / u64::from(self.sample_rate.max(1)));
-
-        u64::try_from(elapsed_nanos / nanos_per_frame.max(1)).unwrap_or(u64::MAX)
+        expected_frames(self.start.elapsed(), self.sample_rate)
     }
 
     /// How many frames behind real time the stream is. Zero when it is ahead.

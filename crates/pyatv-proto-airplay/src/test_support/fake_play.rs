@@ -120,6 +120,13 @@ pub struct PlayState {
     pub body: Mutex<Option<plist::Value>>,
     /// Every `setProperty` target and its `value`, in arrival order.
     pub properties: Mutex<Vec<(String, plist::Value)>>,
+    /// Every post-`/play` call's path — both `setProperty` and `/rate` — in arrival order.
+    ///
+    /// `properties` deliberately holds only the `setProperty` calls, because that is what most
+    /// assertions want. The interleaving matters separately: upstream sends `/rate` *between* the
+    /// second and third `setProperty` (`airplayv2.py:252`), and nothing else records where in the
+    /// sequence it landed.
+    pub calls: Mutex<Vec<String>>,
     /// The `/playback-info` answers still queued, oldest first.
     pub answers: Mutex<Vec<PlaybackAnswer>>,
     /// A status to answer every `/play` with instead of `200`, or zero to answer normally.
@@ -189,6 +196,7 @@ pub async fn handle(request: &FakeRequest, state: &PlayState, mode: PlayMode) ->
         }
         ("POST", path) if path.starts_with("/rate") => {
             state.rates.fetch_add(1, Ordering::SeqCst);
+            state.calls.lock().await.push(path.to_owned());
             Some(PlayReply::empty(200, "OK"))
         }
         ("PUT", path) if path.starts_with("/setProperty") => {
@@ -302,6 +310,7 @@ async fn set_property(request: &FakeRequest, state: &PlayState, path: &str) -> P
         .unwrap_or(plist::Value::Boolean(false));
 
     state.properties.lock().await.push((path.to_owned(), value));
+    state.calls.lock().await.push(path.to_owned());
 
     PlayReply::empty(200, "OK")
 }

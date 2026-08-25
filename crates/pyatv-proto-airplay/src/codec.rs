@@ -8,7 +8,7 @@
 //! Bodies stay opaque [`bytes::Bytes`] at this layer. Decoding `application/x-apple-binary-plist`
 //! is [`crate::rtsp`]'s job, one layer up.
 //!
-//! The parsing itself lives in [`parse`] as plain functions over `&[u8]`, so it can be tested
+//! The parsing itself lives in `parse` as plain functions over `&[u8]`, so it can be tested
 //! against captured byte slices with no runtime involved; the [`tokio_util::codec`] impls at the
 //! bottom of this file are thin wrappers over them. [`crate::http::HttpConnection`] uses the plain
 //! functions directly rather than `Framed`, because the post-pair-verify
@@ -23,7 +23,7 @@ mod tests;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-pub use parse::parse_frame;
+pub use parse::{MAX_BODY_LEN, parse_frame};
 
 use crate::Error;
 

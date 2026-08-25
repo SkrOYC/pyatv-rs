@@ -3,7 +3,7 @@
 //! Ports `pyatv/storage/`, and deliberately ports it byte-for-byte: the document written here is
 //! the same `~/.pyatv.conf` pyatv writes, so a user who has already paired with pyatv keeps their
 //! credentials, and one who pairs here can go back. The shape is defined in [`settings`], the
-//! shared logic in [`core`](self::core), and the two backends in [`file`] and [`memory`].
+//! shared logic in [`core`], and the two backends in [`mod@file`] and [`memory`].
 //!
 //! ```text
 //! StorageModel { version: 1, devices: [Settings] }

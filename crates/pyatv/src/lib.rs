@@ -15,20 +15,23 @@
 //! See `docs/research/pyatv-architecture.md` for the upstream design this reproduces.
 
 pub mod connect;
+pub mod helpers;
 pub mod pair;
 pub mod scan;
 pub mod tunnel;
 
 pub use connect::connect;
+pub use helpers::{auto_connect, get_unique_id, is_device_supported, is_streamable};
 pub use pair::pair;
 pub use scan::scan;
 
+pub use pyatv_core::facade::Interface;
 pub use pyatv_core::interface::{
-    AppleTV, Apps, Audio, DeviceListener, Features, Keyboard, Metadata, PairingHandler,
-    PlaybackListener, Power, PowerListener, PushUpdater, RemoteControl, Stream, TouchGestures,
-    UserAccounts,
+    AppleTV, Apps, Audio, AudioListener, DeviceListener, Features, Keyboard, KeyboardListener,
+    Metadata, PairingHandler, PlaybackListener, Power, PowerListener, PushUpdater, RemoteControl,
+    Stream, TouchGestures, UserAccounts,
 };
-pub use pyatv_core::models::Playing;
+pub use pyatv_core::models::{MediaMetadata, MediaSource, OutputDevice, Playing};
 pub use pyatv_core::storage::{
     AirPlaySettings, CompanionSettings, DmapSettings, FileStorage, InfoSettings, MemoryStorage,
     MrpSettings, MrpTunnel, ProtocolSettings, RaopSettings, Settings, Storage, StorageModel,

@@ -18,6 +18,7 @@ pub mod volume;
 use std::sync::{Arc, Mutex, Weak};
 
 use pyatv_core::consts::PowerState;
+use pyatv_core::facade::StateDispatcher;
 use pyatv_core::interface::{PlaybackListener, PowerListener};
 use pyatv_core::models::{App, Playing};
 use tokio::sync::{Notify, mpsc, watch};
@@ -53,6 +54,12 @@ struct PushState {
 struct Listeners {
     push: Mutex<PushState>,
     power: Mutex<Option<Arc<dyn PowerListener>>>,
+    /// Where volume and output-device changes are reported.
+    ///
+    /// `MrpAudio.state_dispatcher` (`__init__.py:750-754`), which upstream dispatches
+    /// `UpdatedState.Volume`, `UpdatedState.OutputDeviceVolume` and `UpdatedState.OutputDevices`
+    /// into so the facade can turn them into `AudioListener` callbacks.
+    state: Mutex<Option<Arc<dyn StateDispatcher>>>,
 }
 
 impl Listeners {
@@ -72,6 +79,11 @@ impl Listeners {
     /// The power listener, if one is registered.
     fn power_listener(&self) -> Option<Arc<dyn PowerListener>> {
         self.power.lock().ok()?.clone()
+    }
+
+    /// The state dispatcher, if one was supplied at setup.
+    fn state_dispatcher(&self) -> Option<Arc<dyn StateDispatcher>> {
+        self.state.lock().ok()?.clone()
     }
 }
 
@@ -173,6 +185,13 @@ impl MrpState {
     pub fn set_power_listener(&self, listener: Option<Arc<dyn PowerListener>>) {
         if let Ok(mut slot) = self.listeners.power.lock() {
             *slot = listener;
+        }
+    }
+
+    /// Register where volume and output-device changes are reported.
+    pub fn set_state_dispatcher(&self, dispatcher: Option<Arc<dyn StateDispatcher>>) {
+        if let Ok(mut slot) = self.listeners.state.lock() {
+            *slot = dispatcher;
         }
     }
 
@@ -308,7 +327,7 @@ impl MrpState {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Decode`] if a message this state does handle carries a payload that does
+    /// Returns [`crate::Error::Decode`] if a message this state does handle carries a payload that does
     /// not parse.
     pub fn handle(&self, message: &MrpMessage) -> Result<()> {
         match message.message_type_enum() {

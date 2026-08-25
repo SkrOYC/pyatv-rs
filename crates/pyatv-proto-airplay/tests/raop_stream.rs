@@ -170,6 +170,12 @@ async fn metadata_and_progress_reach_the_receiver() {
     );
 
     // `start/current/end`, all three RTP timestamps, with start and current equal.
+    //
+    // The end tick is a whole number of seconds past the start, because upstream's
+    // `AudioSource.duration` is an `int` — `round(self.src.duration)` (`audio_source.py:720-724`) —
+    // and `end = start + duration * sample_rate` (`stream_client.py:403`). This clip is 0.05 s, so
+    // the rounded duration is zero and `end == start`: a receiver is told the track has no length,
+    // exactly as pyatv tells it.
     let progress = state
         .progress
         .lock()
@@ -181,7 +187,36 @@ async fn metadata_and_progress_reach_the_receiver() {
     assert_eq!(parts[0], parts[1], "{progress}");
     let start: u32 = parts[0].parse().expect("a number");
     let end: u32 = parts[2].parse().expect("a number");
-    assert!(end > start, "{progress}");
+    assert_eq!(
+        end, start,
+        "a sub-second clip rounds to a zero duration: {progress}"
+    );
+}
+
+/// A clip long enough to round to a whole second advances the end tick by exactly that many
+/// seconds' worth of RTP ticks, and by nothing more precise.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_progress_end_is_quantised_to_whole_seconds() {
+    let (_device, stream, state) = ap2(FakeRaopOptions::default()).await;
+
+    // 1.4 s rounds to 1, so the end tick is one second of ticks past the start rather than the 1.4
+    // seconds' worth the exact decoded length would give.
+    stream
+        .stream_source(Source::Bytes(sine_wav(1.4)))
+        .await
+        .expect("the file should stream");
+
+    let progress = state
+        .progress
+        .lock()
+        .await
+        .clone()
+        .expect("a progress line");
+    let parts: Vec<&str> = progress.split('/').collect();
+    let start: u32 = parts[0].parse().expect("a number");
+    let end: u32 = parts[2].parse().expect("a number");
+
+    assert_eq!(end - start, 44_100, "{progress}");
 }
 
 /// A file with no tags ships an **empty** `mlit` container, not the placeholder identity.

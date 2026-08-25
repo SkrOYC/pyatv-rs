@@ -12,8 +12,29 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-bytes.workspace = true
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+hex = "0.4.3"
+md-5 = "0.11.0"
+plist = "1.10.0"
 pyatv-core.workspace = true
+pyatv-mdns.workspace = true
+rand = "0.10.2"
+sha2 = "0.11.0"
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[features]
+# The hermetic DMAP device in `test_support`, published as part of the library so the umbrella
+# crate's integration tests can stand the same device up behind a real `connect()`. Unlike the other
+# protocol crates this pulls in nothing extra: DMAP has no crypto and therefore no reference
+# accessory to enable.
+test-support = []
+
+[dev-dependencies]
+# Self dev-dependency: the only way to turn a feature on for this crate's *own* test binaries, so
+# `cargo test -p pyatv-proto-dmap` keeps working without `--all-features`. `cargo add` refuses to
+# write this one ("cannot add `pyatv-proto-dmap` as a dependency to itself"), so it is by hand, the
+# same as in the other three protocol crates.
+pyatv-proto-dmap = { path = ".", features = ["test-support"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

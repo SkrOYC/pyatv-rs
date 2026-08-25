@@ -10,12 +10,13 @@
 use std::sync::LazyLock;
 
 use pyatv_proto_airplay::raop::metadata::TrackMetadata;
+use pyatv_proto_airplay::raop::pacing::expected_frames;
 use pyatv_proto_airplay::raop::packets::{
     AudioPacketHeader, RetransmitRequest, RtpHeader, SyncPacket, TimingPacket,
 };
 use pyatv_proto_airplay::raop::protocol_v2::AirPlayV2;
 use pyatv_proto_airplay::raop::timing;
-use pyatv_proto_airplay::raop::volume::{dbfs_to_pct, pct_to_dbfs};
+use pyatv_proto_airplay::raop::volume::{dbfs_to_pct, format_dbfs, pct_to_dbfs, volume_body};
 use pyatv_proto_airplay::rtsp::digest::digest_response;
 use pyatv_proto_airplay::rtsp::{AnnounceFormat, announce_sdp};
 use serde_json::Value;
@@ -446,5 +447,47 @@ fn the_digest_authorization_header_matches_pyatv() {
         );
 
         assert_eq!(header, string(vector, "header"), "{name}");
+    }
+}
+
+/// The whole `SET_PARAMETER volume` body, not just the number.
+///
+/// This is the vector that catches the `str(float)` difference: Python renders `-12.0`, Rust's
+/// `Display` for `f32` renders `-12`, and a receiver reading `volume: -12` is being told something
+/// pyatv never says. The `f32`/`f64` split is real but invisible here — the mapping's outputs are
+/// small multiples of `0.3` whose shortest representations agree in both widths.
+#[test]
+fn the_volume_body_matches_pyatv() {
+    for vector in group("volume_body") {
+        let percent = float(vector, "percent");
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the vector is a Python float; the port works in f32 as pyatv's wire value does"
+        )]
+        let ours = volume_body(pct_to_dbfs(percent as f32));
+
+        assert_eq!(ours, string(vector, "body"), "volume at {percent}%");
+        #[allow(clippy::cast_possible_truncation, reason = "as above")]
+        let rendered = format_dbfs(pct_to_dbfs(percent as f32));
+        assert_eq!(rendered, string(vector, "value"), "volume at {percent}%");
+    }
+}
+
+/// `expected_frame_count` at fixed elapsed times, which is what pins the float divisor.
+///
+/// `10**9 / 44100` is `22675.736961451247`; truncating it to `22675` first makes the count creep
+/// ahead of real time and provokes compensation packets on a stream that is exactly on time.
+#[test]
+fn the_expected_frame_count_matches_pyatv() {
+    for vector in group("pacing") {
+        let elapsed = std::time::Duration::from_nanos(number(vector, "elapsed_ns"));
+        let sample_rate = u32_field(vector, "sample_rate");
+        let expected = number(vector, "expected_frame_count");
+
+        assert_eq!(
+            expected_frames(elapsed, sample_rate),
+            expected,
+            "expected_frame_count({elapsed:?}, {sample_rate})"
+        );
     }
 }

@@ -29,7 +29,7 @@ use pyatv_core::airplay::{
 };
 use pyatv_core::consts::{DeviceModel, Protocol};
 use pyatv_core::device_info::lookup_model;
-use pyatv_core::facade::SetupData;
+use pyatv_core::facade::{FacadeTakeover, SetupData};
 use pyatv_core::features::FeatureName;
 use pyatv_core::models::{BaseService, DeviceInfo};
 use pyatv_pairing::{AuthenticationType, HapCredentials};
@@ -88,6 +88,11 @@ pub struct AirPlaySetupOptions {
     /// registered [`AirPlayStream`] unconfigured, so it reports `play_url` unsupported rather than
     /// failing the whole connect — upstream's registration is unconditional too.
     pub credentials: Option<HapCredentials>,
+    /// How `play_url` claims `RemoteControl` while a URL is playing.
+    ///
+    /// `partial(atv.takeover, proto)` handed to every protocol through `Core`
+    /// (`pyatv/__init__.py:138`, `pyatv/core/__init__.py:223`). `None` outside a facade.
+    pub takeover: Option<FacadeTakeover>,
     /// Which protocol version to play with. Upstream reads
     /// `settings.protocols.raop.protocol_version` even for the AirPlay-proper path
     /// (`__init__.py:150-156`), and its default is
@@ -113,6 +118,7 @@ pub fn setup(options: &AirPlaySetupOptions) -> SetupData {
             credentials,
             get_protocol_version(&options.service, options.protocol_version),
         ))
+        .with_takeover(options.takeover.clone())
     } else {
         tracing::debug!("no credentials for AirPlay, registering play_url as unsupported");
         AirPlayStream::unconfigured()
@@ -311,6 +317,7 @@ pub(super) mod tests {
             service: test_device_service(),
             address: "10.0.0.5".parse().expect("an address"),
             credentials,
+            takeover: None,
             protocol_version: pyatv_core::airplay::AirPlayVersion::Auto,
         }
     }

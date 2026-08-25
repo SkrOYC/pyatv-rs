@@ -22,7 +22,7 @@ use crate::raop::metadata::TrackMetadata;
 use crate::raop::net::{AudioSender, ControlClient, TimingServer};
 use crate::raop::protocol::StreamProtocol;
 use crate::raop::rtsp::{self as raop_rtsp, RtpInfo};
-use crate::raop::volume::pct_to_dbfs;
+use crate::raop::volume::{format_dbfs, pct_to_dbfs};
 
 use super::AudioProperties;
 
@@ -169,13 +169,19 @@ impl StreamClient {
         }
 
         let audio = AudioProperties::from_properties(properties);
+        // The RTP `ssrc` is the RTSP session identifier, drawn once per connection and constant
+        // from here on — so it is read once rather than on every packet. See `StreamContext::ssrc`.
+        let ssrc = with_connection(&self.connection, async |rtsp, _| Ok(rtsp.session_id())).await?;
         self.context.with(|context| {
             context.audio = audio;
             context.latency = super::context::latency_for(audio.sample_rate);
+            context.ssrc = ssrc;
         });
 
-        let control = ControlClient::start(self.local, 0).await?;
-        let timing = TimingServer::start(self.local, 0).await?;
+        // Both receive loops only answer this address; see `raop::net`'s module header.
+        let receiver = self.connection.lock().await.http.remote_address().ip();
+        let control = ControlClient::start(self.local, 0, receiver).await?;
+        let timing = TimingServer::start(self.local, 0, receiver).await?;
         tracing::debug!(
             control = control.port(),
             timing = timing.port(),
@@ -236,7 +242,7 @@ impl StreamClient {
     /// started.
     pub async fn set_volume(&self, dbfs: f32) -> Result<()> {
         with_connection(&self.connection, async |rtsp, http| {
-            raop_rtsp::set_parameter(rtsp, http, "volume", &dbfs.to_string()).await
+            raop_rtsp::set_parameter(rtsp, http, "volume", &format_dbfs(dbfs)).await
         })
         .await?;
         self.context.with(|context| context.volume = Some(dbfs));
@@ -253,6 +259,10 @@ impl StreamClient {
     /// `volume` is the deferred one: `RaopStream.stream_file` passes it only when setting the
     /// volume *before* streaming failed, because some receivers answer `500` until `FLUSH`
     /// (`raop/__init__.py:392-399`, `stream_client.py:450-451`).
+    ///
+    /// **Divergence.** Upstream guards the retry with `if volume:`, so a deferred `0.0` — a mute —
+    /// is dropped, because zero is falsy in Python. `Some(0.0)` is applied here; see
+    /// [`crate::raop::manager::RaopPlaybackManager`]'s `negotiate_volume`.
     ///
     /// # Errors
     ///
@@ -344,13 +354,20 @@ impl StreamClient {
             // `start` and `now` are the same value: upstream computes `context.rtptime` twice with
             // no state change in between (`stream_client.py:400-403`).
             let start = context.rtptime();
+            // `end = start + source.duration * sample_rate` (`stream_client.py:403`), where
+            // `AudioSource.duration` is typed `int` and `FileSource` returns
+            // `round(self.src.duration)` (`audio_source.py:720-724`) — so the end tick upstream
+            // sends is always a whole number of seconds past the start, never a fractional one.
+            // This port knows the exact decoded length, but rounding it the same way keeps the
+            // value a receiver sees identical. `round_ties_even` rather than `round` because
+            // Python's `round` is banker's rounding and this port's `f64::round` is not.
             #[allow(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
                 reason = "a duration in RTP ticks that overflows u32 is a 27-hour track"
             )]
-            let end = start
-                .wrapping_add((source.duration() * f64::from(context.audio.sample_rate)) as u32);
+            let seconds = source.duration().round_ties_even() as u32;
+            let end = start.wrapping_add(seconds.wrapping_mul(context.audio.sample_rate));
             let progress = format!("{start}/{start}/{end}");
 
             with_connection(&self.connection, async |rtsp, http| {

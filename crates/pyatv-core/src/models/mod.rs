@@ -12,10 +12,12 @@
 //! build-number tables it is derived from.
 
 mod config;
+mod media;
 mod playing;
 mod service;
 
 pub use config::BaseConfig;
+pub use media::{MediaMetadata, MediaSource, OutputDevice};
 pub use playing::{App, ArtworkInfo, Playing, UserAccount};
 pub use service::BaseService;
 

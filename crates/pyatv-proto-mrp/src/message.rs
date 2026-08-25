@@ -3,7 +3,7 @@
 //! `prost` models the envelope's seven declared fields and nothing else — it neither generates
 //! code for proto2 `extend` blocks nor keeps unknown fields after a decode
 //! (`docs/research/mrp-protobuf-spike.md`). A bare
-//! [`ProtocolMessage`](crate::protobuf::ProtocolMessage) is therefore *lossy*: round-tripping one
+//! [`ProtocolMessage`] is therefore *lossy*: round-tripping one
 //! through `prost` silently drops whatever concrete message it was carrying.
 //!
 //! So the unit that travels across [`crate::transport::MrpTransport`] is this type, which holds the

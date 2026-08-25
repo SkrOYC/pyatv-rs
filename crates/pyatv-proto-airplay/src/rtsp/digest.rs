@@ -23,7 +23,9 @@ pub const DIGEST_USERNAME: &str = "pyatv";
 /// Held for the lifetime of the connection once a `401` has been answered: upstream computes the
 /// header fresh per request from the same stored nonce and never re-parses a later challenge
 /// (`rtsp.py:275-279`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// [`Debug`] is written by hand and redacts the password — see the impl.
+#[derive(Clone, PartialEq, Eq)]
 pub struct DigestInfo {
     /// Username, always [`DIGEST_USERNAME`].
     pub username: String,
@@ -33,6 +35,25 @@ pub struct DigestInfo {
     pub password: String,
     /// Nonce from the challenge.
     pub nonce: String,
+}
+
+impl std::fmt::Debug for DigestInfo {
+    /// Hand-written so the device password never reaches a log line.
+    ///
+    /// This type is a field of [`crate::rtsp::RtspSession`], which is a field of the RAOP
+    /// connection, which appears in `tracing` events and in any `{:?}` of an error path — a
+    /// derived `Debug` would print the user's device password at every one of them. The realm and
+    /// nonce are public challenge parameters and stay visible, because they are what makes a
+    /// failed digest exchange diagnosable.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DigestInfo")
+            .field("username", &self.username)
+            .field("realm", &self.realm)
+            .field("password", &"<redacted>")
+            .field("nonce", &self.nonce)
+            .finish()
+    }
 }
 
 impl DigestInfo {
@@ -169,6 +190,19 @@ mod tests {
             parse_challenge("Digest realm=\"raop\", nonce=\"deadbeef\""),
             Some(("raop".to_owned(), "deadbeef".to_owned()))
         );
+    }
+
+    /// The password must not appear in a `Debug` rendering, because this type is reachable from
+    /// every RAOP connection that gets logged.
+    #[test]
+    fn the_debug_rendering_redacts_the_password() {
+        let rendered = format!("{:?}", DigestInfo::new("raop", "hunter2", "abc123"));
+
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // The challenge parameters stay visible, so a failure is still diagnosable.
+        assert!(rendered.contains("raop"), "{rendered}");
+        assert!(rendered.contains("abc123"), "{rendered}");
     }
 
     /// A challenge with a third quoted parameter does not match upstream's positional split, and

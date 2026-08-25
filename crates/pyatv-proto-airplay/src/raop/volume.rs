@@ -36,16 +36,52 @@ pub const VOLUME_STEP: f32 = 5.0;
 
 /// Convert a percentage to the dBFS value the wire carries.
 ///
-/// `pct_to_dbfs` (`utils.py:286-291`). Zero maps to [`DBFS_MUTED`] rather than to [`DBFS_MIN`];
-/// upstream tests that with `math.isclose(level, 0.0)`, whose default relative tolerance reduces to
-/// an exact-zero comparison at this magnitude, so an epsilon test is used here.
+/// `pct_to_dbfs` (`utils.py:286-291`). Zero maps to [`DBFS_MUTED`] rather than to [`DBFS_MIN`].
+///
+/// The comparison is against exact zero, because that is what upstream's
+/// `math.isclose(level, 0.0)` amounts to: `isclose` scales its default relative tolerance by the
+/// larger operand, and with the other operand fixed at `0.0` the product is `0.0`, so only an
+/// exact zero passes — `math.isclose(1e-300, 0.0)` is `False`. An `abs() <= f32::EPSILON` test
+/// would instead mute every percentage below about `1.2e-7`, which upstream does not.
 #[must_use]
 pub fn pct_to_dbfs(level: f32) -> f32 {
-    if level.abs() <= f32::EPSILON {
+    if level == 0.0 {
         return DBFS_MUTED;
     }
 
     map_range(level, PERCENTAGE_MIN, PERCENTAGE_MAX, DBFS_MIN, DBFS_MAX)
+}
+
+/// Render a dBFS level the way `SET_PARAMETER volume` expects it.
+///
+/// Upstream's body is `f"volume: {value}"` where `value` came through `str(volume)` on a Python
+/// float (`stream_client.py:372`, `rtsp.py:194-200`) — and `str` of a float **always** carries a
+/// decimal point: `str(-12.0)` is `"-12.0"`, not `"-12"`. Rust's `Display` for `f32` drops it, so
+/// the naive `dbfs.to_string()` puts `volume: -12` on the wire where pyatv puts `volume: -12.0`.
+///
+/// A non-integral value is left as Rust's shortest round-tripping representation, which is the
+/// same algorithm `repr`/`str` uses in Python — so `-29.7` and `-20.1` render identically in both.
+/// The two differ only where an f32 and an f64 computation of the same expression land on
+/// different decimal expansions, which the volume mapping's small multiples of `0.3` do not.
+#[must_use]
+pub fn format_dbfs(level: f32) -> String {
+    let rendered = level.to_string();
+
+    // `is_finite` guards the `inf`/`NaN` renderings, which must not gain a `.0` suffix.
+    if level.is_finite() && !rendered.contains(['.', 'e', 'E']) {
+        return format!("{rendered}.0");
+    }
+
+    rendered
+}
+
+/// The full `SET_PARAMETER` body for a volume change.
+///
+/// `f"{parameter}: {value}"` with `parameter = "volume"` (`rtsp.py:194-200`) — one space after the
+/// colon and no trailing newline.
+#[must_use]
+pub fn volume_body(level: f32) -> String {
+    format!("volume: {}", format_dbfs(level))
 }
 
 /// Convert a dBFS value back to a percentage.
@@ -81,7 +117,10 @@ pub fn step_down(volume: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DBFS_MUTED, INITIAL_VOLUME, dbfs_to_pct, pct_to_dbfs, step_down, step_up};
+    use super::{
+        DBFS_MUTED, INITIAL_VOLUME, dbfs_to_pct, format_dbfs, pct_to_dbfs, step_down, step_up,
+        volume_body,
+    };
 
     /// `pct_to_dbfs(60) == -12.0` (`tests/protocols/raop/test_raop_functional.py:391-431`).
     #[test]
@@ -114,6 +153,43 @@ mod tests {
                 "{level} did not read as zero"
             );
         }
+    }
+
+    /// Only an exact zero is the mute sentinel; a tiny but non-zero percentage maps linearly, as
+    /// `math.isclose(level, 0.0)` does upstream.
+    #[test]
+    fn a_tiny_non_zero_percentage_is_not_muted() {
+        assert!((pct_to_dbfs(f32::MIN_POSITIVE) - (-30.0)).abs() < 1e-4);
+        assert!(pct_to_dbfs(f32::MIN_POSITIVE) > DBFS_MUTED);
+    }
+
+    /// `str(float)` always has a decimal point, so an integral dBFS level must not render as a
+    /// bare integer.
+    #[test]
+    fn an_integral_level_keeps_its_decimal_point() {
+        assert_eq!(format_dbfs(-12.0), "-12.0");
+        assert_eq!(format_dbfs(-144.0), "-144.0");
+        assert_eq!(format_dbfs(0.0), "0.0");
+        assert_eq!(format_dbfs(-30.0), "-30.0");
+    }
+
+    /// A non-integral level is the shortest representation that round-trips, which is what Python
+    /// `str` produces too.
+    #[test]
+    fn a_non_integral_level_is_the_shortest_representation() {
+        assert_eq!(format_dbfs(-29.7), "-29.7");
+        assert_eq!(format_dbfs(-20.1), "-20.1");
+        assert_eq!(format_dbfs(-22.5), "-22.5");
+        assert_eq!(format_dbfs(-14.7), "-14.7");
+    }
+
+    /// The full body, exactly as `f"{parameter}: {value}"` renders it: one space, no newline.
+    #[test]
+    fn the_volume_body_has_one_space_and_no_newline() {
+        assert_eq!(volume_body(pct_to_dbfs(60.0)), "volume: -12.0");
+        assert_eq!(volume_body(pct_to_dbfs(0.0)), "volume: -144.0");
+        assert_eq!(volume_body(pct_to_dbfs(100.0)), "volume: 0.0");
+        assert!(!volume_body(-15.0).ends_with('\n'));
     }
 
     #[test]

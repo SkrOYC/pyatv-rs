@@ -13,6 +13,8 @@
 //! unconditionally rather than porting a host-endianness test whose author flags it as uncertain
 //! (`airplay-playurl-raop-port-spec.md` §11).
 
+use std::borrow::Cow;
+
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler as _};
 
@@ -44,6 +46,11 @@ impl PcmFormat {
 
 /// Conform decoded audio to `target`, returning interleaved big-endian PCM bytes.
 ///
+/// A whole track's samples are a large buffer — an hour of 44.1 kHz stereo is 1.27 GB as `f32` —
+/// so each stage borrows through a [`Cow`] and only allocates when it genuinely changes the data.
+/// A source that already matches the receiver's channel count and rate, which is the overwhelmingly
+/// common case, therefore reaches [`pack`] without a single intermediate copy.
+///
 /// # Errors
 ///
 /// Returns [`Error::Audio`] if the target format is degenerate — no channels, no rate, or a sample
@@ -51,12 +58,12 @@ impl PcmFormat {
 /// (`audio_source.py:52-61`) — or if the resampler refuses the ratio.
 pub fn conform(decoded: &Decoded, target: PcmFormat) -> Result<Vec<u8>> {
     if target.channels == 0 || target.sample_rate == 0 {
-        return Err(Error::Audio(format!(
+        return Err(Error::audio_format(format!(
             "the receiver negotiated an unusable format: {target:?}"
         )));
     }
     if !matches!(target.bytes_per_sample, 1..=4) {
-        return Err(Error::Audio(format!(
+        return Err(Error::audio_format(format!(
             "unsupported sample size: {}",
             target.bytes_per_sample
         )));
@@ -79,11 +86,14 @@ pub fn conform(decoded: &Decoded, target: PcmFormat) -> Result<Vec<u8>> {
 /// and are the ones a listener expects: a mono source is duplicated to every output channel, a
 /// multi-channel source is averaged down to mono, and anything else takes the first `to` channels
 /// of each frame. Nothing in RAOP negotiates more than two channels in practice.
+///
+/// Borrowed straight through when the counts already match, which is the usual case for a stereo
+/// file streamed to a stereo receiver.
 #[must_use]
-pub fn map_channels(samples: &[f32], from: usize, to: u8) -> Vec<f32> {
+pub fn map_channels(samples: &[f32], from: usize, to: u8) -> Cow<'_, [f32]> {
     let to = usize::from(to);
     if from == to || from == 0 {
-        return samples.to_vec();
+        return Cow::Borrowed(samples);
     }
 
     let frames = samples.len() / from;
@@ -104,7 +114,7 @@ pub fn map_channels(samples: &[f32], from: usize, to: u8) -> Vec<f32> {
         }
     }
 
-    out
+    Cow::Owned(out)
 }
 
 /// Resample interleaved `f32` audio.
@@ -113,12 +123,14 @@ pub fn map_channels(samples: &[f32], from: usize, to: u8) -> Vec<f32> {
 /// rate are both known and constant, so there is no clock drift to track. `process_all` handles the
 /// chunking and trims the resampler's own startup delay, so the output lines up with the input.
 ///
+/// Borrowed straight through when the rates already match — no filter runs and nothing is copied.
+///
 /// # Errors
 ///
 /// Returns [`Error::Audio`] if rubato refuses the ratio or the buffer shape.
-pub fn resample(samples: &[f32], channels: usize, from: u32, to: u32) -> Result<Vec<f32>> {
+pub fn resample(samples: &[f32], channels: usize, from: u32, to: u32) -> Result<Cow<'_, [f32]>> {
     if from == to || samples.is_empty() {
-        return Ok(samples.to_vec());
+        return Ok(Cow::Borrowed(samples));
     }
 
     let frames = samples.len() / channels;
@@ -129,16 +141,18 @@ pub fn resample(samples: &[f32], channels: usize, from: u32, to: u32) -> Result<
         channels,
         FixedSync::Both,
     )
-    .map_err(|error| Error::Audio(format!("cannot resample {from} Hz to {to} Hz: {error}")))?;
+    .map_err(|error| {
+        Error::audio_format(format!("cannot resample {from} Hz to {to} Hz: {error}"))
+    })?;
 
     let input = InterleavedSlice::new(samples, channels, frames)
-        .map_err(|error| Error::Audio(format!("malformed audio buffer: {error}")))?;
+        .map_err(|error| Error::audio_format(format!("malformed audio buffer: {error}")))?;
 
     let output = resampler
         .process_all(&input, frames, None)
-        .map_err(|error| Error::Audio(format!("resampling failed: {error}")))?;
+        .map_err(|error| Error::audio_format(format!("resampling failed: {error}")))?;
 
-    Ok(output.take_data())
+    Ok(Cow::Owned(output.take_data()))
 }
 
 /// Pack `f32` samples in `-1.0..=1.0` into big-endian integer samples of `bytes_per_sample` width.
@@ -200,6 +214,8 @@ fn unsigned_byte(value: i32) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::{PcmFormat, conform, map_channels, pack, resample};
     use crate::audio::decode::Decoded;
     use crate::raop::metadata::TrackMetadata;
@@ -250,19 +266,25 @@ mod tests {
 
     #[test]
     fn mono_is_duplicated_to_every_output_channel() {
-        assert_eq!(map_channels(&[0.5, -0.5], 1, 2), vec![0.5, 0.5, -0.5, -0.5]);
+        assert_eq!(*map_channels(&[0.5, -0.5], 1, 2), [0.5, 0.5, -0.5, -0.5]);
     }
 
     #[test]
     fn a_stereo_source_is_averaged_down_to_mono() {
-        assert_eq!(map_channels(&[1.0, 0.0, -1.0, 1.0], 2, 1), vec![0.5, 0.0]);
+        assert_eq!(*map_channels(&[1.0, 0.0, -1.0, 1.0], 2, 1), [0.5, 0.0]);
     }
 
     #[test]
     fn a_matching_channel_count_is_left_alone() {
         let samples = [0.1, 0.2, 0.3, 0.4];
 
-        assert_eq!(map_channels(&samples, 2, 2), samples.to_vec());
+        let mapped = map_channels(&samples, 2, 2);
+
+        assert_eq!(*mapped, samples);
+        assert!(
+            matches!(mapped, Cow::Borrowed(_)),
+            "a matching channel count must not copy the samples"
+        );
     }
 
     /// A wider source is truncated to the first `to` channels of each frame.
@@ -270,7 +292,7 @@ mod tests {
     fn a_wider_source_is_truncated() {
         let samples = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 
-        assert_eq!(map_channels(&samples, 3, 2), vec![1.0, 2.0, 4.0, 5.0]);
+        assert_eq!(*map_channels(&samples, 3, 2), [1.0, 2.0, 4.0, 5.0]);
     }
 
     /// A matching rate skips the resampler entirely, so nothing is filtered or delayed.
@@ -278,9 +300,12 @@ mod tests {
     fn a_matching_rate_is_a_no_op() {
         let samples = [0.1, 0.2, 0.3, 0.4];
 
-        assert_eq!(
-            resample(&samples, 2, 44_100, 44_100).expect("no-op"),
-            samples.to_vec()
+        let output = resample(&samples, 2, 44_100, 44_100).expect("no-op");
+
+        assert_eq!(*output, samples);
+        assert!(
+            matches!(output, Cow::Borrowed(_)),
+            "a matching rate must not copy the samples"
         );
     }
 

@@ -14,8 +14,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use pyatv_core::facade::StateDispatcher;
 use pyatv_core::interface::PowerListener;
-use pyatv_core::{KeyboardFocusState, PowerState};
+use pyatv_core::{KeyboardFocusState, PowerState, Protocol};
 use tokio::sync::Notify;
 
 /// The media-control bitfield the device pushes under `_iMC`'s `_mcF` (`__init__.py:87-101`).
@@ -87,6 +88,11 @@ pub struct ApiState {
     pub volume_changed: Notify,
     /// Notified after the power state changed.
     pub power_changed: Notify,
+    /// Where volume and keyboard-focus changes are reported.
+    ///
+    /// `core.state_dispatcher` (`companion/__init__.py:451,512`), which upstream dispatches
+    /// `UpdatedState.Volume` and `UpdatedState.KeyboardFocus` into.
+    state_dispatcher: Option<Arc<dyn StateDispatcher>>,
     /// Where a power change is reported, usually the facade's listener hub.
     ///
     /// `CompanionPower._update_power_state` calls `self.listener.powerstate_update(old, new)`
@@ -96,11 +102,15 @@ pub struct ApiState {
 }
 
 impl ApiState {
-    /// A state that reports power changes to `listener`.
+    /// A state that reports power changes to `listener` and everything else to `dispatcher`.
     #[must_use]
-    pub fn with_power_listener(listener: Option<Arc<dyn PowerListener>>) -> Self {
+    pub fn with_listeners(
+        listener: Option<Arc<dyn PowerListener>>,
+        dispatcher: Option<Arc<dyn StateDispatcher>>,
+    ) -> Self {
         Self {
             power_listener: listener,
+            state_dispatcher: dispatcher,
             ..Self::default()
         }
     }
@@ -166,6 +176,19 @@ impl ApiState {
     pub fn set_volume(&self, volume: f32) {
         self.update(|observed| observed.volume = volume);
         self.volume_changed.notify_waiters();
+        self.dispatch_volume(volume);
+    }
+
+    /// Report the current level to the state dispatcher.
+    ///
+    /// `self.core.state_dispatcher.dispatch(UpdatedState.Volume, self.volume)`
+    /// (`__init__.py:451`), which upstream runs on **both** branches of
+    /// `_handle_control_flag_update` — including the one that zeroes the volume because the device
+    /// reported no volume control at all.
+    fn dispatch_volume(&self, volume: f32) {
+        if let Some(dispatcher) = &self.state_dispatcher {
+            dispatcher.volume_updated(Protocol::Companion, volume);
+        }
     }
 
     /// Record that the device reports no volume control at all.
@@ -176,11 +199,19 @@ impl ApiState {
     /// leaves `volume_up()` waiting for its five-second timeout.
     pub fn clear_volume(&self) {
         self.update(|observed| observed.volume = 0.0);
+        self.dispatch_volume(0.0);
     }
 
-    /// Record the keyboard focus state.
+    /// Record the keyboard focus state and report it.
+    ///
+    /// `_handle_text_input` (`__init__.py:505-512`). The dispatch is unconditional here, as it is
+    /// upstream; the "did it actually change" check belongs to
+    /// [`pyatv_core::facade::ListenerHub`], which is where `FacadeKeyboard` does it too.
     pub fn set_focus(&self, focus: KeyboardFocusState) {
         self.update(|observed| observed.focus = focus);
+        if let Some(dispatcher) = &self.state_dispatcher {
+            dispatcher.keyboard_focus_updated(Protocol::Companion, focus);
+        }
     }
 }
 

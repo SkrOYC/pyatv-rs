@@ -220,7 +220,7 @@ impl DataStreamChannel {
     ///
     /// Returns [`Error::Plist`] if the envelope cannot be serialised, [`Error::Io`] with
     /// [`std::io::ErrorKind::BrokenPipe`] if the channel has been closed, and [`Error::Io`] with
-    /// [`std::io::ErrorKind::TimedOut`] if the outbound queue stayed full for [`SEND_TIMEOUT`].
+    /// [`std::io::ErrorKind::TimedOut`] if the outbound queue stayed full for `SEND_TIMEOUT`.
     pub async fn send_payload(&self, data: &[u8]) -> Result<()> {
         let envelope = payload::encode_envelope(data.to_vec())?;
         let frame = frame::encode_sync(self.next_seqno(), &envelope);

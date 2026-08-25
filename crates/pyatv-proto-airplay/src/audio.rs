@@ -185,18 +185,20 @@ pub async fn open_source(source: Source, target: PcmFormat) -> Result<AudioSourc
             (Some(bytes), _) => decode::decode_bytes(bytes, hint.as_deref())?,
             (None, Some(path)) => {
                 let file = std::fs::File::open(&path).map_err(|error| {
-                    Error::Audio(format!("could not open {}: {error}", path.display()))
+                    Error::audio_source(format!("could not open {}: {error}", path.display()))
                 })?;
                 decode::decode(Box::new(file), hint.as_deref())?
             }
-            (None, None) => return Err(Error::Audio("no audio source was given".to_owned())),
+            (None, None) => {
+                return Err(Error::audio_source("no audio source was given".to_owned()));
+            }
         };
 
         let samples = convert::conform(&decoded, target)?;
         Ok::<_, Error>((samples, decoded.metadata))
     })
     .await
-    .map_err(|error| Error::Audio(format!("the audio decoder task failed: {error}")))??;
+    .map_err(|error| Error::audio_source(format!("the audio decoder task failed: {error}")))??;
 
     let (samples, metadata) = decoded;
     let mut audio = AudioSource::from_pcm(samples, target, metadata);

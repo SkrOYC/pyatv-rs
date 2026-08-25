@@ -93,6 +93,21 @@ pub enum Error {
     #[error("no identifier for device {0}")]
     DeviceIdMissing(String),
 
+    /// An operation was attempted from a state that does not allow it.
+    ///
+    /// `InvalidStateError` (`pyatv/exceptions.py`). Raised by `Relayer::takeover` when a second
+    /// protocol tries to claim an interface another one already holds
+    /// (`pyatv/core/relayer.py:117-123`).
+    #[error("invalid state: {0}")]
+    InvalidState(String),
+
+    /// A device reported a value outside the range its protocol allows.
+    ///
+    /// `ProtocolError` (`pyatv/exceptions.py`), which upstream's `FacadeAudio` raises for a volume
+    /// outside `0.0..=100.0` in either direction (`pyatv/core/facade.py:505-522`).
+    #[error("protocol error: {0}")]
+    Protocol(String),
+
     /// Underlying I/O failure.
     #[error("i/o error")]
     Io(#[from] std::io::Error),

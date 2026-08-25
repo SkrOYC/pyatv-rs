@@ -11,7 +11,7 @@
 //!
 //! - `prost` decodes [`ProtocolMessage`] for the seven declared fields (`type`, `identifier`,
 //!   `errorCode`, …), which is all the transport layer routes on;
-//! - the extension payload is read straight off the same serialised bytes by [`wire`](super::wire)
+//! - the extension payload is read straight off the same serialised bytes by [`wire`]
 //!   and handed to `prost` as its own message type.
 //!
 //! One [`MessageExtension`] constant is generated per extension, named after it and typed by the
@@ -111,7 +111,7 @@ impl<M: Message + Default> MessageExtension<M> {
     /// Serialise `envelope` with this extension set to `value`.
     ///
     /// Fields come out in ascending tag order, matching the reference implementation byte for
-    /// byte; see [`wire::splice_length_delimited`](super::wire::splice_length_delimited).
+    /// byte; see [`wire::splice_length_delimited`].
     ///
     /// # Errors
     ///

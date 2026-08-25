@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pyatv_core::facade::SetupData;
+use pyatv_core::facade::StateDispatcher;
 use pyatv_core::interface::{BoxFuture, DeviceListener, PowerListener, ProtocolHandle};
 use pyatv_core::storage::InfoSettings;
 use pyatv_core::{BaseService, DeviceInfo, DeviceModel, Protocol, device_info};
@@ -62,6 +63,9 @@ pub struct MrpSetupOptions {
     pub listener: Option<Arc<dyn DeviceListener>>,
     /// Notified when the device reports a new power state.
     pub power_listener: Option<Arc<dyn PowerListener>>,
+    /// Where volume and output-device changes are reported (`MrpAudio.state_dispatcher`,
+    /// `__init__.py:750-754`).
+    pub state_dispatcher: Option<Arc<dyn StateDispatcher>>,
     /// Fetches artwork from URLs the device advertises; see [`ArtworkFetcher`].
     pub artwork_fetcher: Option<Arc<dyn ArtworkFetcher>>,
 }
@@ -78,6 +82,7 @@ impl MrpSetupOptions {
             request_timeout: REQUEST_TIMEOUT,
             listener: None,
             power_listener: None,
+            state_dispatcher: None,
             artwork_fetcher: None,
         }
     }
@@ -155,6 +160,9 @@ pub async fn setup(
         },
     ));
     protocol.state().set_power_listener(options.power_listener);
+    protocol
+        .state()
+        .set_state_dispatcher(options.state_dispatcher.clone());
     protocol.start().await?;
 
     let remote = Arc::new(MrpRemoteControl::new(Arc::clone(&protocol)));

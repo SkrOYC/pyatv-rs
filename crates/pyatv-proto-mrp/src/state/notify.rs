@@ -20,8 +20,8 @@
 
 use std::sync::Arc;
 
-use pyatv_core::consts::PowerState;
-use pyatv_core::models::Playing;
+use pyatv_core::consts::{PowerState, Protocol};
+use pyatv_core::models::{OutputDevice, Playing};
 use tokio::sync::mpsc;
 
 use super::Listeners;
@@ -47,6 +47,17 @@ pub(super) enum Notification {
         /// What it reports now.
         new_state: PowerState,
     },
+    /// This device's own volume, as a percentage (`UpdatedState.Volume`, `__init__.py:840`).
+    Volume(f32),
+    /// Another output device's volume (`UpdatedState.OutputDeviceVolume`, `__init__.py:848-851`).
+    OutputDeviceVolume {
+        /// Which speaker the level belongs to.
+        identifier: String,
+        /// Its new level, as a percentage.
+        volume: f32,
+    },
+    /// The playback group was re-derived (`UpdatedState.OutputDevices`, `__init__.py:925`).
+    OutputDevices(Vec<OutputDevice>),
 }
 
 /// Deliver queued callbacks until the state that feeds them goes away.
@@ -82,6 +93,21 @@ pub(super) fn deliver(notification: &Notification, listeners: &Listeners) {
         } => {
             if let Some(listener) = listeners.power_listener() {
                 listener.power_state_changed(*old_state, *new_state);
+            }
+        }
+        Notification::Volume(level) => {
+            if let Some(dispatcher) = listeners.state_dispatcher() {
+                dispatcher.volume_updated(Protocol::Mrp, *level);
+            }
+        }
+        Notification::OutputDeviceVolume { identifier, volume } => {
+            if let Some(dispatcher) = listeners.state_dispatcher() {
+                dispatcher.output_device_volume_updated(Protocol::Mrp, identifier, *volume);
+            }
+        }
+        Notification::OutputDevices(devices) => {
+            if let Some(dispatcher) = listeners.state_dispatcher() {
+                dispatcher.output_devices_updated(Protocol::Mrp, devices.clone());
             }
         }
     }

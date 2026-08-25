@@ -15,15 +15,15 @@
 pub mod updates;
 
 use std::net::IpAddr;
-use std::path::Path;
 use std::sync::Arc;
 
+use pyatv_core::airplay::AirPlayVersion;
 use pyatv_core::consts::{DeviceModel, OperatingSystem, Protocol};
 use pyatv_core::device_info::{lookup_model, lookup_os_from_identifier};
-use pyatv_core::facade::SetupData;
+use pyatv_core::facade::{FacadeTakeover, Interface, SetupData, StateDispatcher};
 use pyatv_core::features::{FeatureInfo, FeatureName, FeatureState};
 use pyatv_core::interface::{Audio, BoxFuture, Features, Stream};
-use pyatv_core::models::{BaseService, DeviceInfo};
+use pyatv_core::models::{BaseService, DeviceInfo, MediaMetadata, MediaSource, OutputDevice};
 use pyatv_pairing::HapCredentials;
 
 use crate::audio::Source;
@@ -69,6 +69,17 @@ pub struct RaopSetupOptions {
     /// this has to come from the Companion pairing rather than from the RAOP service's own empty
     /// field, for the reason [`crate::setup::tunnel_credentials`] documents at length.
     pub credentials: HapCredentials,
+    /// Which AirPlay protocol version to stream with.
+    ///
+    /// `get_protocol_version(core.service, core.settings.protocols.raop.protocol_version)`
+    /// (`raop/__init__.py:148-151`), which decides between the RAOP v1 and v2 stream protocols.
+    pub protocol_version: AirPlayVersion,
+    /// How `stream_file` claims the interfaces it needs while a stream runs.
+    ///
+    /// `core.takeover` (`raop/__init__.py:350-352`). `None` outside a facade.
+    pub takeover: Option<FacadeTakeover>,
+    /// Where volume changes are reported (`RaopAudio.state_dispatcher`, `raop/__init__.py:307`).
+    pub state_dispatcher: Option<Arc<dyn StateDispatcher>>,
 }
 
 /// Describe what RAOP contributes to the facade.
@@ -81,19 +92,27 @@ pub fn setup(options: &RaopSetupOptions) -> SetupData {
     let mut service = options.service.clone();
     service.credentials = Some(options.credentials.to_string());
 
-    let manager = Arc::new(RaopPlaybackManager::new(options.address, service));
+    let manager = Arc::new(
+        RaopPlaybackManager::new(options.address, service)
+            .with_protocol_version(options.protocol_version),
+    );
     let push_updater = Arc::new(RaopPushUpdater::new(Arc::clone(&manager)));
 
     SetupData {
         protocol: Some(Protocol::Raop),
         features: DECLARED_FEATURES.into_iter().collect(),
         features_impl: Some(Arc::new(RaopFeatures::new(Arc::clone(&manager)))),
-        stream: Some(Arc::new(RaopStream::new(
-            Arc::clone(&manager),
-            options.credentials.clone(),
-            Arc::clone(&push_updater),
-        ))),
-        audio: Some(Arc::new(RaopAudio::new(Arc::clone(&manager)))),
+        stream: Some(Arc::new(
+            RaopStream::new(
+                Arc::clone(&manager),
+                options.credentials.clone(),
+                Arc::clone(&push_updater),
+            )
+            .with_takeover(options.takeover.clone()),
+        )),
+        audio: Some(Arc::new(
+            RaopAudio::new(Arc::clone(&manager)).with_dispatcher(options.state_dispatcher.clone()),
+        )),
         metadata: Some(Arc::new(RaopMetadata::new(Arc::clone(&manager)))),
         remote_control: Some(Arc::new(RaopRemoteControl::new(Arc::clone(&manager)))),
         push_updater: Some(push_updater),
@@ -135,6 +154,9 @@ pub struct RaopStream {
     manager: Arc<RaopPlaybackManager>,
     credentials: HapCredentials,
     push_updater: Arc<RaopPushUpdater>,
+    /// How `stream_file` claims `Audio`, `Metadata`, `PushUpdater` and `RemoteControl`
+    /// (`raop/__init__.py:350-352`). `None` outside a facade.
+    takeover: Option<FacadeTakeover>,
 }
 
 impl RaopStream {
@@ -149,7 +171,15 @@ impl RaopStream {
             manager,
             credentials,
             push_updater,
+            takeover: None,
         }
+    }
+
+    /// The same, claiming the interfaces a stream needs from `takeover` while it runs.
+    #[must_use]
+    pub fn with_takeover(mut self, takeover: Option<FacadeTakeover>) -> Self {
+        self.takeover = takeover;
+        self
     }
 
     /// The session manager behind this stream.
@@ -219,16 +249,37 @@ impl Stream for RaopStream {
         })
     }
 
-    fn stream_file(&self, path: &Path) -> BoxFuture<'_, pyatv_core::Result<()>> {
-        // A `str` source is a URL if it matches `^http(|s)://` and a path otherwise
-        // (`audio_source.py:731-735`); a `Path` that spells a URL is treated the same way, so
-        // `atvremote stream_file http://…` works exactly as upstream's does.
-        let source = path
-            .to_str()
-            .map_or_else(|| Source::from_path(path), Source::from_str_source);
+    fn stream_file(
+        &self,
+        source: &MediaSource,
+        metadata: Option<&MediaMetadata>,
+        override_missing_metadata: bool,
+    ) -> BoxFuture<'_, pyatv_core::Result<()>> {
+        let source = to_source(source);
+        let metadata = metadata.map(to_track_metadata);
 
         Box::pin(async move {
-            Box::pin(self.stream_source(source))
+            // `takeover_release = self.core.takeover(Audio, Metadata, PushUpdater, RemoteControl)`
+            // (`raop/__init__.py:350-352`), released by the `finally` at `:403` — here, by
+            // dropping the guard when this future ends, on every path. It is what makes
+            // `playing()` describe the track being streamed rather than whatever MRP last saw, and
+            // `stop()` end the stream.
+            let _takeover = match self.takeover.as_ref() {
+                Some(takeover) => takeover
+                    .claim(&[
+                        Interface::Audio,
+                        Interface::Metadata,
+                        Interface::PushUpdater,
+                        Interface::RemoteControl,
+                    ])
+                    .inspect_err(|error| {
+                        tracing::warn!(%error, "streaming without the interface takeover");
+                    })
+                    .ok(),
+                None => None,
+            };
+
+            Box::pin(self.stream_source_with(source, metadata, override_missing_metadata))
                 .await
                 .map_err(Into::into)
         })
@@ -239,17 +290,64 @@ impl Stream for RaopStream {
     }
 }
 
+/// Translate the public source model into RAOP's own.
+///
+/// The two enums carry the same three cases; [`MediaSource`] is the one the [`Stream`] trait
+/// speaks and [`Source`] the one [`crate::audio::open_source`] does.
+fn to_source(source: &MediaSource) -> Source {
+    match source {
+        MediaSource::File(path) => Source::from_path(path),
+        MediaSource::Url(url) => Source::Url(url.clone()),
+        MediaSource::Bytes(bytes) => Source::Bytes(bytes.clone()),
+    }
+}
+
+/// Translate the public metadata model into RAOP's own.
+fn to_track_metadata(metadata: &MediaMetadata) -> TrackMetadata {
+    TrackMetadata {
+        title: metadata.title.clone(),
+        artist: metadata.artist.clone(),
+        album: metadata.album.clone(),
+        duration: metadata.duration,
+        artwork: metadata.artwork.clone(),
+    }
+}
+
 /// RAOP's volume control.
 #[derive(Debug)]
 pub struct RaopAudio {
     manager: Arc<RaopPlaybackManager>,
+    /// Where a volume change is reported (`RaopAudio.state_dispatcher`, `raop/__init__.py:307`).
+    dispatcher: Option<Arc<dyn StateDispatcher>>,
 }
 
 impl RaopAudio {
     /// Control the volume of the device `manager` owns.
     #[must_use]
     pub fn new(manager: Arc<RaopPlaybackManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            dispatcher: None,
+        }
+    }
+
+    /// The same, reporting every change to `dispatcher`.
+    #[must_use]
+    pub fn with_dispatcher(mut self, dispatcher: Option<Arc<dyn StateDispatcher>>) -> Self {
+        self.dispatcher = dispatcher;
+        self
+    }
+
+    /// Set the level and report it.
+    ///
+    /// `set_volume` (`raop/__init__.py:295-307`), whose dispatch runs whether the level went to a
+    /// live stream client or only into the pending context.
+    async fn apply(&self, level: f32) -> pyatv_core::Result<()> {
+        self.manager.set_volume(level).await?;
+        if let Some(dispatcher) = &self.dispatcher {
+            dispatcher.volume_updated(Protocol::Raop, self.manager.volume());
+        }
+        Ok(())
     }
 }
 
@@ -258,29 +356,25 @@ impl Audio for RaopAudio {
         self.manager.volume()
     }
 
-    fn set_volume(&self, level: f32) -> BoxFuture<'_, pyatv_core::Result<()>> {
-        Box::pin(async move { self.manager.set_volume(level).await.map_err(Into::into) })
+    /// `output_device` is ignored: RAOP streams to one receiver and upstream's `RaopAudio` takes
+    /// the argument without reading it (`raop/__init__.py:295-307`).
+    fn set_volume(
+        &self,
+        level: f32,
+        _output_device: Option<&OutputDevice>,
+    ) -> BoxFuture<'_, pyatv_core::Result<()>> {
+        Box::pin(async move { self.apply(level).await })
     }
 
     fn volume_up(&self) -> BoxFuture<'_, pyatv_core::Result<()>> {
-        Box::pin(async move {
-            self.manager
-                .set_volume(step_up(self.manager.volume()))
-                .await
-                .map_err(Into::into)
-        })
+        Box::pin(async move { self.apply(step_up(self.manager.volume())).await })
     }
 
     fn volume_down(&self) -> BoxFuture<'_, pyatv_core::Result<()>> {
-        Box::pin(async move {
-            self.manager
-                .set_volume(step_down(self.manager.volume()))
-                .await
-                .map_err(Into::into)
-        })
+        Box::pin(async move { self.apply(step_down(self.manager.volume())).await })
     }
 
-    fn output_devices(&self) -> Vec<String> {
+    fn output_devices(&self) -> Vec<OutputDevice> {
         Vec::new()
     }
 
@@ -379,12 +473,13 @@ mod tests {
 
     use pyatv_core::consts::{DeviceState, MediaType, Protocol};
     use pyatv_core::features::{FeatureName, FeatureState};
-    use pyatv_core::interface::Features as _;
+    use pyatv_core::interface::{Audio as _, Features as _};
     use pyatv_core::models::BaseService;
     use pyatv_pairing::HapCredentials;
 
     use super::{
-        DECLARED_FEATURES, RaopFeatures, RaopMetadata, RaopSetupOptions, device_facts, setup,
+        AirPlayVersion, DECLARED_FEATURES, OutputDevice, RaopAudio, RaopFeatures, RaopMetadata,
+        RaopSetupOptions, StateDispatcher, device_facts, setup,
     };
     use crate::raop::manager::RaopPlaybackManager;
 
@@ -429,6 +524,9 @@ mod tests {
             address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             service: service(),
             credentials: credentials(),
+            protocol_version: AirPlayVersion::Auto,
+            takeover: None,
+            state_dispatcher: None,
         });
 
         assert_eq!(data.protocol, Some(Protocol::Raop));
@@ -498,5 +596,68 @@ mod tests {
 
         assert_eq!(info.raw_model(), Some("AppleTV14,1"));
         assert_eq!(info.version().as_deref(), Some("27.0"));
+    }
+
+    /// Records what a protocol dispatched, so a test can see the volume report.
+    #[derive(Debug, Default)]
+    struct Dispatched {
+        volumes: std::sync::Mutex<Vec<(Protocol, f32)>>,
+    }
+
+    impl StateDispatcher for Dispatched {
+        fn volume_updated(&self, protocol: Protocol, level: f32) {
+            self.volumes
+                .lock()
+                .expect("uncontended")
+                .push((protocol, level));
+        }
+
+        fn output_devices_updated(&self, _protocol: Protocol, _devices: Vec<OutputDevice>) {}
+
+        fn output_device_volume_updated(
+            &self,
+            _protocol: Protocol,
+            _identifier: &str,
+            _volume: f32,
+        ) {
+        }
+
+        fn keyboard_focus_updated(
+            &self,
+            _protocol: Protocol,
+            _state: pyatv_core::KeyboardFocusState,
+        ) {
+        }
+    }
+
+    /// Every volume change is reported, whether or not a stream is running.
+    ///
+    /// `self.state_dispatcher.dispatch(UpdatedState.Volume, self.volume)` sits after the `if raop`
+    /// branch of `RaopAudio.set_volume` (`raop/__init__.py:299-307`), so a level set before any
+    /// stream exists — the normal case, since RAOP opens its RTSP connection per call — is reported
+    /// too.
+    #[tokio::test]
+    async fn a_raop_volume_change_is_dispatched() {
+        let dispatched = Arc::new(Dispatched::default());
+        let audio = RaopAudio::new(manager())
+            .with_dispatcher(Some(Arc::clone(&dispatched) as Arc<dyn StateDispatcher>));
+
+        audio
+            .set_volume(40.0, None)
+            .await
+            .expect("there is no stream for this to fail against");
+        audio
+            .volume_up()
+            .await
+            .expect("there is no stream for this to fail against");
+
+        let seen = dispatched.volumes.lock().expect("uncontended").clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen.iter().all(|(protocol, _)| *protocol == Protocol::Raop));
+        assert!((seen[0].1 - 40.0).abs() < 0.01, "{seen:?}");
+        assert!(
+            (seen[1].1 - 45.0).abs() < 0.01,
+            "the step is five percent: {seen:?}"
+        );
     }
 }

@@ -34,7 +34,7 @@
 //! `A` and `B` are not constants, and roughly one value in 256 has a leading zero byte. `srptools`
 //! hashes both as integers, i.e. minimally, while `srp` hashes exactly the slice it is handed —
 //! which for `B` is the raw wire payload. [`HapSrpClient`] therefore normalises both through
-//! [`crate::srp_encoding::minimal_be`] before hashing, and puts the minimal `A` on the wire, which
+//! `crate::srp_encoding::minimal_be` before hashing, and puts the minimal `A` on the wire, which
 //! is what pyatv transmits (`binascii.unhexlify(session.public)`, `hap_srp.py:159`).
 //! `tests/kat/hap_srp_kat_leading_zero.json` carries a pair of exchanges generated against pyatv
 //! that were searched for exactly this case, so the rule is pinned rather than reasoned about.

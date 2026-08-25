@@ -27,7 +27,7 @@ pub const RAOP: ProtocolHandlers = ProtocolHandlers {
 /// (`pyatv/protocols/raop/__init__.py:462-465`).
 ///
 /// It contributes no service and no protocol, ever. It exists only so that an `AirPort` Express's
-/// `wama` TXT key — advertised under this type and nowhere else — reaches [`device_info`] through
+/// `wama` TXT key — advertised under this type and nowhere else — reaches `device_info` through
 /// the registry's "record properties regardless of whether a service was produced" step
 /// (`pyatv/core/scan.py:227-231`).
 pub const AIRPORT: ProtocolHandlers = ProtocolHandlers {

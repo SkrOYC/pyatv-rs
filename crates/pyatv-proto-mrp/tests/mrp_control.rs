@@ -265,7 +265,7 @@ async fn setting_the_volume_round_trips() {
     .await;
 
     let audio = data.audio.as_ref().expect("Audio is registered");
-    audio.set_volume(20.0).await.expect("set_volume");
+    audio.set_volume(20.0, None).await.expect("set_volume");
     assert!((audio.volume() - 20.0).abs() < 0.01, "{}", audio.volume());
     assert!(
         (device.state().with(|inner| inner.volume) - 0.2).abs() < 0.001,

@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use pyatv_core::airplay::{AirPlayMajorVersion, AirPlayVersion, get_protocol_version};
-use pyatv_core::facade::{ListenerHub, SetupData};
+use pyatv_core::facade::{ListenerHub, SetupData, StateDispatcher};
 use pyatv_core::interface::{BoxFuture, DeviceListener, PowerListener, ProtocolHandle};
 use pyatv_core::storage::{MrpTunnel, Settings};
 use pyatv_core::{BaseConfig, BaseService, Protocol, Result};
@@ -217,6 +217,9 @@ fn options(
     options.identifier = config.identifier().map(str::to_owned);
     options.listener = Some(Arc::clone(listeners) as Arc<dyn DeviceListener>);
     options.power_listener = Some(Arc::clone(listeners) as Arc<dyn PowerListener>);
+    // `MrpAudio.state_dispatcher` (`mrp/__init__.py:750-754`): volume and output-device changes
+    // arrive here and the hub turns them into `AudioListener` callbacks.
+    options.state_dispatcher = Some(Arc::clone(listeners) as Arc<dyn StateDispatcher>);
     // No `ArtworkFetcher`: fetching an iTunes CDN URL needs an HTTP client with TLS, which this
     // workspace does not depend on yet. Only the local `PLAYBACK_QUEUE_REQUEST` strategy runs, and
     // it is the only one that speaks MRP at all (spec §13.1).

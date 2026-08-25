@@ -7,24 +7,43 @@
 //!
 //! See `docs/research/pyatv-architecture.md` §3 for the upstream `SetupData` contract and §6 for
 //! the per-capability priority ordering reproduced in [`FacadeAppleTV::new`].
+//!
+//! # What a relayer selects on
+//!
+//! The declared feature set travels with each registration into the relayer, because it is what
+//! decides *per method* which protocol answers — see [`crate::relayer`]. Without it a device
+//! offering both `AirPlay` and RAOP would route `stream_file` to `AirPlay`, which does not
+//! implement it, and the call would be unreachable.
 
+pub mod audio;
 pub mod features;
+pub mod listeners;
+pub mod playback;
+pub mod remote;
+pub mod stream;
+pub mod takeover;
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
 
 use crate::Result;
-use crate::consts::PowerState;
 use crate::consts::Protocol;
 use crate::features::FeatureName;
 use crate::interface::{
-    AppleTV, Apps, Audio, BoxFuture, DeviceListener, Features, Keyboard, Metadata, Power,
-    PowerListener, ProtocolHandle, PushUpdater, RemoteControl, Stream, TouchGestures, UserAccounts,
+    AppleTV, Apps, Audio, AudioListener, BoxFuture, DeviceListener, Features, Keyboard,
+    KeyboardListener, Metadata, Power, PowerListener, ProtocolHandle, PushUpdater, RemoteControl,
+    Stream, TouchGestures, UserAccounts,
 };
 use crate::models::{BaseService, DeviceInfo};
 use crate::relayer::Relayer;
 
+pub use audio::FacadeAudio;
 pub use features::FacadeFeatures;
+pub use listeners::{ListenerHub, StateDispatcher};
+pub use playback::FacadePushUpdater;
+pub use remote::FacadeRemoteControl;
+pub use stream::FacadeStream;
+pub use takeover::{FacadeTakeover, Interface, TakeoverGuard, TakeoverRegistry};
 
 /// The order every capability but [`Power`] resolves in.
 ///
@@ -55,7 +74,8 @@ pub const POWER_PRIORITIES: [Protocol; 5] = [
 ///
 /// Every capability handle is optional: DMAP has no [`Apps`], RAOP has no [`RemoteControl`], and so
 /// on. `features` is the set the protocol declares it *could* serve; live availability is resolved
-/// by asking `features_impl` at call time.
+/// by asking `features_impl` at call time, and the same set decides which trait methods this
+/// registration is eligible to answer.
 #[derive(Debug, Default)]
 pub struct SetupData {
     /// Which protocol produced this data.
@@ -90,110 +110,99 @@ pub struct SetupData {
     pub device_info: DeviceInfo,
 }
 
-/// The listener registry a facade shares with the protocol connections reporting to it.
-///
-/// This is deliberately a separate, `Arc`-able object rather than a field on [`FacadeAppleTV`]: a
-/// protocol's `setup()` needs somewhere to report a dropped connection to, and it needs it *before*
-/// the facade has finished being assembled. `FacadeAppleTV` itself cannot be shared at that point
-/// — `add_protocol` takes `&mut self` — so the hub is created first, handed to every protocol, and
-/// kept by the facade afterwards.
-///
-/// Both lists hold [`Weak`] references, so a caller that drops its listener unregisters it and
-/// cannot leak it into the facade's lifetime. Upstream's `StateProducer` also holds listeners
-/// weakly, and also has exactly one slot per interface; a list is used here because replacing a
-/// previous caller's listener without telling them is not worth reproducing.
-#[derive(Debug, Default)]
-pub struct ListenerHub {
-    devices: Mutex<Vec<Weak<dyn DeviceListener>>>,
-    power: Mutex<Vec<Weak<dyn PowerListener>>>,
-}
-
-impl ListenerHub {
-    /// Register a connection listener.
-    pub fn add_listener(&self, listener: &Arc<dyn DeviceListener>) {
-        if let Ok(mut listeners) = self.devices.lock() {
-            listeners.push(Arc::downgrade(listener));
-        }
-    }
-
-    /// Register a power-state listener.
-    pub fn add_power_listener(&self, listener: &Arc<dyn PowerListener>) {
-        if let Ok(mut listeners) = self.power.lock() {
-            listeners.push(Arc::downgrade(listener));
-        }
-    }
-}
-
-impl DeviceListener for ListenerHub {
-    fn connection_lost(&self, reason: &str) {
-        tracing::debug!(reason, "a protocol connection was lost");
-        if let Ok(listeners) = self.devices.lock() {
-            for listener in listeners.iter().filter_map(Weak::upgrade) {
-                listener.connection_lost(reason);
-            }
-        }
-    }
-
-    fn connection_closed(&self) {
-        if let Ok(listeners) = self.devices.lock() {
-            for listener in listeners.iter().filter_map(Weak::upgrade) {
-                listener.connection_closed();
-            }
-        }
-    }
-}
-
-impl PowerListener for ListenerHub {
-    fn power_state_changed(&self, old_state: PowerState, new_state: PowerState) {
-        tracing::debug!(?old_state, ?new_state, "the device power state changed");
-        if let Ok(listeners) = self.power.lock() {
-            for listener in listeners.iter().filter_map(Weak::upgrade) {
-                listener.power_state_changed(old_state, new_state);
-            }
-        }
-    }
-}
-
 /// Unified view of one device across every connected protocol.
 #[derive(Debug)]
 pub struct FacadeAppleTV {
-    remote_control: Relayer<dyn RemoteControl>,
-    metadata: Relayer<dyn Metadata>,
-    push_updater: Relayer<dyn PushUpdater>,
-    stream: Relayer<dyn Stream>,
-    power: Relayer<dyn Power>,
-    apps: Relayer<dyn Apps>,
-    audio: Relayer<dyn Audio>,
-    keyboard: Relayer<dyn Keyboard>,
-    touch_gestures: Relayer<dyn TouchGestures>,
-    user_accounts: Relayer<dyn UserAccounts>,
+    remote_control: Arc<Relayer<dyn RemoteControl>>,
+    metadata: Arc<Relayer<dyn Metadata>>,
+    push_updater: Arc<Relayer<dyn PushUpdater>>,
+    stream: Arc<Relayer<dyn Stream>>,
+    power: Arc<Relayer<dyn Power>>,
+    apps: Arc<Relayer<dyn Apps>>,
+    audio: Arc<Relayer<dyn Audio>>,
+    keyboard: Arc<Relayer<dyn Keyboard>>,
+    touch_gestures: Arc<Relayer<dyn TouchGestures>>,
+    user_accounts: Arc<Relayer<dyn UserAccounts>>,
     features: Arc<FacadeFeatures>,
+    /// The long-lived relaying wrappers handed out by the [`AppleTV`] accessors.
+    ///
+    /// They are built once and shared rather than created per call because a caller keeps one
+    /// across a takeover — that is the behaviour `test_takeover_and_release`
+    /// (`tests/core/test_facade.py:544-566`) pins — and because [`FacadePushUpdater`] owns the
+    /// listener shims it registered with each protocol.
+    facades: Facades,
+    takeover: Arc<TakeoverRegistry>,
     handles: Vec<(Protocol, Arc<dyn ProtocolHandle>)>,
     listeners: Arc<ListenerHub>,
     device_info: DeviceInfo,
     service: BaseService,
 }
 
+/// The per-interface relaying objects a caller receives.
+#[derive(Debug)]
+struct Facades {
+    remote_control: Arc<FacadeRemoteControl>,
+    audio: Arc<FacadeAudio>,
+    stream: Arc<FacadeStream>,
+    push_updater: Arc<FacadePushUpdater>,
+}
+
 impl FacadeAppleTV {
     /// Build an empty facade for `service`, with pyatv's per-capability priority ordering.
     #[must_use]
     pub fn new(service: BaseService) -> Self {
-        fn default<T: ?Sized>() -> Relayer<T> {
-            Relayer::new(DEFAULT_PRIORITIES.to_vec())
+        fn default<T: ?Sized>() -> Arc<Relayer<T>> {
+            Arc::new(Relayer::new(DEFAULT_PRIORITIES.to_vec()))
         }
 
+        let remote_control = default::<dyn RemoteControl>();
+        let metadata = default::<dyn Metadata>();
+        let push_updater = default::<dyn PushUpdater>();
+        let stream = default::<dyn Stream>();
+        let power: Arc<Relayer<dyn Power>> = Arc::new(Relayer::new(POWER_PRIORITIES.to_vec()));
+        let apps = default::<dyn Apps>();
+        let audio = default::<dyn Audio>();
+        let keyboard = default::<dyn Keyboard>();
+        let touch_gestures = default::<dyn TouchGestures>();
+        let user_accounts = default::<dyn UserAccounts>();
+        let features = Arc::new(FacadeFeatures::default());
+
+        let mut takeover = TakeoverRegistry::default();
+        takeover.insert(Interface::RemoteControl, &remote_control);
+        takeover.insert(Interface::Metadata, &metadata);
+        takeover.insert(Interface::PushUpdater, &push_updater);
+        takeover.insert(Interface::Stream, &stream);
+        takeover.insert(Interface::Power, &power);
+        takeover.insert(Interface::Apps, &apps);
+        takeover.insert(Interface::Audio, &audio);
+        takeover.insert(Interface::Keyboard, &keyboard);
+        takeover.insert(Interface::TouchGestures, &touch_gestures);
+        takeover.insert(Interface::UserAccounts, &user_accounts);
+
+        let facades = Facades {
+            remote_control: Arc::new(FacadeRemoteControl::new(Arc::clone(&remote_control))),
+            audio: Arc::new(FacadeAudio::new(Arc::clone(&audio))),
+            stream: Arc::new(FacadeStream::new(
+                Arc::clone(&stream),
+                Arc::clone(&features) as Arc<dyn Features>,
+            )),
+            push_updater: FacadePushUpdater::new(Arc::clone(&push_updater)),
+        };
+
         Self {
-            remote_control: default(),
-            metadata: default(),
-            push_updater: default(),
-            stream: default(),
-            power: Relayer::new(POWER_PRIORITIES.to_vec()),
-            apps: default(),
-            audio: default(),
-            keyboard: default(),
-            touch_gestures: default(),
-            user_accounts: default(),
-            features: Arc::new(FacadeFeatures::default()),
+            remote_control,
+            metadata,
+            push_updater,
+            stream,
+            power,
+            apps,
+            audio,
+            keyboard,
+            touch_gestures,
+            user_accounts,
+            features,
+            facades,
+            takeover: Arc::new(takeover),
             handles: Vec::new(),
             listeners: Arc::new(ListenerHub::default()),
             device_info: DeviceInfo::default(),
@@ -214,7 +223,8 @@ impl FacadeAppleTV {
         macro_rules! register {
             ($field:ident) => {
                 if let Some(instance) = data.$field {
-                    self.$field.register(protocol, instance);
+                    self.$field
+                        .register(protocol, instance, data.features.clone());
                 }
             };
         }
@@ -243,6 +253,11 @@ impl FacadeAppleTV {
             self.features.set_push_updates(true);
         }
 
+        // `FacadeKeyboard`'s dispatcher filter is on the keyboard relayer's main protocol
+        // (`facade.py:554-558`), which only the facade can know.
+        self.listeners
+            .set_keyboard_protocol(self.keyboard.main_protocol());
+
         if let Some(handle) = data.handle {
             self.handles.push((protocol, handle));
         }
@@ -261,6 +276,31 @@ impl FacadeAppleTV {
     #[must_use]
     pub fn listener_hub(&self) -> Arc<ListenerHub> {
         Arc::clone(&self.listeners)
+    }
+
+    /// A takeover handle bound to `protocol`, for that protocol's `setup()`.
+    ///
+    /// `partial(atv.takeover, proto)` (`pyatv/__init__.py:138`). Taken before setup for the same
+    /// reason [`FacadeAppleTV::listener_hub`] is.
+    #[must_use]
+    pub fn takeover_handle(&self, protocol: Protocol) -> FacadeTakeover {
+        FacadeTakeover::new(Arc::clone(&self.takeover), protocol)
+    }
+
+    /// Claim one or more interfaces for `protocol` until the returned guard is dropped.
+    ///
+    /// `FacadeAppleTV.takeover` (`pyatv/core/facade.py:804-830`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidState`] if any named interface is already claimed; nothing
+    /// remains claimed in that case.
+    pub fn takeover(
+        &self,
+        protocol: Protocol,
+        interfaces: &[Interface],
+    ) -> Result<takeover::TakeoverGuard> {
+        self.takeover.claim(protocol, interfaces)
     }
 
     /// Every protocol that contributed at least one capability.
@@ -306,43 +346,52 @@ impl DeviceListener for FacadeAppleTV {
 
 impl AppleTV for FacadeAppleTV {
     fn remote_control(&self) -> Option<Arc<dyn RemoteControl>> {
-        self.remote_control.main_instance().cloned()
+        (!self.remote_control.is_empty())
+            .then(|| Arc::clone(&self.facades.remote_control) as Arc<dyn RemoteControl>)
     }
 
+    /// The highest-priority metadata implementation, resolved afresh on every call.
+    ///
+    /// Unlike remote control, audio and streaming this is not wrapped: every protocol that
+    /// registers a [`Metadata`] implements all of it, so there is no per-method contention to
+    /// resolve, and resolving at call time is already enough for a takeover to be visible. The one
+    /// difference from upstream is that a handle stored across a takeover keeps pointing at the
+    /// protocol it was taken from.
     fn metadata(&self) -> Option<Arc<dyn Metadata>> {
-        self.metadata.main_instance().cloned()
+        self.metadata.main_instance()
     }
 
     fn push_updater(&self) -> Option<Arc<dyn PushUpdater>> {
-        self.push_updater.main_instance().cloned()
+        (!self.push_updater.is_empty())
+            .then(|| Arc::clone(&self.facades.push_updater) as Arc<dyn PushUpdater>)
     }
 
     fn stream(&self) -> Option<Arc<dyn Stream>> {
-        self.stream.main_instance().cloned()
+        (!self.stream.is_empty()).then(|| Arc::clone(&self.facades.stream) as Arc<dyn Stream>)
     }
 
     fn power(&self) -> Option<Arc<dyn Power>> {
-        self.power.main_instance().cloned()
+        self.power.main_instance()
     }
 
     fn apps(&self) -> Option<Arc<dyn Apps>> {
-        self.apps.main_instance().cloned()
+        self.apps.main_instance()
     }
 
     fn audio(&self) -> Option<Arc<dyn Audio>> {
-        self.audio.main_instance().cloned()
+        (!self.audio.is_empty()).then(|| Arc::clone(&self.facades.audio) as Arc<dyn Audio>)
     }
 
     fn keyboard(&self) -> Option<Arc<dyn Keyboard>> {
-        self.keyboard.main_instance().cloned()
+        self.keyboard.main_instance()
     }
 
     fn touch_gestures(&self) -> Option<Arc<dyn TouchGestures>> {
-        self.touch_gestures.main_instance().cloned()
+        self.touch_gestures.main_instance()
     }
 
     fn user_accounts(&self) -> Option<Arc<dyn UserAccounts>> {
-        self.user_accounts.main_instance().cloned()
+        self.user_accounts.main_instance()
     }
 
     fn features(&self) -> Arc<dyn Features> {
@@ -365,6 +414,14 @@ impl AppleTV for FacadeAppleTV {
         self.listeners.add_power_listener(listener);
     }
 
+    fn add_audio_listener(&self, listener: &Arc<dyn AudioListener>) {
+        self.listeners.add_audio_listener(listener);
+    }
+
+    fn add_keyboard_listener(&self, listener: &Arc<dyn KeyboardListener>) {
+        self.listeners.add_keyboard_listener(listener);
+    }
+
     /// Close every protocol in turn.
     ///
     /// Upstream collects a task per protocol and lets the caller await them all
@@ -373,9 +430,9 @@ impl AppleTV for FacadeAppleTV {
     /// connected. The first error is still reported so a caller can notice.
     fn close(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            if let Some(push_updater) = self.push_updater.main_instance() {
-                push_updater.stop();
-            }
+            // `self.push_updater.stop()` (`facade.py:791-792`), which upstream reaches through the
+            // facade so *every* protocol's updater stops, not only the main one.
+            self.facades.push_updater.stop();
 
             let mut first_error = None;
             for (protocol, handle) in &self.handles {
@@ -490,5 +547,8 @@ mod tests {
             facade.features().get_feature(FeatureName::AppList).state,
             FeatureState::Unsupported
         );
+        assert!(facade.remote_control().is_none());
+        assert!(facade.audio().is_none());
+        assert!(facade.stream().is_none());
     }
 }

@@ -55,6 +55,8 @@
 //! This crate deliberately depends only on `bytes` and `thiserror` — it must stay usable from any
 //! layer of the workspace without dragging in the runtime or the core types.
 
+#![warn(missing_docs)]
+
 pub mod de;
 pub mod error;
 mod macros;

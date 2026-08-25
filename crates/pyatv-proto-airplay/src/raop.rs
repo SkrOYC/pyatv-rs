@@ -95,36 +95,17 @@ impl AudioProperties {
     }
 }
 
-/// Encryption schemes a receiver can advertise in its `et` TXT key.
-///
-/// pyatv parses these purely so it can recognise a stream it cannot handle. None of the FairPlay
-/// variants are implemented, by anyone: they depend on Apple's hardware-backed key material and no
-/// public implementation exists. See `docs/research/crypto-pairing.md` §5.5.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncryptionType {
-    /// No encryption.
-    None,
-    /// RSA, legacy AirPlay 1 audio. Not implemented.
-    Rsa,
-    /// FairPlay. Not implemented.
-    FairPlay,
-    /// FairPlay SAP v2.5. Not implemented.
-    FairPlaySapV25,
-}
-
-impl EncryptionType {
-    /// Whether this crate can actually stream to a receiver demanding this scheme.
-    #[must_use]
-    pub const fn is_supported(self) -> bool {
-        matches!(self, Self::None)
-    }
-}
+// The encryption schemes a receiver advertises in `et` live in
+// [`pyatv_core::airplay::EncryptionType`], which is the bitflags set `get_encryption_types` parses
+// (`pyatv/protocols/raop/parsers.py`) and the one
+// [`crate::raop::stream::SUPPORTED_ENCRYPTIONS`] intersects against. An enum here duplicated the
+// same knowledge in a shape nothing could combine, so it is gone rather than kept in step.
 
 #[cfg(test)]
 mod tests {
     use pyatv_core::{BaseService, Protocol};
 
-    use super::{AudioProperties, EncryptionType};
+    use super::AudioProperties;
 
     #[test]
     fn missing_txt_keys_fall_back_to_pyatv_defaults() {
@@ -164,13 +145,5 @@ mod tests {
             .insert("sr".to_owned(), "not a number".to_owned());
 
         assert_eq!(AudioProperties::from_service(&service).sample_rate, 44_100);
-    }
-
-    #[test]
-    fn only_unencrypted_streams_are_supported() {
-        assert!(EncryptionType::None.is_supported());
-        assert!(!EncryptionType::Rsa.is_supported());
-        assert!(!EncryptionType::FairPlay.is_supported());
-        assert!(!EncryptionType::FairPlaySapV25.is_supported());
     }
 }

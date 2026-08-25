@@ -9,9 +9,12 @@
 //! handful of scalars the synchronous facade accessors read — `Audio::volume` and
 //! `Features::get_feature` are not `async` and cannot wait on anything.
 
+pub mod listener;
+
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
+use pyatv_core::airplay::{AirPlayVersion, get_protocol_version};
 use pyatv_core::models::BaseService;
 use pyatv_pairing::HapCredentials;
 
@@ -19,11 +22,13 @@ use crate::audio::{PcmFormat, Source, open_source};
 use crate::raop::connection::{self, SharedConnection, with_connection};
 use crate::raop::context::StreamContext;
 use crate::raop::metadata::TrackMetadata;
-use crate::raop::protocol::{StreamProtocol, protocol_version};
+use crate::raop::protocol::StreamProtocol;
 use crate::raop::rtsp as raop_rtsp;
 use crate::raop::stream::{PlaybackInfo, RaopListener, StopHandle, StreamClient};
-use crate::raop::volume::{INITIAL_VOLUME, dbfs_to_pct, pct_to_dbfs};
+use crate::raop::volume::{INITIAL_VOLUME, dbfs_to_pct, format_dbfs, pct_to_dbfs};
 use crate::{Error, Result};
+
+pub use listener::ManagerListener;
 
 /// What the synchronous facade accessors can see.
 #[derive(Debug, Default)]
@@ -46,6 +51,9 @@ struct SharedState {
 pub struct RaopPlaybackManager {
     address: IpAddr,
     service: BaseService,
+    /// Which stream protocol to use, from `settings.protocols.raop.protocol_version`
+    /// (`raop/__init__.py:148-151`). [`AirPlayVersion::Auto`] resolves from the TXT record.
+    version: AirPlayVersion,
     state: Mutex<SharedState>,
     streaming: tokio::sync::Mutex<()>,
 }
@@ -57,9 +65,17 @@ impl RaopPlaybackManager {
         Self {
             address,
             service,
+            version: AirPlayVersion::Auto,
             state: Mutex::new(SharedState::default()),
             streaming: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// The same, pinned to a caller-chosen protocol version.
+    #[must_use]
+    pub fn with_protocol_version(mut self, version: AirPlayVersion) -> Self {
+        self.version = version;
+        self
     }
 
     /// Whether a stream is running, which is what gates `Stop` and `Pause`.
@@ -119,7 +135,7 @@ impl RaopPlaybackManager {
         };
 
         with_connection(&connection, async |rtsp, http| {
-            raop_rtsp::set_parameter(rtsp, http, "volume", &dbfs.to_string()).await
+            raop_rtsp::set_parameter(rtsp, http, "volume", &format_dbfs(dbfs)).await
         })
         .await?;
         self.locked().volume = Some(dbfs);
@@ -188,7 +204,7 @@ impl RaopPlaybackManager {
         self.locked().connection = Some(connection.clone());
 
         let local = connection.lock().await.http.local_address()?.ip();
-        let version = protocol_version(&self.service);
+        let version = get_protocol_version(&self.service, self.version);
         tracing::debug!(?version, "using this AirPlay version for RAOP");
 
         let mut client = StreamClient::new(connection.clone(), StreamProtocol::new(version), local);
@@ -225,11 +241,30 @@ impl RaopPlaybackManager {
     /// when the user has not set one, otherwise push the current value now — and if the receiver
     /// refuses, hand it to `send_audio` to retry once streaming has started. Some receivers really
     /// do answer `500` to a volume set before `FLUSH` (`tests/fake_device/raop.py:59-64`).
+    ///
+    /// # Two divergences, both in the direction of doing what the user asked
+    ///
+    /// - **A deferred volume of zero is still applied.** `send_audio` guards its retry with
+    ///   `if volume:` (`stream_client.py:450`), and `0.0` is falsy in Python — so upstream silently
+    ///   drops a deferred *mute*, which is the one deferred value a user is most likely to have
+    ///   meant. This port returns `Some(0.0)` and [`StreamClient::send_audio`] applies it, because
+    ///   the option is "was a volume deferred", not "was a non-zero volume deferred".
+    /// - **A non-`real` `initialVolume` is read anyway.** Upstream does
+    ///   `initial_volume = self.playback_manager.stream_client.initial_volume` and compares it
+    ///   with `is not None`, so a receiver that encodes the key as a plist *integer* — `0` and
+    ///   `-30` both round-trip that way through several encoders — is honoured there. Reading it
+    ///   only as [`plist::Value::as_real`] would silently fall through to the client-side default
+    ///   instead, so an integer is accepted here too.
     async fn negotiate_volume(&self, client: &StreamClient) -> Option<f32> {
-        let initial = client
-            .info()
-            .get("initialVolume")
-            .and_then(plist::Value::as_real);
+        let initial = client.info().get("initialVolume").and_then(|value| {
+            value.as_real().or_else(|| {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "a dBFS volume is a small number; precision is irrelevant at this scale"
+                )]
+                value.as_signed_integer().map(|volume| volume as f64)
+            })
+        });
 
         if !self.has_changed_volume()
             && let Some(initial) = initial
@@ -280,7 +315,7 @@ impl RaopPlaybackManager {
     }
 
     /// Record what a listener reported.
-    fn set_playback_info(&self, info: Option<PlaybackInfo>) {
+    pub(crate) fn set_playback_info(&self, info: Option<PlaybackInfo>) {
         self.locked().playback_info = info;
     }
 
@@ -318,60 +353,6 @@ pub fn resolve_metadata(
         None => source.metadata().clone(),
         Some(metadata) if override_missing_metadata => metadata.merged_over(source.metadata()),
         Some(metadata) => metadata,
-    }
-}
-
-/// Bridges [`RaopListener`] callbacks into the manager's shared state.
-///
-/// `RaopStateListener` (`__init__.py:524-543`), which is a local class inside upstream's `setup()`
-/// for the same reason this is a separate type: it needs the manager and the push updater, and
-/// neither exists before `setup` runs.
-pub struct ManagerListener {
-    manager: std::sync::Weak<RaopPlaybackManager>,
-    on_change: Box<dyn Fn() + Send + Sync>,
-}
-
-impl std::fmt::Debug for ManagerListener {
-    /// Hand-written because a boxed closure has no `Debug`, and the workspace denies
-    /// `missing_debug_implementations`.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ManagerListener")
-            .field("manager", &self.manager.upgrade().is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-impl ManagerListener {
-    /// Report into `manager`, calling `on_change` after each transition.
-    ///
-    /// The manager is held weakly so the listener cannot keep it alive; upstream's own listener is
-    /// held weakly from the other direction, for the same "do not create a cycle" reason.
-    #[must_use]
-    pub fn new(
-        manager: &Arc<RaopPlaybackManager>,
-        on_change: Box<dyn Fn() + Send + Sync>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            manager: Arc::downgrade(manager),
-            on_change,
-        })
-    }
-}
-
-impl RaopListener for ManagerListener {
-    fn playing(&self, info: &PlaybackInfo) {
-        if let Some(manager) = self.manager.upgrade() {
-            manager.set_playback_info(Some(info.clone()));
-        }
-        (self.on_change)();
-    }
-
-    fn stopped(&self) {
-        if let Some(manager) = self.manager.upgrade() {
-            manager.set_playback_info(None);
-        }
-        (self.on_change)();
     }
 }
 

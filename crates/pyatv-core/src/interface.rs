@@ -19,8 +19,8 @@ pub mod playback;
 use std::pin::Pin;
 use std::sync::Arc;
 
-pub use control::{Keyboard, RemoteControl, TouchGestures};
-pub use device::{Apps, Audio, Features, Power, UserAccounts};
+pub use control::{Keyboard, KeyboardListener, RemoteControl, TouchGestures};
+pub use device::{Apps, Audio, AudioListener, Features, Power, UserAccounts};
 pub use playback::{Metadata, PlaybackListener, PushUpdater, Stream};
 
 use crate::consts::PowerState;
@@ -86,6 +86,22 @@ pub trait AppleTV: Send + Sync + std::fmt::Debug {
     ///
     /// Held weakly, as [`AppleTV::add_listener`].
     fn add_power_listener(&self, listener: &Arc<dyn PowerListener>);
+
+    /// Register a listener notified when the volume or the playback group changes.
+    ///
+    /// Upstream hangs this off the audio interface (`atv.audio.listener = mine`,
+    /// `pyatv/core/facade.py:434-493`); it is on the root object here for the same reasons
+    /// [`AppleTV::add_power_listener`] is.
+    ///
+    /// Held weakly, as [`AppleTV::add_listener`].
+    fn add_audio_listener(&self, listener: &Arc<dyn AudioListener>);
+
+    /// Register a listener notified when the on-screen keyboard gains or loses focus.
+    ///
+    /// Upstream's `atv.keyboard.listener` (`pyatv/core/facade.py:546-568`).
+    ///
+    /// Held weakly, as [`AppleTV::add_listener`].
+    fn add_keyboard_listener(&self, listener: &Arc<dyn KeyboardListener>);
 
     /// Tear down every protocol connection.
     fn close(&self) -> BoxFuture<'_, Result<()>>;

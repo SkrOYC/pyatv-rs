@@ -48,7 +48,7 @@ use crate::{Error, Result};
 /// the same number, so the event is already set and the wait returns immediately. The four seconds
 /// only elapse when a response arrives carrying a *different* `CSeq` — reordering across
 /// concurrent in-flight requests, which this port's one-request-at-a-time
-/// [`HttpConnection::exchange`] cannot produce at all.
+/// [`HttpConnection::send`] cannot produce at all.
 ///
 /// So the faithful bound for "device did not answer" is ten, not four; adopting four would make
 /// this client give up on requests pyatv would still be waiting for, on exactly the sleepy devices

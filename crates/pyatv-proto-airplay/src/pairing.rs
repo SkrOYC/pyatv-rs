@@ -3,7 +3,7 @@
 //! Port of `AirPlayPairingHandler` (`pyatv/protocols/airplay/pairing.py:19-97`). One handler serves
 //! both protocols — upstream calls that out as a "HACK" (`pairing.py:80-82`) and branches on
 //! `service.protocol` when deciding which settings slot the credentials belong in; the same branch
-//! is here, in [`AirPlayPairingHandler::persist`].
+//! is here, in `AirPlayPairingHandler::persist`.
 //!
 //! The exchange to run is chosen from the AirPlay major version alone
 //! (`pairing.py:50-57`): AirPlay 2 devices get HAP pair-setup, AirPlay 1 devices get the legacy
