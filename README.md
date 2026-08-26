@@ -17,27 +17,28 @@ Prior art from GPL/LGPL projects (owntone, UxPlay, shairport-sync, rairplay) was
 
 ## Status
 
-Early but substantial: every protocol is implemented and the full quality gate is green, but not every path has met real hardware. Nothing here has been published to crates.io and there is no tagged release yet.
+Every planned protocol and the pyatv-compatible CLI surface are implemented, and the full quality gate is green. The project has not been published to crates.io and has no tagged release.
 
-The live-verified work was done against one device — an Apple TV 4K (gen 3) running tvOS 27. "Hermetic" below means the code is covered by socket-level tests against an in-process fake device plus known-answer tests generated from pyatv, but has not been run against real hardware.
+The live validation used one Apple TV 4K (3rd generation) running tvOS 27. _Hermetic_ means that socket-level tests and pyatv-generated known-answer tests cover the path, but representative hardware has not exercised it. For the full probe record, see the [live parity validation report](docs/research/live-parity-validation-2026-08-25.md).
 
 | Area | State |
-|---|---|
+| --- | --- |
 | Discovery (mDNS/DNS-SD, multicast and unicast) | Live-verified |
 | HAP pairing (SRP6a-3072, pair-setup and pair-verify, transport ciphers) | Live-verified |
 | Companion (OPACK, pairing, apps, power, keyboard, touch, accounts) | Live-verified |
 | AirPlay 2 control channel, event and data-stream channels | Live-verified |
 | MRP over the AirPlay tunnel (now-playing, push updates) | Live-verified |
 | MRP over direct TCP (pre-tvOS-15 devices) | Hermetic only |
-| AirPlay `play_url` | Hermetic only — the live probe plays video, so it needs a human at the TV |
-| RAOP audio streaming (`stream_file`) | Hermetic only — the live probe plays audio and changes volume |
+| AirPlay `play_url` | Live-probed — tvOS accepts `/play`, then returns `500 Internal Server Error` to `/playback-info`; pyatv reports the same tvOS 26+ failure |
+| RAOP audio streaming (`stream_file`) | Live-probed — Rust and pyatv 0.18.0 both time out at the AirPlay 2 audio-stream `SETUP` on this tvOS build |
 | Legacy DMAP (Apple TV gen 1–3) | Hermetic only — no such device available to test against |
-| Facade relaying, CLI parity, `--json` | In progress (Step 8) |
+| Facade relaying, CLI parity, `--json` | Complete |
 
-Known limitations on current tvOS, from the risk register:
+Known limitations on the tested tvOS build, from the risk register:
 
-- **Volume is unavailable over the MRP tunnel on tvOS 27.** No availability message arrives after bring-up, so volume features report `Unavailable` and Companion registers no audio interface (`docs/RISKS.md` L13).
+- **MRP volume availability depends on playback state.** It was unavailable while idle, then became available as absolute control during grouped playback (`docs/RISKS.md` L13).
 - **AirPlay pair-setup shows no PIN on modern tvOS.** Companion pairing is the only pairing path; the AirPlay tunnel then authenticates with those same HAP credentials (`docs/RISKS.md` M7).
+- **AirPlay media streaming does not interoperate with the tested tvOS 27 build.** The same `play_url` and RAOP failures occur in pyatv, so fixing them requires evidence from a successful Apple sender rather than another byte-for-byte port.
 
 [`docs/ROADMAP.md`](docs/ROADMAP.md) is the authoritative, per-step status; [`docs/RISKS.md`](docs/RISKS.md) is the full risk register.
 
@@ -122,14 +123,26 @@ atvremote -n "Living Room" --json playing
 
 ```json
 {
-  "album": null, "app": "Netflix", "app_id": "com.netflix.Netflix",
-  "artist": null, "content_identifier": null,
+  "album": null,
+  "app": "Netflix",
+  "app_id": "com.netflix.Netflix",
+  "artist": null,
+  "content_identifier": null,
   "datetime": "2026-08-25T09:41:07.123456+00:00",
-  "device_state": "playing", "episode_number": null, "genre": null,
-  "hash": "azyFEzFpSNOSGq9ZvcaX4A", "itunes_store_identifier": null,
-  "media_type": "video", "position": 312, "repeat": null, "result": "success",
-  "season_number": null, "series_name": null, "shuffle": null,
-  "title": "The Sea Beast", "total_time": 7135
+  "device_state": "playing",
+  "episode_number": null,
+  "genre": null,
+  "hash": "azyFEzFpSNOSGq9ZvcaX4A",
+  "itunes_store_identifier": null,
+  "media_type": "video",
+  "position": 312,
+  "repeat": null,
+  "result": "success",
+  "season_number": null,
+  "series_name": null,
+  "shuffle": null,
+  "title": "The Sea Beast",
+  "total_time": 7135
 }
 ```
 

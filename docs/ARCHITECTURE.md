@@ -1,12 +1,12 @@
 # Architecture
 
-This document records the design decisions for pyatv-rs and the reasoning behind them. It is the synthesis of the seven research reports under `docs/research/`; where a claim needs a wire-level citation, it points there. It should be read after the root `CLAUDE.md` and before touching any crate.
+This document records the design decisions for pyatv-rs and the reasoning behind them. It synthesizes the research corpus under `docs/research/`; wire-level claims link to their evidence. Read the root `CLAUDE.md` first, then this document, before changing a crate.
 
 ## 1. Goals and non-goals
 
-**Goal:** behavioral parity with pyatv as a *client/controller* library — discover devices on the LAN, pair with them, and control playback, power, apps, keyboard, and audio streaming across the protocols a modern Apple TV / HomePod speaks. Embeddable as a library (for a future GUI, Home Assistant integration, etc.) with a thin CLI on top, mirroring how pyatv ships a library plus `atvremote`.
+**Goal:** behavioral parity with pyatv as a _client/controller_ library — discover devices on the LAN, pair with them, and control playback, power, apps, keyboard, and audio streaming across the protocols a modern Apple TV / HomePod speaks. Embeddable as a library (for a future GUI, Home Assistant integration, etc.) with a thin CLI on top, mirroring how pyatv ships a library plus `atvremote`.
 
-**Non-goals (for now):** acting as an AirPlay *receiver* (accepting streams / screen mirroring / video decode — a materially different problem, and pyatv itself does not do it); implementing FairPlay DRM (no open implementation exists, depends on Apple hardware key material, and pyatv only *parses* its advertisement); byte-for-byte reuse of any GPL/LGPL reference implementation.
+**Non-goals (for now):** acting as an AirPlay _receiver_ (accepting streams / screen mirroring / video decode — a materially different problem, and pyatv itself does not do it); implementing FairPlay DRM (no open implementation exists, depends on Apple hardware key material, and pyatv only _parses_ its advertisement); byte-for-byte reuse of any GPL/LGPL reference implementation.
 
 ## 2. The unifying model: facade over a priority relay
 
@@ -56,7 +56,7 @@ Concretely: `MrpTransport` is a trait so the same MRP message state machine runs
 
 AirPlay speaks a non-standard HTTP/RTSP dialect over a single socket with reverse connections and an event channel — a client and server role on the same connection. Off-the-shelf HTTP clients cannot model that. The AirPlay crate therefore implements a custom `tokio_util::codec` `Decoder`/`Encoder` that parses both requests and responses on one socket, buffers on `Content-Length` (partial frame → `Ok(None)`), and hands binary-plist bodies up as opaque `Bytes` for the `plist` crate to decode. See `docs/research/airplay-raop-dmap.md` and `docs/research/rust-crates.md` §5.
 
-Discovery is a port of pyatv's own hand-written mDNS stack (the `pyatv/support/dns.py` codec plus the `MulticastDnsSdClientProtocol`/`UnicastDnsSdClientProtocol` scanners in `pyatv/core/mdns.py`), not a wrapper over `mdns-sd`. Decision (Step 1, 2026-08-24): pyatv deliberately does not use a general-purpose zeroconf browser for querying — it sends one query carrying every service-type PTR question with the unicast-response bit, correlates answers per host, detects deep sleep via `_sleep-proxy._udp`, and stops early when a requested identifier answers. Reproducing that on top of `mdns-sd`'s browse-event model would mean fighting the library, and the unicast host-scan path (`--scan-hosts`, Docker/VLAN networks) needs a codec regardless. One sans-io codec (`pyatv_mdns::dns`: PTR/SRV/TXT/A/AAAA per RFC 1035/6762, with pyatv's quirks replicated and commented) therefore serves both scanners; `hickory-proto` is dropped and `mdns-sd` is not a Step 1 dependency. pyatv itself hands *publishing* (needed only for the legacy DMAP pairing flow, Step 7) to python-zeroconf; the Rust equivalent is re-evaluated then, with `mdns-sd`'s `register()` the leading candidate. Spec of record: `docs/research/discovery-port-spec.md`.
+Discovery is a port of pyatv's own hand-written mDNS stack (the `pyatv/support/dns.py` codec plus the `MulticastDnsSdClientProtocol`/`UnicastDnsSdClientProtocol` scanners in `pyatv/core/mdns.py`), not a wrapper over `mdns-sd`. Decision (Step 1, 2026-08-24): pyatv deliberately does not use a general-purpose zeroconf browser for querying — it sends one query carrying every service-type PTR question with the unicast-response bit, correlates answers per host, detects deep sleep via `_sleep-proxy._udp`, and stops early when a requested identifier answers. Reproducing that on top of `mdns-sd`'s browse-event model would mean fighting the library, and the unicast host-scan path (`--scan-hosts`, Docker/VLAN networks) needs a codec regardless. One sans-io codec (`pyatv_mdns::dns`: PTR/SRV/TXT/A/AAAA per RFC 1035/6762, with pyatv's quirks replicated and commented) therefore serves both scanners; `hickory-proto` is dropped and `mdns-sd` is not a Step 1 dependency. pyatv itself hands _publishing_ (needed only for the legacy DMAP pairing flow, Step 7) to python-zeroconf; the Rust equivalent is re-evaluated then, with `mdns-sd`'s `register()` the leading candidate. Spec of record: `docs/research/discovery-port-spec.md`.
 
 ## 6. Cryptography and pairing
 
@@ -78,13 +78,13 @@ The one structural decision worth recording here: RustCrypto `srp`'s high-level 
 
 Libraries return structured `thiserror` enums with preserved context (operation, device id, protocol). The top-level CLI may aggregate with `anyhow`. `Result` is used for all expected failures; panics are reserved for genuine programmer errors.
 
-Credentials and settings persist through a `Storage` trait with a default file-backed implementation, mirroring pyatv's storage abstraction. Byte-for-byte compatibility with pyatv's existing `~/.pyatv.conf` JSON schema (so users can migrate credential exports) is treated as a **separate, explicit decision**, not assumed free — it requires reverse-engineering pyatv's `StorageModel`/`Settings` field names. The credential *string* format (colon-joined lowercase hex, documented in `crypto-pairing.md` §7) is replicated exactly regardless.
+Credentials and settings persist through a `Storage` trait with a default file-backed implementation. The implementation uses pyatv's `~/.pyatv.conf` JSON schema and credential-string format. The 2026-08-25 parity pass confirmed that pyatv `0.18.0` loads a file written by this project. This compatibility lets users migrate pairings without converting the file.
 
 ## 9. Open architectural decisions
 
 These are deferred to the point where they must be made, and are tracked in `docs/RISKS.md`:
 
-- MSRV policy: currently a provisional `1.88` floor (let-chains), CI-verified with `cargo-msrv`. Decide whether to adopt a rolling "N releases behind stable" policy.
-- Whether `~/.pyatv.conf` on-disk compatibility is a shipped feature or just the credential-string format.
-- Whether AirPlay 2 tunneled MRP is a full protobuf transport or a thin relay of the standalone MRP message set (affects whether one MRP codec serves both transports — current plan assumes it does, via the `MrpTransport` trait).
+- MSRV policy: the `1.88` floor is CI-verified. Decide whether to adopt a rolling policy based on a fixed number of Rust releases behind stable.
 - Whether any FFI (macOS Keychain for credential storage) is in scope, which would reintroduce `unsafe extern` surface.
+
+Two earlier decisions are closed. On-disk storage compatibility ships as part of the default file backend. AirPlay 2 carries the same MRP protobuf state machine through the `MrpTransport` abstraction rather than a separate thin relay.

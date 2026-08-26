@@ -4,7 +4,7 @@ Date: 2026-08-24. Device: Apple TV 4K (3rd gen, `AppleTV14,1`), tvOS 27.0, build
 
 ## Why
 
-`docs/RISKS.md` M7 recorded that AirPlay HAP pair-*setup* never displays a PIN on this device, which appeared to close off the only path to the HAP credentials that `is_remote_control_supported` (`pyatv/protocols/airplay/utils.py:165-180`) demands before pyatv will even attempt an MRP tunnel to an `AppleTV*` model. Companion pairing, by contrast, works: it does display a PIN and produces HAP credentials, which this workspace already stores. The question this experiment answers is whether those Companion credentials open the *AirPlay* control connection, and if not, whether transient pairing does.
+`docs/RISKS.md` M7 recorded that AirPlay HAP pair-_setup_ never displays a PIN on this device, which appeared to close off the only path to the HAP credentials that `is_remote_control_supported` (`pyatv/protocols/airplay/utils.py:165-180`) demands before pyatv will even attempt an MRP tunnel to an `AppleTV*` model. Companion pairing, by contrast, works: it does display a PIN and produces HAP credentials, which this workspace already stores. The question this experiment answers is whether those Companion credentials open the _AirPlay_ control connection, and if not, whether transient pairing does.
 
 ## Method and safety envelope
 
@@ -42,7 +42,7 @@ POST /pair-verify HTTP/1.1\r\nContent-Length: 37\r\nUser-Agent: AirPlay/320.20\r
 HTTP/1.1 200 OK\r\nDate: Mon, 24 Aug 2026 18:34:58 GMT\r\nContent-Length: 159\r\nContent-Type: application/octet-stream\r\nServer: AirTunes/980.67.2\r\nX-Apple-ProcessingTime: 9\r\nX-Apple-RequestReceivedTimestamp: 26177770\r\n\r\n
 ```
 
-M2 processing **succeeded in full**, which is the load-bearing result: the X25519 exchange produced a shared secret, the `Pair-Verify-Encrypt` sub-TLV decrypted, the `Identifier` inside it equalled the `atv_id` stored by *Companion* pairing, and the accessory's Ed25519 signature over `accessoryPK ‖ accessoryID ‖ controllerPK` verified against the `ltpk` stored by *Companion* pairing. This port checks all three; pyatv checks none of them (`docs/RISKS.md` M6), so a pyatv run could not have distinguished a genuine match from a device that simply answered.
+M2 processing **succeeded in full**, which is the load-bearing result: the X25519 exchange produced a shared secret, the `Pair-Verify-Encrypt` sub-TLV decrypted, the `Identifier` inside it equalled the `atv_id` stored by _Companion_ pairing, and the accessory's Ed25519 signature over `accessoryPK ‖ accessoryID ‖ controllerPK` verified against the `ltpk` stored by _Companion_ pairing. This port checks all three; pyatv checks none of them (`docs/RISKS.md` M6), so a pyatv run could not have distinguished a genuine match from a device that simply answered.
 
 **M3 request** (125-byte body, TLV `SeqNo=M3 EncryptedData[120B]`), same header block as M1 with `Content-Length: 125`.
 
@@ -68,22 +68,22 @@ Both directions decrypted cleanly through the 1024-byte `HapSession` framing on 
 
 Selected values (identifiers and key material deliberately omitted):
 
-| key | value |
-|---|---|
-| `model` | `AppleTV14,1` |
-| `name` | `Living Room` |
-| `osBuildVersion` | `00A0000a` |
-| `protocolVersion` | `1.1` |
-| `sourceVersion` | `980.67.2` |
-| `features` | `4330070159449382869` = `0x3C177FDE4A7FDFD5` |
-| `statusFlags` | `1148484` = `0x118644` |
-| `keepAliveSendStatsAsBody` | `true` |
+| key                        | value                                        |
+| -------------------------- | -------------------------------------------- |
+| `model`                    | `AppleTV14,1`                                |
+| `name`                     | `Living Room`                                |
+| `osBuildVersion`           | `00A0000a`                                   |
+| `protocolVersion`          | `1.1`                                        |
+| `sourceVersion`            | `980.67.2`                                   |
+| `features`                 | `4330070159449382869` = `0x3C177FDE4A7FDFD5` |
+| `statusFlags`              | `1148484` = `0x118644`                       |
+| `keepAliveSendStatsAsBody` | `true`                                       |
 
 Two incidental findings there. `features` matches the mDNS TXT `0x4A7FDFD5,0x3C177FDE` exactly once recombined as `high‖low`, confirming `parse_features`' ordering against a second, independent source. `statusFlags` is `0x118644` where the TXT `flags` is `0x18644` — the `/info` value carries an extra bit `0x100000` that the TXT record does not, so the two are **not** interchangeable inputs to `get_pairing_requirement`.
 
 ## Experiment 3 (run as a control even though experiment 1 succeeded) — pyatv's own Companion credentials
 
-Same exchange, `PROBE_CONF=/tmp/pyatv-py.conf`, whose `protocols.companion.credentials` belong to a *different* controller identity created by upstream pyatv. Byte-identical outcome: `200`/`200`, M2's identifier and signature verified, M4 clean, `GET /info` `200` with the same 27 keys.
+Same exchange, `PROBE_CONF=/tmp/pyatv-py.conf`, whose `protocols.companion.credentials` belong to a _different_ controller identity created by upstream pyatv. Byte-identical outcome: `200`/`200`, M2's identifier and signature verified, M4 clean, `GET /info` `200` with the same 27 keys.
 
 So the result is not a property of one credential or of this port's pairing code. **Any HAP controller pairing registered on the device is accepted by the AirPlay endpoint, regardless of which protocol created it.**
 
@@ -131,7 +131,7 @@ RTSP/1.0 200 OK\r\nDate: Mon, 24 Aug 2026 18:34:58 GMT\r\nContent-Length: 75\r\n
 The 75-byte reply plist has exactly two keys:
 
 | key | type | value |
-|---|---|---|
+| --- | --- | --- |
 | `eventPort` | integer | `49191`, `49192`, `49193`, `49194` on four consecutive runs — allocated fresh per `SETUP`, never reused |
 | `skipRecord` | boolean | `true` |
 
@@ -143,23 +143,25 @@ No data-stream `SETUP` was sent, the event port was never dialled, and no MRP me
 
 ## Conclusion
 
-**The Rust tunnel should authenticate the AirPlay control connection with HAP pair-verify against the credentials from *any* completed HAP pairing on the device — in practice the Companion one — and must not treat AirPlay pair-setup as a prerequisite.** On this device class (Apple TV 4K, tvOS 27, `flags` bit `0x200` set, `0x8` clear):
+**The Rust tunnel should authenticate the AirPlay control connection with HAP pair-verify against the credentials from _any_ completed HAP pairing on the device — in practice the Companion one — and must not treat AirPlay pair-setup as a prerequisite.** On this device class (Apple TV 4K, tvOS 27, `flags` bit `0x200` set, `0x8` clear):
 
 1. HAP pair-verify with Companion credentials completes M1–M4 and yields working `Control-*` transport keys. Verified twice, with two independent controller identities.
 2. Transient pairing is refused with `470` before any TLV is exchanged, and the refusal is about `X-Apple-HKP: 4`, not about the withheld `/pair-pin-start`.
 3. The encrypted control channel then carries `GET /info` and the `isRemoteControlOnly` `SETUP` without incident, so the tunnel's first hop is reachable today.
 
-The practical consequence for the port is that **pyatv's `is_remote_control_supported` heuristic is satisfiable here** — it wants `credentials.type == AuthenticationType::Hap` for an `AppleTV*` model with `osvers >= 13`, and Companion pairing supplies exactly that. What must change relative to a naive reading of pyatv is where the credentials come from: pyatv reaches for `service.credentials` on the *AirPlay* service (`extract_credentials`, `auth/__init__.py:120-133`), which is empty here because AirPlay pairing cannot be completed. The Rust facade should, when the AirPlay service has no credentials of its own, fall back to the Companion service's HAP credentials before deciding the tunnel is unavailable. That is a deliberate divergence from pyatv and should be written as one, with this document cited.
+The practical consequence for the port is that **pyatv's `is_remote_control_supported` heuristic is satisfiable here** — it wants `credentials.type == AuthenticationType::Hap` for an `AppleTV*` model with `osvers >= 13`, and Companion pairing supplies exactly that. What must change relative to a naive reading of pyatv is where the credentials come from: pyatv reaches for `service.credentials` on the _AirPlay_ service (`extract_credentials`, `auth/__init__.py:120-133`), which is empty here because AirPlay pairing cannot be completed. The Rust facade should, when the AirPlay service has no credentials of its own, fall back to the Companion service's HAP credentials before deciding the tunnel is unavailable. That is a deliberate divergence from pyatv and should be written as one, with this document cited.
 
 Do **not** implement transient pairing as a fallback for Apple TV models. It is refused here, and `is_remote_control_supported` would reject its credentials for an `AppleTV*` model even if it were not.
 
 ## Open questions, for the next session with the device
 
-- **`skipRecord`.** Does omitting `RECORD` change whether the data-stream `SETUP` and the MRP session survive? Test both branches once the data channel exists, and capture an iOS sender with `atvproxy` to see what Apple's own controller does with the key.
+Follow-up on 2026-08-25: `docs/research/live-parity-validation-2026-08-25.md` resolves two device-session questions. The Rust client honored `skipRecord=true` and kept the MRP tunnel open for a 60-second observation. After the controller was removed on the Apple TV, the same credential completed M2 device verification and received `Authentication` in M4. Natural credential expiry remains untested.
+
+- **Apple sender handling of `skipRecord`.** The Rust path works when it omits `RECORD`, but an Apple sender capture is still required to confirm Apple's interpretation of the key.
 - **Does the event channel actually have to be dialled?** The reply allocates a port per `SETUP`; nothing here shows what happens if the controller never connects to it. `ap2_session.py:137-139`'s comment says the channel is "not used … must be set up though", which is an assertion this experiment did not test.
 - **`statusFlags` bit `0x100000`.** Present in `/info`, absent from the mDNS `flags`. Unidentified; decide whether any gating should read it.
-- **Credential longevity.** The Companion pairing verified today. Whether tvOS expires or revokes a pairing used from a protocol other than the one that created it is unknown, and would show up as a sudden `470` on a previously working pair-verify.
-- **HomePod.** `is_remote_control_supported` allows *only* transient credentials for `AudioAccessory*`, the exact flavour refused here. This experiment says nothing about that device class; do not generalise the `470`.
+- **Credential longevity.** Explicit device-side revocation is verified. Whether tvOS expires a cross-protocol pairing without user action remains unknown.
+- **HomePod.** `is_remote_control_supported` allows _only_ transient credentials for `AudioAccessory*`, the exact flavour refused here. This experiment says nothing about that device class; do not generalise the `470`.
 
 ## What this experiment added to the crate
 
