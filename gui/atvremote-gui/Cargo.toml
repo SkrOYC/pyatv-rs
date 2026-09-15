@@ -1,0 +1,23 @@
+[package]
+name = "atvremote-gui"
+description = "Minimalist GPUI-based remote control for Apple TV and AirPlay devices (prototype v0.0.1)"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+gpui = { workspace = true }
+gpui_platform = { workspace = true, features = ["wayland", "x11"] }
+gpui_tokio = { workspace = true }
+pyatv = { workspace = true }
+pyatv-core = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

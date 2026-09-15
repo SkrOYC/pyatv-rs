@@ -72,6 +72,16 @@ in
     RUST_BACKTRACE = "1";
     # prost-build / tonic-build look here before falling back to a $PATH lookup.
     PROTOC = "${pkgs.protobuf}/bin/protoc";
+    # Allow fontconfig dlopen on Linux for GPUI font-kit
+    RUST_FONTCONFIG_DLOPEN = "1";
+    LD_LIBRARY_PATH = "${lib.makeLibraryPath [
+      pkgs.vulkan-loader
+      pkgs.libxkbcommon
+      pkgs.wayland
+      pkgs.xorg.libxcb
+      pkgs.fontconfig
+      pkgs.freetype
+    ]}";
   };
 
   # https://devenv.sh/packages/
@@ -88,6 +98,12 @@ in
     pkgs.gh
     pkgs.jq
     pkgs.eza
+    pkgs.pkg-config
+    pkgs.fontconfig
+    pkgs.libxkbcommon
+    pkgs.xorg.libxcb
+    pkgs.wayland
+    pkgs.vulkan-loader
   ];
 
   # https://devenv.sh/languages/

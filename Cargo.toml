@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "cli/atvremote"]
+members = ["crates/*", "cli/atvremote", "gui/atvremote-gui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,7 @@ authors = ["SkrOYC"]
 # Internal crates (path deps declared once). The `version` alongside `path` is what cargo uses when
 # these are published — crates.io rejects bare path dependencies — and it also keeps cargo-deny's
 # wildcard ban satisfied.
+pyatv = { path = "crates/pyatv", version = "0.1.0" }
 pyatv-core = { path = "crates/pyatv-core", version = "0.1.0" }
 pyatv-mdns = { path = "crates/pyatv-mdns", version = "0.1.0" }
 pyatv-pairing = { path = "crates/pyatv-pairing", version = "0.1.0" }
@@ -36,6 +37,9 @@ tokio = { version = "1.53.1", features = [
   "io-util",
 ] }
 tracing = "0.1.44"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "ced90fc636c4ede05402befc38a63bae7fd741bd" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "ced90fc636c4ede05402befc38a63bae7fd741bd" }
+gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "ced90fc636c4ede05402befc38a63bae7fd741bd" }
 
 [profile.bench]
 # Line tables in the benchmark binaries. A criterion number tells you *that* something got slower;

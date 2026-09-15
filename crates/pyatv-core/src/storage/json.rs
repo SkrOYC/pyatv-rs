@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn separators_match_json_dumps() {
-        let value = serde_json::json!({"version": 1, "devices": [{"a": 1}, {"b": [1, 2]}]});
+        let value = serde_json::json!({"devices": [{"a": 1}, {"b": [1, 2]}], "version": 1});
         assert_eq!(
             to_python_json(&value).expect("serialising must succeed"),
             r#"{"devices": [{"a": 1}, {"b": [1, 2]}], "version": 1}"#

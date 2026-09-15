@@ -2,6 +2,7 @@
 
 [graph]
 all-features = true
+exclude = ["atvremote-gui"]
 
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
@@ -88,6 +89,10 @@ skip = [
   # backends, miette-derive, prettyplease, tracing-attributes and rubato's `visibility` have not.
   # Delete this entry once the laggards catch up — the build will tell you if it was premature.
   { crate = "syn@2.0.119", reason = "proc-macro crates that have not yet migrated to syn 3: curve25519-dalek-derive, prost-derive, logos-codegen, miette-derive, prettyplease, tracing-attributes, visibility" },
+  # getrandom 0.3 / 0.4 transition: proptest and prost-build still use rand 0.9 / getrandom 0.3,
+  # while pyatv-core and runtime crates use rand 0.10 / getrandom 0.4.
+  { crate = "getrandom@0.3.4", reason = "proptest 1.11.0 / prost-build 0.14.4 build and dev dependencies" },
+  { crate = "r-efi@5.3.0", reason = "pulled transitively by getrandom 0.3.4" },
 ]
 skip-tree = []
 
